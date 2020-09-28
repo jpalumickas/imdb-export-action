@@ -75,6 +75,13 @@ const fetchData = async (): Promise<Result> => {
         XPathResult.FIRST_ORDERED_NODE_TYPE,
         null
       ).singleNodeValue as HTMLLinkElement;
+
+      if (!link) {
+        core.debug('Warning! Failed to find watchlist export button');
+        console.log('Warning! Failed to find watchlist export button');
+        return;
+      }
+
       return fetch(link.href).then((r) => r.text());
     });
 
@@ -89,6 +96,13 @@ const fetchData = async (): Promise<Result> => {
         XPathResult.FIRST_ORDERED_NODE_TYPE,
         null
       ).singleNodeValue as HTMLLinkElement;
+
+      if (!link) {
+        core.debug('Warning! Failed to find ratings export button');
+        console.log('Warning! Failed to find ratings export button');
+        return;
+      }
+
       return fetch(link.href).then((r) => r.text());
     });
   } catch (err) {

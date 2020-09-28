@@ -6,7 +6,10 @@ import commitFile from './commitFile';
   try {
     const data = await fetchData();
 
-    if (!data.ratings || !data.watchlist) return;
+    if (!data.ratings && !data.watchlist) {
+      core.setFailed(`Failed to get data from IMDb`);
+      return;
+    }
 
     core.debug('Commit files');
 
