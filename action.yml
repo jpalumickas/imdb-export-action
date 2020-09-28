@@ -26,6 +26,11 @@ inputs:
     description: 'Commit message when updating watchlist file'
     required: false
     default: 'Update IMDb Watchlist'
+
 runs:
   using: 'node14'
   main: 'dist/index.js'
+
+branding:
+  icon: 'download'
+  color: 'yellow'
