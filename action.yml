@@ -11,7 +11,7 @@ inputs:
     description: 'GitHub Token'
     required: true
   ratings_path:
-    description: 'Ratings path in Repo'
+    description: 'Ratings file path in repository'
     required: false
     default: 'imdb_ratings.csv'
   ratings_commit_message:
@@ -19,7 +19,7 @@ inputs:
     required: false
     default: 'Update IMDb Ratings'
   watchlist_path:
-    description: 'Watchlist path in Repo'
+    description: 'Watchlist file path in repository'
     required: false
     default: 'imdb_watchlist.csv'
   watchlist_commit_message:

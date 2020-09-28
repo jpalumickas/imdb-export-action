@@ -369,10 +369,10 @@ node-fetch@^2.6.1:
   resolved "https://registry.yarnpkg.com/node-fetch/-/node-fetch-2.6.1.tgz#045bd323631f76ed2e2b55573394416b639a0052"
   integrity sha512-V4aYg89jEoVRxRb2fJdAg8FHvI7cEyYdVAh94HH0UIK8oJxUfkjlDQN9RbMx+bEjP7+ggMiFRprSti032Oipxw==
 
-octokit-commit-multiple-files@^2.0.0:
-  version "2.0.0"
-  resolved "https://registry.yarnpkg.com/octokit-commit-multiple-files/-/octokit-commit-multiple-files-2.0.0.tgz#4a9fd59f5093c18d7803ebb3c6fe2584426be767"
-  integrity sha512-/ysmT5/wbXdT0AKtoaFWlGVoYFl3i7AppjHfD3wL718pW9jnAGKf1aXnqmpklhga6dSOgm8A8HKODb2gx0exMw==
+octokit-commit-multiple-files@^3.0.1:
+  version "3.0.1"
+  resolved "https://registry.yarnpkg.com/octokit-commit-multiple-files/-/octokit-commit-multiple-files-3.0.1.tgz#491a1a692891ca7c806cc9336470eabfc0eb3de2"
+  integrity sha512-V+Q931BDAgVUF3JEWJ0fxxAE5k8ibbODP3kl93vXS6EHPIT0GLMtWFLGaJUYAv1SX6UHspzzxOorQmrPDJuOrg==
   dependencies:
     nock "^11.7.0"
 
