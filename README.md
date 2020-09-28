@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Export from IMDb
-        uses: jpalumickas/imdb-export-action@v0.1.0
+        uses: jpalumickas/imdb-export-action@v1.0.0
         with:
           imdb_email: ${{ secrets.IMDB_EMAIL }}
           imdb_password: ${{ secrets.IMDB_PASSWORD }}
