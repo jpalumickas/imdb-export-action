@@ -1,0 +1,37 @@
+{
+  "name": "imdb-export",
+  "version": "0.1.0",
+  "main": "index.js",
+  "author": "Justas Palumickas",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/jpalumickas/imdb-export-action-action/issues"
+  },
+  "homepage": "https://github.com/jpalumickas/imdb-export-action#readme",
+  "repository": "jpalumickas/imdb-export-action",
+  "dependencies": {
+    "@actions/core": "^1.2.4",
+    "@actions/github": "^4.0.0",
+    "octokit-commit-multiple-files": "^2.0.0",
+    "puppeteer-core": "^5.0.0"
+  },
+  "peerDependencies": {
+    "@actions/core": ">=1 <2"
+  },
+  "devDependencies": {
+    "@types/puppeteer-core": "^2.0.0",
+    "@zeit/ncc": "^0.22.3",
+    "prettier": "^2.0.5",
+    "typescript": "^3.9.6"
+  },
+  "scripts": {
+    "build": "ncc build src/index.ts -o dist"
+  },
+  "keywords": [
+    "imdb",
+    "github",
+    "actions",
+    "github-actions",
+    "javascript"
+  ]
+}

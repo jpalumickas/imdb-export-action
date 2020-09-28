@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "removeComments": true,
+    "module": "ESNext",
+    "target": "ES2019", // Node 12
+    "strict": true,
+    "newLine": "lf",
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "moduleResolution": "node",
+    "lib": ["ES6", "DOM"],
+    "rootDir": "./src"
+  },
+  "include": ["src/**/*"]
+}
