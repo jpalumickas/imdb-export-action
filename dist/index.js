@@ -59,7 +59,7 @@ module.exports =
 
 const os = __webpack_require__(87);
 const macosRelease = __webpack_require__(118);
-const winRelease = __webpack_require__(494);
+const winRelease = __webpack_require__(854);
 
 const osName = (platform, release) => {
 	if (!platform && release) {
@@ -105,35 +105,7 @@ module.exports = osName;
 
 
 /***/ }),
-/* 3 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-/**
- * Copyright 2020 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.PUPPETEER_REVISIONS = void 0;
-exports.PUPPETEER_REVISIONS = {
-    chromium: '756035',
-    firefox: 'latest',
-};
-
-
-/***/ }),
+/* 3 */,
 /* 4 */,
 /* 5 */,
 /* 6 */,
@@ -240,121 +212,401 @@ module.exports = eos;
 
 /***/ }),
 /* 10 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
 "use strict";
 
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.WebWorker = void 0;
+
+const { randomFillSync } = __webpack_require__(417);
+
+const PerMessageDeflate = __webpack_require__(301);
+const { EMPTY_BUFFER } = __webpack_require__(799);
+const { isValidStatusCode } = __webpack_require__(562);
+const { mask: applyMask, toBuffer } = __webpack_require__(349);
+
+const mask = Buffer.alloc(4);
+
 /**
- * Copyright 2018 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * HyBi Sender implementation.
  */
-const EventEmitter_1 = __webpack_require__(304);
-const helper_1 = __webpack_require__(758);
-const ExecutionContext_1 = __webpack_require__(317);
-const JSHandle_1 = __webpack_require__(661);
-/**
- * The WebWorker class represents a
- * {@link https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API | WebWorker}.
- *
- * @remarks
- * The events `workercreated` and `workerdestroyed` are emitted on the page
- * object to signal the worker lifecycle.
- *
- * @example
- * ```js
- * page.on('workercreated', worker => console.log('Worker created: ' + worker.url()));
- * page.on('workerdestroyed', worker => console.log('Worker destroyed: ' + worker.url()));
- *
- * console.log('Current workers:');
- * for (const worker of page.workers()) {
- *   console.log('  ' + worker.url());
- * }
- * ```
- *
- * @public
- */
-class WebWorker extends EventEmitter_1.EventEmitter {
-    /**
-     *
-     * @internal
-     */
-    constructor(client, url, consoleAPICalled, exceptionThrown) {
-        super();
-        this._client = client;
-        this._url = url;
-        this._executionContextPromise = new Promise((x) => (this._executionContextCallback = x));
-        let jsHandleFactory;
-        this._client.once('Runtime.executionContextCreated', async (event) => {
-            // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
-            jsHandleFactory = (remoteObject) => new JSHandle_1.JSHandle(executionContext, client, remoteObject);
-            const executionContext = new ExecutionContext_1.ExecutionContext(client, event.context, null);
-            this._executionContextCallback(executionContext);
-        });
-        // This might fail if the target is closed before we recieve all execution contexts.
-        this._client.send('Runtime.enable', {}).catch(helper_1.debugError);
-        this._client.on('Runtime.consoleAPICalled', (event) => consoleAPICalled(event.type, event.args.map(jsHandleFactory), event.stackTrace));
-        this._client.on('Runtime.exceptionThrown', (exception) => exceptionThrown(exception.exceptionDetails));
+class Sender {
+  /**
+   * Creates a Sender instance.
+   *
+   * @param {net.Socket} socket The connection socket
+   * @param {Object} extensions An object containing the negotiated extensions
+   */
+  constructor(socket, extensions) {
+    this._extensions = extensions || {};
+    this._socket = socket;
+
+    this._firstFragment = true;
+    this._compress = false;
+
+    this._bufferedBytes = 0;
+    this._deflating = false;
+    this._queue = [];
+  }
+
+  /**
+   * Frames a piece of data according to the HyBi WebSocket protocol.
+   *
+   * @param {Buffer} data The data to frame
+   * @param {Object} options Options object
+   * @param {Number} options.opcode The opcode
+   * @param {Boolean} options.readOnly Specifies whether `data` can be modified
+   * @param {Boolean} options.fin Specifies whether or not to set the FIN bit
+   * @param {Boolean} options.mask Specifies whether or not to mask `data`
+   * @param {Boolean} options.rsv1 Specifies whether or not to set the RSV1 bit
+   * @return {Buffer[]} The framed data as a list of `Buffer` instances
+   * @public
+   */
+  static frame(data, options) {
+    const merge = options.mask && options.readOnly;
+    let offset = options.mask ? 6 : 2;
+    let payloadLength = data.length;
+
+    if (data.length >= 65536) {
+      offset += 8;
+      payloadLength = 127;
+    } else if (data.length > 125) {
+      offset += 2;
+      payloadLength = 126;
     }
-    /**
-     * @returns The URL of this web worker.
-     */
-    url() {
-        return this._url;
+
+    const target = Buffer.allocUnsafe(merge ? data.length + offset : offset);
+
+    target[0] = options.fin ? options.opcode | 0x80 : options.opcode;
+    if (options.rsv1) target[0] |= 0x40;
+
+    target[1] = payloadLength;
+
+    if (payloadLength === 126) {
+      target.writeUInt16BE(data.length, 2);
+    } else if (payloadLength === 127) {
+      target.writeUInt32BE(0, 2);
+      target.writeUInt32BE(data.length, 6);
     }
-    /**
-     * Returns the ExecutionContext the WebWorker runs in
-     * @returns The ExecutionContext the web worker runs in.
-     */
-    async executionContext() {
-        return this._executionContextPromise;
+
+    if (!options.mask) return [target, data];
+
+    randomFillSync(mask, 0, 4);
+
+    target[1] |= 0x80;
+    target[offset - 4] = mask[0];
+    target[offset - 3] = mask[1];
+    target[offset - 2] = mask[2];
+    target[offset - 1] = mask[3];
+
+    if (merge) {
+      applyMask(data, mask, target, offset, data.length);
+      return [target];
     }
-    /**
-     * If the function passed to the `worker.evaluate` returns a Promise, then
-     * `worker.evaluate` would wait for the promise to resolve and return its
-     * value. If the function passed to the `worker.evaluate` returns a
-     * non-serializable value, then `worker.evaluate` resolves to `undefined`.
-     * DevTools Protocol also supports transferring some additional values that
-     * are not serializable by `JSON`: `-0`, `NaN`, `Infinity`, `-Infinity`, and
-     * bigint literals.
-     * Shortcut for `await worker.executionContext()).evaluate(pageFunction, ...args)`.
-     *
-     * @param pageFunction - Function to be evaluated in the worker context.
-     * @param args - Arguments to pass to `pageFunction`.
-     * @returns Promise which resolves to the return value of `pageFunction`.
-     */
-    async evaluate(pageFunction, ...args) {
-        return (await this._executionContextPromise).evaluate(pageFunction, ...args);
+
+    applyMask(data, mask, data, 0, data.length);
+    return [target, data];
+  }
+
+  /**
+   * Sends a close message to the other peer.
+   *
+   * @param {(Number|undefined)} code The status code component of the body
+   * @param {String} data The message component of the body
+   * @param {Boolean} mask Specifies whether or not to mask the message
+   * @param {Function} cb Callback
+   * @public
+   */
+  close(code, data, mask, cb) {
+    let buf;
+
+    if (code === undefined) {
+      buf = EMPTY_BUFFER;
+    } else if (typeof code !== 'number' || !isValidStatusCode(code)) {
+      throw new TypeError('First argument must be a valid error code number');
+    } else if (data === undefined || data === '') {
+      buf = Buffer.allocUnsafe(2);
+      buf.writeUInt16BE(code, 0);
+    } else {
+      const length = Buffer.byteLength(data);
+
+      if (length > 123) {
+        throw new RangeError('The message must not be greater than 123 bytes');
+      }
+
+      buf = Buffer.allocUnsafe(2 + length);
+      buf.writeUInt16BE(code, 0);
+      buf.write(data, 2);
     }
-    /**
-     * The only difference between `worker.evaluate` and `worker.evaluateHandle`
-     * is that `worker.evaluateHandle` returns in-page object (JSHandle). If the
-     * function passed to the `worker.evaluateHandle` returns a [Promise], then
-     * `worker.evaluateHandle` would wait for the promise to resolve and return
-     * its value. Shortcut for
-     * `await worker.executionContext()).evaluateHandle(pageFunction, ...args)`
-     *
-     * @param pageFunction - Function to be evaluated in the page context.
-     * @param args - Arguments to pass to `pageFunction`.
-     * @returns Promise which resolves to the return value of `pageFunction`.
-     */
-    async evaluateHandle(pageFunction, ...args) {
-        return (await this._executionContextPromise).evaluateHandle(pageFunction, ...args);
+
+    if (this._deflating) {
+      this.enqueue([this.doClose, buf, mask, cb]);
+    } else {
+      this.doClose(buf, mask, cb);
     }
+  }
+
+  /**
+   * Frames and sends a close message.
+   *
+   * @param {Buffer} data The message to send
+   * @param {Boolean} mask Specifies whether or not to mask `data`
+   * @param {Function} cb Callback
+   * @private
+   */
+  doClose(data, mask, cb) {
+    this.sendFrame(
+      Sender.frame(data, {
+        fin: true,
+        rsv1: false,
+        opcode: 0x08,
+        mask,
+        readOnly: false
+      }),
+      cb
+    );
+  }
+
+  /**
+   * Sends a ping message to the other peer.
+   *
+   * @param {*} data The message to send
+   * @param {Boolean} mask Specifies whether or not to mask `data`
+   * @param {Function} cb Callback
+   * @public
+   */
+  ping(data, mask, cb) {
+    const buf = toBuffer(data);
+
+    if (buf.length > 125) {
+      throw new RangeError('The data size must not be greater than 125 bytes');
+    }
+
+    if (this._deflating) {
+      this.enqueue([this.doPing, buf, mask, toBuffer.readOnly, cb]);
+    } else {
+      this.doPing(buf, mask, toBuffer.readOnly, cb);
+    }
+  }
+
+  /**
+   * Frames and sends a ping message.
+   *
+   * @param {Buffer} data The message to send
+   * @param {Boolean} mask Specifies whether or not to mask `data`
+   * @param {Boolean} readOnly Specifies whether `data` can be modified
+   * @param {Function} cb Callback
+   * @private
+   */
+  doPing(data, mask, readOnly, cb) {
+    this.sendFrame(
+      Sender.frame(data, {
+        fin: true,
+        rsv1: false,
+        opcode: 0x09,
+        mask,
+        readOnly
+      }),
+      cb
+    );
+  }
+
+  /**
+   * Sends a pong message to the other peer.
+   *
+   * @param {*} data The message to send
+   * @param {Boolean} mask Specifies whether or not to mask `data`
+   * @param {Function} cb Callback
+   * @public
+   */
+  pong(data, mask, cb) {
+    const buf = toBuffer(data);
+
+    if (buf.length > 125) {
+      throw new RangeError('The data size must not be greater than 125 bytes');
+    }
+
+    if (this._deflating) {
+      this.enqueue([this.doPong, buf, mask, toBuffer.readOnly, cb]);
+    } else {
+      this.doPong(buf, mask, toBuffer.readOnly, cb);
+    }
+  }
+
+  /**
+   * Frames and sends a pong message.
+   *
+   * @param {Buffer} data The message to send
+   * @param {Boolean} mask Specifies whether or not to mask `data`
+   * @param {Boolean} readOnly Specifies whether `data` can be modified
+   * @param {Function} cb Callback
+   * @private
+   */
+  doPong(data, mask, readOnly, cb) {
+    this.sendFrame(
+      Sender.frame(data, {
+        fin: true,
+        rsv1: false,
+        opcode: 0x0a,
+        mask,
+        readOnly
+      }),
+      cb
+    );
+  }
+
+  /**
+   * Sends a data message to the other peer.
+   *
+   * @param {*} data The message to send
+   * @param {Object} options Options object
+   * @param {Boolean} options.compress Specifies whether or not to compress `data`
+   * @param {Boolean} options.binary Specifies whether `data` is binary or text
+   * @param {Boolean} options.fin Specifies whether the fragment is the last one
+   * @param {Boolean} options.mask Specifies whether or not to mask `data`
+   * @param {Function} cb Callback
+   * @public
+   */
+  send(data, options, cb) {
+    const buf = toBuffer(data);
+    const perMessageDeflate = this._extensions[PerMessageDeflate.extensionName];
+    let opcode = options.binary ? 2 : 1;
+    let rsv1 = options.compress;
+
+    if (this._firstFragment) {
+      this._firstFragment = false;
+      if (rsv1 && perMessageDeflate) {
+        rsv1 = buf.length >= perMessageDeflate._threshold;
+      }
+      this._compress = rsv1;
+    } else {
+      rsv1 = false;
+      opcode = 0;
+    }
+
+    if (options.fin) this._firstFragment = true;
+
+    if (perMessageDeflate) {
+      const opts = {
+        fin: options.fin,
+        rsv1,
+        opcode,
+        mask: options.mask,
+        readOnly: toBuffer.readOnly
+      };
+
+      if (this._deflating) {
+        this.enqueue([this.dispatch, buf, this._compress, opts, cb]);
+      } else {
+        this.dispatch(buf, this._compress, opts, cb);
+      }
+    } else {
+      this.sendFrame(
+        Sender.frame(buf, {
+          fin: options.fin,
+          rsv1: false,
+          opcode,
+          mask: options.mask,
+          readOnly: toBuffer.readOnly
+        }),
+        cb
+      );
+    }
+  }
+
+  /**
+   * Dispatches a data message.
+   *
+   * @param {Buffer} data The message to send
+   * @param {Boolean} compress Specifies whether or not to compress `data`
+   * @param {Object} options Options object
+   * @param {Number} options.opcode The opcode
+   * @param {Boolean} options.readOnly Specifies whether `data` can be modified
+   * @param {Boolean} options.fin Specifies whether or not to set the FIN bit
+   * @param {Boolean} options.mask Specifies whether or not to mask `data`
+   * @param {Boolean} options.rsv1 Specifies whether or not to set the RSV1 bit
+   * @param {Function} cb Callback
+   * @private
+   */
+  dispatch(data, compress, options, cb) {
+    if (!compress) {
+      this.sendFrame(Sender.frame(data, options), cb);
+      return;
+    }
+
+    const perMessageDeflate = this._extensions[PerMessageDeflate.extensionName];
+
+    this._bufferedBytes += data.length;
+    this._deflating = true;
+    perMessageDeflate.compress(data, options.fin, (_, buf) => {
+      if (this._socket.destroyed) {
+        const err = new Error(
+          'The socket was closed while data was being compressed'
+        );
+
+        if (typeof cb === 'function') cb(err);
+
+        for (let i = 0; i < this._queue.length; i++) {
+          const callback = this._queue[i][4];
+
+          if (typeof callback === 'function') callback(err);
+        }
+
+        return;
+      }
+
+      this._bufferedBytes -= data.length;
+      this._deflating = false;
+      options.readOnly = false;
+      this.sendFrame(Sender.frame(buf, options), cb);
+      this.dequeue();
+    });
+  }
+
+  /**
+   * Executes queued send operations.
+   *
+   * @private
+   */
+  dequeue() {
+    while (!this._deflating && this._queue.length) {
+      const params = this._queue.shift();
+
+      this._bufferedBytes -= params[1].length;
+      Reflect.apply(params[0], this, params.slice(1));
+    }
+  }
+
+  /**
+   * Enqueues a send operation.
+   *
+   * @param {Array} params Send operation parameters.
+   * @private
+   */
+  enqueue(params) {
+    this._bufferedBytes += params[1].length;
+    this._queue.push(params);
+  }
+
+  /**
+   * Sends a frame.
+   *
+   * @param {Buffer[]} list The frame to send
+   * @param {Function} cb Callback
+   * @private
+   */
+  sendFrame(list, cb) {
+    if (list.length === 2) {
+      this._socket.cork();
+      this._socket.write(list[0]);
+      this._socket.write(list[1], cb);
+      this._socket.uncork();
+    } else {
+      this._socket.write(list[0], cb);
+    }
+  }
 }
-exports.WebWorker = WebWorker;
+
+module.exports = Sender;
 
 
 /***/ }),
@@ -523,7 +775,69 @@ exports.getProxyForUrl = getProxyForUrl;
 
 
 /***/ }),
-/* 19 */,
+/* 19 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", { value: true });
+/**
+ * Mitt: Tiny (~200b) functional event emitter / pubsub.
+ * @name mitt
+ * @returns {Mitt}
+ */
+function mitt(all) {
+    all = all || new Map();
+    return {
+        /**
+         * A Map of event names to registered handler functions.
+         */
+        all,
+        /**
+         * Register an event handler for the given type.
+         * @param {string|symbol} type Type of event to listen for, or `"*"` for all events
+         * @param {Function} handler Function to call in response to given event
+         * @memberOf mitt
+         */
+        on(type, handler) {
+            const handlers = all.get(type);
+            const added = handlers && handlers.push(handler);
+            if (!added) {
+                all.set(type, [handler]);
+            }
+        },
+        /**
+         * Remove an event handler for the given type.
+         * @param {string|symbol} type Type of event to unregister `handler` from, or `"*"`
+         * @param {Function} handler Handler function to remove
+         * @memberOf mitt
+         */
+        off(type, handler) {
+            const handlers = all.get(type);
+            if (handlers) {
+                handlers.splice(handlers.indexOf(handler) >>> 0, 1);
+            }
+        },
+        /**
+         * Invoke all handlers for the given type.
+         * If present, `"*"` handlers are invoked after type-matched handlers.
+         *
+         * Note: Manually firing "*" handlers is not supported.
+         *
+         * @param {string|symbol} type The event type to invoke
+         * @param {Any} [evt] Any value (object is recommended and powerful), passed to each handler
+         * @memberOf mitt
+         */
+        emit(type, evt) {
+            (all.get(type) || []).slice().map((handler) => { handler(evt); });
+            (all.get('*') || []).slice().map((handler) => { handler(type, evt); });
+        }
+    };
+}
+exports.default = mitt;
+
+
+/***/ }),
 /* 20 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -586,7 +900,7 @@ const { URL } = __webpack_require__(835);
 
 const PerMessageDeflate = __webpack_require__(301);
 const Receiver = __webpack_require__(312);
-const Sender = __webpack_require__(837);
+const Sender = __webpack_require__(10);
 const {
   BINARY_TYPES,
   EMPTY_BUFFER,
@@ -596,7 +910,7 @@ const {
   NOOP
 } = __webpack_require__(799);
 const { addEventListener, removeEventListener } = __webpack_require__(646);
-const { format, parse } = __webpack_require__(330);
+const { format, parse } = __webpack_require__(288);
 const { toBuffer } = __webpack_require__(349);
 
 const readyStates = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
@@ -1485,12 +1799,127 @@ function socketOnError() {
 /* 22 */,
 /* 23 */,
 /* 24 */
+/***/ (function(module) {
+
+module.exports = eval("require")("bufferutil");
+
+
+/***/ }),
+/* 25 */,
+/* 26 */,
+/* 27 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Tracing = void 0;
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+/**
+ * The Tracing class exposes the tracing audit interface.
+ * @remarks
+ * You can use `tracing.start` and `tracing.stop` to create a trace file
+ * which can be opened in Chrome DevTools or {@link https://chromedevtools.github.io/timeline-viewer/ | timeline viewer}.
+ *
+ * @example
+ * ```js
+ * await page.tracing.start({path: 'trace.json'});
+ * await page.goto('https://www.google.com');
+ * await page.tracing.stop();
+ * ```
+ *
+ * @public
+ */
+class Tracing {
+    /**
+     * @internal
+     */
+    constructor(client) {
+        this._recording = false;
+        this._path = '';
+        this._client = client;
+    }
+    /**
+     * Starts a trace for the current page.
+     * @remarks
+     * Only one trace can be active at a time per browser.
+     * @param options - Optional `TracingOptions`.
+     */
+    async start(options = {}) {
+        assert_js_1.assert(!this._recording, 'Cannot start recording trace while already recording trace.');
+        const defaultCategories = [
+            '-*',
+            'devtools.timeline',
+            'v8.execute',
+            'disabled-by-default-devtools.timeline',
+            'disabled-by-default-devtools.timeline.frame',
+            'toplevel',
+            'blink.console',
+            'blink.user_timing',
+            'latencyInfo',
+            'disabled-by-default-devtools.timeline.stack',
+            'disabled-by-default-v8.cpu_profiler',
+            'disabled-by-default-v8.cpu_profiler.hires',
+        ];
+        const { path = null, screenshots = false, categories = defaultCategories, } = options;
+        if (screenshots)
+            categories.push('disabled-by-default-devtools.screenshot');
+        this._path = path;
+        this._recording = true;
+        await this._client.send('Tracing.start', {
+            transferMode: 'ReturnAsStream',
+            categories: categories.join(','),
+        });
+    }
+    /**
+     * Stops a trace started with the `start` method.
+     * @returns Promise which resolves to buffer with trace data.
+     */
+    async stop() {
+        let fulfill;
+        let reject;
+        const contentPromise = new Promise((x, y) => {
+            fulfill = x;
+            reject = y;
+        });
+        this._client.once('Tracing.tracingComplete', (event) => {
+            helper_js_1.helper
+                .readProtocolStream(this._client, event.stream, this._path)
+                .then(fulfill, reject);
+        });
+        await this._client.send('Tracing.end');
+        this._recording = false;
+        return contentPromise;
+    }
+}
+exports.Tracing = Tracing;
+
+
+/***/ }),
+/* 28 */,
+/* 29 */
 /***/ (function(__unusedmodule, exports) {
 
 "use strict";
 
 /**
- * Copyright 2018 Google Inc. All rights reserved.
+ * Copyright 2020 Google Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -1505,1180 +1934,57 @@ function socketOnError() {
  * limitations under the License.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.puppeteerErrors = exports.TimeoutError = void 0;
-class CustomError extends Error {
-    constructor(message) {
-        super(message);
-        this.name = this.constructor.name;
-        Error.captureStackTrace(this, this.constructor);
-    }
-}
+exports.ConsoleMessage = void 0;
 /**
- * TimeoutError is emitted whenever certain operations are terminated due to timeout.
- *
- * @remarks
- *
- * Example operations are {@link Page.waitForSelector | page.waitForSelector}
- * or {@link Puppeteer.launch | puppeteer.launch}.
- *
+ * ConsoleMessage objects are dispatched by page via the 'console' event.
  * @public
  */
-class TimeoutError extends CustomError {
+class ConsoleMessage {
+    /**
+     * @public
+     */
+    constructor(type, text, args, location = {}) {
+        this._type = type;
+        this._text = text;
+        this._args = args;
+        this._location = location;
+    }
+    /**
+     * @returns The type of the console message.
+     */
+    type() {
+        return this._type;
+    }
+    /**
+     * @returns The text of the console message.
+     */
+    text() {
+        return this._text;
+    }
+    /**
+     * @returns An array of arguments passed to the console.
+     */
+    args() {
+        return this._args;
+    }
+    /**
+     * @returns The location of the console message.
+     */
+    location() {
+        return this._location;
+    }
 }
-exports.TimeoutError = TimeoutError;
-exports.puppeteerErrors = {
-    TimeoutError,
-};
+exports.ConsoleMessage = ConsoleMessage;
 
 
 /***/ }),
-/* 25 */,
-/* 26 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.BrowserContext = exports.Browser = void 0;
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const Target_1 = __webpack_require__(679);
-const EventEmitter_1 = __webpack_require__(304);
-const Events_1 = __webpack_require__(872);
-/**
- * A Browser is created when Puppeteer connects to a Chromium instance, either through
- * {@link Puppeteer.launch} or {@link Puppeteer.connect}.
- *
- * @example
- *
- * An example of using a {@link Browser} to create a {@link Page}:
- * ```js
- * const puppeteer = require('puppeteer');
- *
- * (async () => {
- *   const browser = await puppeteer.launch();
- *   const page = await browser.newPage();
- *   await page.goto('https://example.com');
- *   await browser.close();
- * })();
- * ```
- *
- * @example
- *
- * An example of disconnecting from and reconnecting to a {@link Browser}:
- * ```js
- * const puppeteer = require('puppeteer');
- *
- * (async () => {
- *   const browser = await puppeteer.launch();
- *   // Store the endpoint to be able to reconnect to Chromium
- *   const browserWSEndpoint = browser.wsEndpoint();
- *   // Disconnect puppeteer from Chromium
- *   browser.disconnect();
- *
- *   // Use the endpoint to reestablish a connection
- *   const browser2 = await puppeteer.connect({browserWSEndpoint});
- *   // Close Chromium
- *   await browser2.close();
- * })();
- * ```
- *
- * @public
- */
-class Browser extends EventEmitter_1.EventEmitter {
-    /**
-     * @internal
-     */
-    constructor(connection, contextIds, ignoreHTTPSErrors, defaultViewport, process, closeCallback) {
-        super();
-        this._ignoreHTTPSErrors = ignoreHTTPSErrors;
-        this._defaultViewport = defaultViewport;
-        this._process = process;
-        this._connection = connection;
-        this._closeCallback = closeCallback || function () { };
-        this._defaultContext = new BrowserContext(this._connection, this, null);
-        this._contexts = new Map();
-        for (const contextId of contextIds)
-            this._contexts.set(contextId, new BrowserContext(this._connection, this, contextId));
-        this._targets = new Map();
-        this._connection.on(Events_1.Events.Connection.Disconnected, () => this.emit(Events_1.Events.Browser.Disconnected));
-        this._connection.on('Target.targetCreated', this._targetCreated.bind(this));
-        this._connection.on('Target.targetDestroyed', this._targetDestroyed.bind(this));
-        this._connection.on('Target.targetInfoChanged', this._targetInfoChanged.bind(this));
-    }
-    /**
-     * @internal
-     */
-    static async create(connection, contextIds, ignoreHTTPSErrors, defaultViewport, process, closeCallback) {
-        const browser = new Browser(connection, contextIds, ignoreHTTPSErrors, defaultViewport, process, closeCallback);
-        await connection.send('Target.setDiscoverTargets', { discover: true });
-        return browser;
-    }
-    /**
-     * The spawned browser process. Returns `null` if the browser instance was created with
-     * {@link Puppeteer.connect}.
-     */
-    process() {
-        return this._process;
-    }
-    /**
-     * Creates a new incognito browser context. This won't share cookies/cache with other
-     * browser contexts.
-     *
-     * @example
-     * ```js
-     * (async () => {
-     *  const browser = await puppeteer.launch();
-     *   // Create a new incognito browser context.
-     *   const context = await browser.createIncognitoBrowserContext();
-     *   // Create a new page in a pristine context.
-     *   const page = await context.newPage();
-     *   // Do stuff
-     *   await page.goto('https://example.com');
-     * })();
-     * ```
-     */
-    async createIncognitoBrowserContext() {
-        const { browserContextId } = await this._connection.send('Target.createBrowserContext');
-        const context = new BrowserContext(this._connection, this, browserContextId);
-        this._contexts.set(browserContextId, context);
-        return context;
-    }
-    /**
-     * Returns an array of all open browser contexts. In a newly created browser, this will
-     * return a single instance of {@link BrowserContext}.
-     */
-    browserContexts() {
-        return [this._defaultContext, ...Array.from(this._contexts.values())];
-    }
-    /**
-     * Returns the default browser context. The default browser context cannot be closed.
-     */
-    defaultBrowserContext() {
-        return this._defaultContext;
-    }
-    /**
-     * @internal
-     * Used by BrowserContext directly so cannot be marked private.
-     */
-    async _disposeContext(contextId) {
-        await this._connection.send('Target.disposeBrowserContext', {
-            browserContextId: contextId || undefined,
-        });
-        this._contexts.delete(contextId);
-    }
-    async _targetCreated(event) {
-        const targetInfo = event.targetInfo;
-        const { browserContextId } = targetInfo;
-        const context = browserContextId && this._contexts.has(browserContextId)
-            ? this._contexts.get(browserContextId)
-            : this._defaultContext;
-        const target = new Target_1.Target(targetInfo, context, () => this._connection.createSession(targetInfo), this._ignoreHTTPSErrors, this._defaultViewport);
-        assert_1.assert(!this._targets.has(event.targetInfo.targetId), 'Target should not exist before targetCreated');
-        this._targets.set(event.targetInfo.targetId, target);
-        if (await target._initializedPromise) {
-            this.emit(Events_1.Events.Browser.TargetCreated, target);
-            context.emit(Events_1.Events.BrowserContext.TargetCreated, target);
-        }
-    }
-    async _targetDestroyed(event) {
-        const target = this._targets.get(event.targetId);
-        target._initializedCallback(false);
-        this._targets.delete(event.targetId);
-        target._closedCallback();
-        if (await target._initializedPromise) {
-            this.emit(Events_1.Events.Browser.TargetDestroyed, target);
-            target
-                .browserContext()
-                .emit(Events_1.Events.BrowserContext.TargetDestroyed, target);
-        }
-    }
-    _targetInfoChanged(event) {
-        const target = this._targets.get(event.targetInfo.targetId);
-        assert_1.assert(target, 'target should exist before targetInfoChanged');
-        const previousURL = target.url();
-        const wasInitialized = target._isInitialized;
-        target._targetInfoChanged(event.targetInfo);
-        if (wasInitialized && previousURL !== target.url()) {
-            this.emit(Events_1.Events.Browser.TargetChanged, target);
-            target.browserContext().emit(Events_1.Events.BrowserContext.TargetChanged, target);
-        }
-    }
-    /**
-     * The browser websocket endpoint which can be used as an argument to
-     * {@link Puppeteer.connect}.
-     *
-     * @returns The Browser websocket url.
-     *
-     * @remarks
-     *
-     * The format is `ws://${host}:${port}/devtools/browser/<id>`.
-     *
-     * You can find the `webSocketDebuggerUrl` from `http://${host}:${port}/json/version`.
-     * Learn more about the
-     * {@link https://chromedevtools.github.io/devtools-protocol | devtools protocol} and
-     * the {@link
-     * https://chromedevtools.github.io/devtools-protocol/#how-do-i-access-the-browser-target
-     * | browser endpoint}.
-     */
-    wsEndpoint() {
-        return this._connection.url();
-    }
-    /**
-     * Creates a {@link Page} in the default browser context.
-     */
-    async newPage() {
-        return this._defaultContext.newPage();
-    }
-    /**
-     * @internal
-     * Used by BrowserContext directly so cannot be marked private.
-     */
-    async _createPageInContext(contextId) {
-        const { targetId } = await this._connection.send('Target.createTarget', {
-            url: 'about:blank',
-            browserContextId: contextId || undefined,
-        });
-        const target = await this._targets.get(targetId);
-        assert_1.assert(await target._initializedPromise, 'Failed to create target for page');
-        const page = await target.page();
-        return page;
-    }
-    /**
-     * All active targets inside the Browser. In case of multiple browser contexts, returns
-     * an array with all the targets in all browser contexts.
-     */
-    targets() {
-        return Array.from(this._targets.values()).filter((target) => target._isInitialized);
-    }
-    /**
-     * The target associated with the browser.
-     */
-    target() {
-        return this.targets().find((target) => target.type() === 'browser');
-    }
-    /**
-     * Searches for a target in all browser contexts.
-     *
-     * @param predicate - A function to be run for every target.
-     * @returns The first target found that matches the `predicate` function.
-     *
-     * @example
-     *
-     * An example of finding a target for a page opened via `window.open`:
-     * ```js
-     * await page.evaluate(() => window.open('https://www.example.com/'));
-     * const newWindowTarget = await browser.waitForTarget(target => target.url() === 'https://www.example.com/');
-     * ```
-     */
-    async waitForTarget(predicate, options = {}) {
-        const { timeout = 30000 } = options;
-        const existingTarget = this.targets().find(predicate);
-        if (existingTarget)
-            return existingTarget;
-        let resolve;
-        const targetPromise = new Promise((x) => (resolve = x));
-        this.on(Events_1.Events.Browser.TargetCreated, check);
-        this.on(Events_1.Events.Browser.TargetChanged, check);
-        try {
-            if (!timeout)
-                return await targetPromise;
-            return await helper_1.helper.waitWithTimeout(targetPromise, 'target', timeout);
-        }
-        finally {
-            this.removeListener(Events_1.Events.Browser.TargetCreated, check);
-            this.removeListener(Events_1.Events.Browser.TargetChanged, check);
-        }
-        function check(target) {
-            if (predicate(target))
-                resolve(target);
-        }
-    }
-    /**
-     * An array of all open pages inside the Browser.
-     *
-     * @remarks
-     *
-     * In case of multiple browser contexts, returns an array with all the pages in all
-     * browser contexts. Non-visible pages, such as `"background_page"`, will not be listed
-     * here. You can find them using {@link Target.page}.
-     */
-    async pages() {
-        const contextPages = await Promise.all(this.browserContexts().map((context) => context.pages()));
-        // Flatten array.
-        return contextPages.reduce((acc, x) => acc.concat(x), []);
-    }
-    /**
-     * A string representing the browser name and version.
-     *
-     * @remarks
-     *
-     * For headless Chromium, this is similar to `HeadlessChrome/61.0.3153.0`. For
-     * non-headless, this is similar to `Chrome/61.0.3153.0`.
-     *
-     * The format of browser.version() might change with future releases of Chromium.
-     */
-    async version() {
-        const version = await this._getVersion();
-        return version.product;
-    }
-    /**
-     * The browser's original user agent. Pages can override the browser user agent with
-     * {@link Page.setUserAgent}.
-     */
-    async userAgent() {
-        const version = await this._getVersion();
-        return version.userAgent;
-    }
-    /**
-     * Closes Chromium and all of its pages (if any were opened). The {@link Browser} object
-     * itself is considered to be disposed and cannot be used anymore.
-     */
-    async close() {
-        await this._closeCallback.call(null);
-        this.disconnect();
-    }
-    /**
-     * Disconnects Puppeteer from the browser, but leaves the Chromium process running.
-     * After calling `disconnect`, the {@link Browser} object is considered disposed and
-     * cannot be used anymore.
-     */
-    disconnect() {
-        this._connection.dispose();
-    }
-    /**
-     * Indicates that the browser is connected.
-     */
-    isConnected() {
-        return !this._connection._closed;
-    }
-    _getVersion() {
-        return this._connection.send('Browser.getVersion');
-    }
-}
-exports.Browser = Browser;
-/**
- * BrowserContexts provide a way to operate multiple independent browser sessions.
- * When a browser is launched, it has a single BrowserContext used by default.
- * The method {@link Browser.newPage | Browser.newPage} creates a page
- * in the default browser context.
- *
- * @remarks
- *
- * If a page opens another page, e.g. with a `window.open` call,
- * the popup will belong to the parent page's browser context.
- *
- * Puppeteer allows creation of "incognito" browser contexts with
- * {@link Browser.createIncognitoBrowserContext | Browser.createIncognitoBrowserContext}
- * method. "Incognito" browser contexts don't write any browsing data to disk.
- *
- * @example
- * ```js
- * // Create a new incognito browser context
- * const context = await browser.createIncognitoBrowserContext();
- * // Create a new page inside context.
- * const page = await context.newPage();
- * // ... do stuff with page ...
- * await page.goto('https://example.com');
- * // Dispose context once it's no longer needed.
- * await context.close();
- * ```
- */
-class BrowserContext extends EventEmitter_1.EventEmitter {
-    /**
-     * @internal
-     */
-    constructor(connection, browser, contextId) {
-        super();
-        this._connection = connection;
-        this._browser = browser;
-        this._id = contextId;
-    }
-    /**
-     * An array of all active targets inside the browser context.
-     */
-    targets() {
-        return this._browser
-            .targets()
-            .filter((target) => target.browserContext() === this);
-    }
-    /**
-     * This searches for a target in this specific browser context.
-     *
-     * @example
-     * An example of finding a target for a page opened via `window.open`:
-     * ```js
-     * await page.evaluate(() => window.open('https://www.example.com/'));
-     * const newWindowTarget = await browserContext.waitForTarget(target => target.url() === 'https://www.example.com/');
-     * ```
-     *
-     * @param predicate - A function to be run for every target
-     * @param options - An object of options. Accepts a timout,
-     * which is the maximum wait time in milliseconds.
-     * Pass `0` to disable the timeout. Defaults to 30 seconds.
-     * @returns Promise which resolves to the first target found
-     * that matches the `predicate` function.
-     */
-    waitForTarget(predicate, options = {}) {
-        return this._browser.waitForTarget((target) => target.browserContext() === this && predicate(target), options);
-    }
-    /**
-     * An array of all pages inside the browser context.
-     *
-     * @returns Promise which resolves to an array of all open pages.
-     * Non visible pages, such as `"background_page"`, will not be listed here.
-     * You can find them using {@link Target.page | the target page}.
-     */
-    async pages() {
-        const pages = await Promise.all(this.targets()
-            .filter((target) => target.type() === 'page')
-            .map((target) => target.page()));
-        return pages.filter((page) => !!page);
-    }
-    /**
-     * Returns whether BrowserContext is incognito.
-     * The default browser context is the only non-incognito browser context.
-     *
-     * @remarks
-     * The default browser context cannot be closed.
-     */
-    isIncognito() {
-        return !!this._id;
-    }
-    /**
-     * @example
-     * ```js
-     * const context = browser.defaultBrowserContext();
-     * await context.overridePermissions('https://html5demos.com', ['geolocation']);
-     * ```
-     *
-     * @param origin - The origin to grant permissions to, e.g. "https://example.com".
-     * @param permissions - An array of permissions to grant.
-     * All permissions that are not listed here will be automatically denied.
-     */
-    async overridePermissions(origin, permissions) {
-        const webPermissionToProtocol = new Map([
-            ['geolocation', 'geolocation'],
-            ['midi', 'midi'],
-            ['notifications', 'notifications'],
-            // TODO: push isn't a valid type?
-            // ['push', 'push'],
-            ['camera', 'videoCapture'],
-            ['microphone', 'audioCapture'],
-            ['background-sync', 'backgroundSync'],
-            ['ambient-light-sensor', 'sensors'],
-            ['accelerometer', 'sensors'],
-            ['gyroscope', 'sensors'],
-            ['magnetometer', 'sensors'],
-            ['accessibility-events', 'accessibilityEvents'],
-            ['clipboard-read', 'clipboardReadWrite'],
-            ['clipboard-write', 'clipboardReadWrite'],
-            ['payment-handler', 'paymentHandler'],
-            // chrome-specific permissions we have.
-            ['midi-sysex', 'midiSysex'],
-        ]);
-        permissions = permissions.map((permission) => {
-            const protocolPermission = webPermissionToProtocol.get(permission);
-            if (!protocolPermission)
-                throw new Error('Unknown permission: ' + permission);
-            return protocolPermission;
-        });
-        await this._connection.send('Browser.grantPermissions', {
-            origin,
-            browserContextId: this._id || undefined,
-            permissions,
-        });
-    }
-    /**
-     * Clears all permission overrides for the browser context.
-     *
-     * @example
-     * ```js
-     * const context = browser.defaultBrowserContext();
-     * context.overridePermissions('https://example.com', ['clipboard-read']);
-     * // do stuff ..
-     * context.clearPermissionOverrides();
-     * ```
-     */
-    async clearPermissionOverrides() {
-        await this._connection.send('Browser.resetPermissions', {
-            browserContextId: this._id || undefined,
-        });
-    }
-    /**
-     * Creates a new page in the browser context.
-     */
-    newPage() {
-        return this._browser._createPageInContext(this._id);
-    }
-    /**
-     * The browser this browser context belongs to.
-     */
-    browser() {
-        return this._browser;
-    }
-    /**
-     * Closes the browser context. All the targets that belong to the browser context
-     * will be closed.
-     *
-     * @remarks
-     * Only incognito browser contexts can be closed.
-     */
-    async close() {
-        assert_1.assert(this._id, 'Non-incognito profiles cannot be closed!');
-        await this._browser._disposeContext(this._id);
-    }
-}
-exports.BrowserContext = BrowserContext;
-
-
-/***/ }),
-/* 27 */,
-/* 28 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-"use strict";
-
-
-const { Duplex } = __webpack_require__(418);
-
-/**
- * Emits the `'close'` event on a stream.
- *
- * @param {stream.Duplex} The stream.
- * @private
- */
-function emitClose(stream) {
-  stream.emit('close');
-}
-
-/**
- * The listener of the `'end'` event.
- *
- * @private
- */
-function duplexOnEnd() {
-  if (!this.destroyed && this._writableState.finished) {
-    this.destroy();
-  }
-}
-
-/**
- * The listener of the `'error'` event.
- *
- * @private
- */
-function duplexOnError(err) {
-  this.removeListener('error', duplexOnError);
-  this.destroy();
-  if (this.listenerCount('error') === 0) {
-    // Do not suppress the throwing behavior.
-    this.emit('error', err);
-  }
-}
-
-/**
- * Wraps a `WebSocket` in a duplex stream.
- *
- * @param {WebSocket} ws The `WebSocket` to wrap
- * @param {Object} options The options for the `Duplex` constructor
- * @return {stream.Duplex} The duplex stream
- * @public
- */
-function createWebSocketStream(ws, options) {
-  let resumeOnReceiverDrain = true;
-
-  function receiverOnDrain() {
-    if (resumeOnReceiverDrain) ws._socket.resume();
-  }
-
-  if (ws.readyState === ws.CONNECTING) {
-    ws.once('open', function open() {
-      ws._receiver.removeAllListeners('drain');
-      ws._receiver.on('drain', receiverOnDrain);
-    });
-  } else {
-    ws._receiver.removeAllListeners('drain');
-    ws._receiver.on('drain', receiverOnDrain);
-  }
-
-  const duplex = new Duplex({
-    ...options,
-    autoDestroy: false,
-    emitClose: false,
-    objectMode: false,
-    writableObjectMode: false
-  });
-
-  ws.on('message', function message(msg) {
-    if (!duplex.push(msg)) {
-      resumeOnReceiverDrain = false;
-      ws._socket.pause();
-    }
-  });
-
-  ws.once('error', function error(err) {
-    if (duplex.destroyed) return;
-
-    duplex.destroy(err);
-  });
-
-  ws.once('close', function close() {
-    if (duplex.destroyed) return;
-
-    duplex.push(null);
-  });
-
-  duplex._destroy = function (err, callback) {
-    if (ws.readyState === ws.CLOSED) {
-      callback(err);
-      process.nextTick(emitClose, duplex);
-      return;
-    }
-
-    let called = false;
-
-    ws.once('error', function error(err) {
-      called = true;
-      callback(err);
-    });
-
-    ws.once('close', function close() {
-      if (!called) callback(err);
-      process.nextTick(emitClose, duplex);
-    });
-    ws.terminate();
-  };
-
-  duplex._final = function (callback) {
-    if (ws.readyState === ws.CONNECTING) {
-      ws.once('open', function open() {
-        duplex._final(callback);
-      });
-      return;
-    }
-
-    // If the value of the `_socket` property is `null` it means that `ws` is a
-    // client websocket and the handshake failed. In fact, when this happens, a
-    // socket is never assigned to the websocket. Wait for the `'error'` event
-    // that will be emitted by the websocket.
-    if (ws._socket === null) return;
-
-    if (ws._socket._writableState.finished) {
-      callback();
-      if (duplex._readableState.endEmitted) duplex.destroy();
-    } else {
-      ws._socket.once('finish', function finish() {
-        // `duplex` is not destroyed here because the `'end'` event will be
-        // emitted on `duplex` after this `'finish'` event. The EOF signaling
-        // `null` chunk is, in fact, pushed when the websocket emits `'close'`.
-        callback();
-      });
-      ws.close();
-    }
-  };
-
-  duplex._read = function () {
-    if (ws.readyState === ws.OPEN && !resumeOnReceiverDrain) {
-      resumeOnReceiverDrain = true;
-      if (!ws._receiver._writableState.needDrain) ws._socket.resume();
-    }
-  };
-
-  duplex._write = function (chunk, encoding, callback) {
-    if (ws.readyState === ws.CONNECTING) {
-      ws.once('open', function open() {
-        duplex._write(chunk, encoding, callback);
-      });
-      return;
-    }
-
-    ws.send(chunk, callback);
-  };
-
-  duplex.on('end', duplexOnEnd);
-  duplex.on('error', duplexOnError);
-  return duplex;
-}
-
-module.exports = createWebSocketStream;
-
-
-/***/ }),
-/* 29 */,
 /* 30 */,
 /* 31 */,
-/* 32 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Frame = exports.FrameManager = void 0;
-const EventEmitter_1 = __webpack_require__(304);
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const Events_1 = __webpack_require__(872);
-const ExecutionContext_1 = __webpack_require__(317);
-const LifecycleWatcher_1 = __webpack_require__(660);
-const DOMWorld_1 = __webpack_require__(963);
-const NetworkManager_1 = __webpack_require__(168);
-const UTILITY_WORLD_NAME = '__puppeteer_utility_world__';
-class FrameManager extends EventEmitter_1.EventEmitter {
-    constructor(client, page, ignoreHTTPSErrors, timeoutSettings) {
-        super();
-        this._frames = new Map();
-        this._contextIdToContext = new Map();
-        this._isolatedWorlds = new Set();
-        this._client = client;
-        this._page = page;
-        this._networkManager = new NetworkManager_1.NetworkManager(client, ignoreHTTPSErrors, this);
-        this._timeoutSettings = timeoutSettings;
-        this._client.on('Page.frameAttached', (event) => this._onFrameAttached(event.frameId, event.parentFrameId));
-        this._client.on('Page.frameNavigated', (event) => this._onFrameNavigated(event.frame));
-        this._client.on('Page.navigatedWithinDocument', (event) => this._onFrameNavigatedWithinDocument(event.frameId, event.url));
-        this._client.on('Page.frameDetached', (event) => this._onFrameDetached(event.frameId));
-        this._client.on('Page.frameStoppedLoading', (event) => this._onFrameStoppedLoading(event.frameId));
-        this._client.on('Runtime.executionContextCreated', (event) => this._onExecutionContextCreated(event.context));
-        this._client.on('Runtime.executionContextDestroyed', (event) => this._onExecutionContextDestroyed(event.executionContextId));
-        this._client.on('Runtime.executionContextsCleared', () => this._onExecutionContextsCleared());
-        this._client.on('Page.lifecycleEvent', (event) => this._onLifecycleEvent(event));
-    }
-    async initialize() {
-        const result = await Promise.all([
-            this._client.send('Page.enable'),
-            this._client.send('Page.getFrameTree'),
-        ]);
-        const { frameTree } = result[1];
-        this._handleFrameTree(frameTree);
-        await Promise.all([
-            this._client.send('Page.setLifecycleEventsEnabled', { enabled: true }),
-            this._client
-                .send('Runtime.enable', {})
-                .then(() => this._ensureIsolatedWorld(UTILITY_WORLD_NAME)),
-            this._networkManager.initialize(),
-        ]);
-    }
-    networkManager() {
-        return this._networkManager;
-    }
-    async navigateFrame(frame, url, options = {}) {
-        assertNoLegacyNavigationOptions(options);
-        const { referer = this._networkManager.extraHTTPHeaders()['referer'], waitUntil = ['load'], timeout = this._timeoutSettings.navigationTimeout(), } = options;
-        const watcher = new LifecycleWatcher_1.LifecycleWatcher(this, frame, waitUntil, timeout);
-        let ensureNewDocumentNavigation = false;
-        let error = await Promise.race([
-            navigate(this._client, url, referer, frame._id),
-            watcher.timeoutOrTerminationPromise(),
-        ]);
-        if (!error) {
-            error = await Promise.race([
-                watcher.timeoutOrTerminationPromise(),
-                ensureNewDocumentNavigation
-                    ? watcher.newDocumentNavigationPromise()
-                    : watcher.sameDocumentNavigationPromise(),
-            ]);
-        }
-        watcher.dispose();
-        if (error)
-            throw error;
-        return watcher.navigationResponse();
-        async function navigate(client, url, referrer, frameId) {
-            try {
-                const response = await client.send('Page.navigate', {
-                    url,
-                    referrer,
-                    frameId,
-                });
-                ensureNewDocumentNavigation = !!response.loaderId;
-                return response.errorText
-                    ? new Error(`${response.errorText} at ${url}`)
-                    : null;
-            }
-            catch (error) {
-                return error;
-            }
-        }
-    }
-    async waitForFrameNavigation(frame, options = {}) {
-        assertNoLegacyNavigationOptions(options);
-        const { waitUntil = ['load'], timeout = this._timeoutSettings.navigationTimeout(), } = options;
-        const watcher = new LifecycleWatcher_1.LifecycleWatcher(this, frame, waitUntil, timeout);
-        const error = await Promise.race([
-            watcher.timeoutOrTerminationPromise(),
-            watcher.sameDocumentNavigationPromise(),
-            watcher.newDocumentNavigationPromise(),
-        ]);
-        watcher.dispose();
-        if (error)
-            throw error;
-        return watcher.navigationResponse();
-    }
-    _onLifecycleEvent(event) {
-        const frame = this._frames.get(event.frameId);
-        if (!frame)
-            return;
-        frame._onLifecycleEvent(event.loaderId, event.name);
-        this.emit(Events_1.Events.FrameManager.LifecycleEvent, frame);
-    }
-    _onFrameStoppedLoading(frameId) {
-        const frame = this._frames.get(frameId);
-        if (!frame)
-            return;
-        frame._onLoadingStopped();
-        this.emit(Events_1.Events.FrameManager.LifecycleEvent, frame);
-    }
-    _handleFrameTree(frameTree) {
-        if (frameTree.frame.parentId)
-            this._onFrameAttached(frameTree.frame.id, frameTree.frame.parentId);
-        this._onFrameNavigated(frameTree.frame);
-        if (!frameTree.childFrames)
-            return;
-        for (const child of frameTree.childFrames)
-            this._handleFrameTree(child);
-    }
-    page() {
-        return this._page;
-    }
-    mainFrame() {
-        return this._mainFrame;
-    }
-    frames() {
-        return Array.from(this._frames.values());
-    }
-    frame(frameId) {
-        return this._frames.get(frameId) || null;
-    }
-    _onFrameAttached(frameId, parentFrameId) {
-        if (this._frames.has(frameId))
-            return;
-        assert_1.assert(parentFrameId);
-        const parentFrame = this._frames.get(parentFrameId);
-        const frame = new Frame(this, this._client, parentFrame, frameId);
-        this._frames.set(frame._id, frame);
-        this.emit(Events_1.Events.FrameManager.FrameAttached, frame);
-    }
-    _onFrameNavigated(framePayload) {
-        const isMainFrame = !framePayload.parentId;
-        let frame = isMainFrame
-            ? this._mainFrame
-            : this._frames.get(framePayload.id);
-        assert_1.assert(isMainFrame || frame, 'We either navigate top level or have old version of the navigated frame');
-        // Detach all child frames first.
-        if (frame) {
-            for (const child of frame.childFrames())
-                this._removeFramesRecursively(child);
-        }
-        // Update or create main frame.
-        if (isMainFrame) {
-            if (frame) {
-                // Update frame id to retain frame identity on cross-process navigation.
-                this._frames.delete(frame._id);
-                frame._id = framePayload.id;
-            }
-            else {
-                // Initial main frame navigation.
-                frame = new Frame(this, this._client, null, framePayload.id);
-            }
-            this._frames.set(framePayload.id, frame);
-            this._mainFrame = frame;
-        }
-        // Update frame payload.
-        frame._navigated(framePayload);
-        this.emit(Events_1.Events.FrameManager.FrameNavigated, frame);
-    }
-    async _ensureIsolatedWorld(name) {
-        if (this._isolatedWorlds.has(name))
-            return;
-        this._isolatedWorlds.add(name);
-        await this._client.send('Page.addScriptToEvaluateOnNewDocument', {
-            source: `//# sourceURL=${ExecutionContext_1.EVALUATION_SCRIPT_URL}`,
-            worldName: name,
-        }),
-            await Promise.all(this.frames().map((frame) => this._client
-                .send('Page.createIsolatedWorld', {
-                frameId: frame._id,
-                grantUniveralAccess: true,
-                worldName: name,
-            })
-                .catch(helper_1.debugError))); // frames might be removed before we send this
-    }
-    _onFrameNavigatedWithinDocument(frameId, url) {
-        const frame = this._frames.get(frameId);
-        if (!frame)
-            return;
-        frame._navigatedWithinDocument(url);
-        this.emit(Events_1.Events.FrameManager.FrameNavigatedWithinDocument, frame);
-        this.emit(Events_1.Events.FrameManager.FrameNavigated, frame);
-    }
-    _onFrameDetached(frameId) {
-        const frame = this._frames.get(frameId);
-        if (frame)
-            this._removeFramesRecursively(frame);
-    }
-    _onExecutionContextCreated(contextPayload) {
-        const auxData = contextPayload.auxData;
-        const frameId = auxData ? auxData.frameId : null;
-        const frame = this._frames.get(frameId) || null;
-        let world = null;
-        if (frame) {
-            if (contextPayload.auxData && !!contextPayload.auxData['isDefault']) {
-                world = frame._mainWorld;
-            }
-            else if (contextPayload.name === UTILITY_WORLD_NAME &&
-                !frame._secondaryWorld._hasContext()) {
-                // In case of multiple sessions to the same target, there's a race between
-                // connections so we might end up creating multiple isolated worlds.
-                // We can use either.
-                world = frame._secondaryWorld;
-            }
-        }
-        if (contextPayload.auxData && contextPayload.auxData['type'] === 'isolated')
-            this._isolatedWorlds.add(contextPayload.name);
-        const context = new ExecutionContext_1.ExecutionContext(this._client, contextPayload, world);
-        if (world)
-            world._setContext(context);
-        this._contextIdToContext.set(contextPayload.id, context);
-    }
-    /**
-     * @param {number} executionContextId
-     */
-    _onExecutionContextDestroyed(executionContextId) {
-        const context = this._contextIdToContext.get(executionContextId);
-        if (!context)
-            return;
-        this._contextIdToContext.delete(executionContextId);
-        if (context._world)
-            context._world._setContext(null);
-    }
-    _onExecutionContextsCleared() {
-        for (const context of this._contextIdToContext.values()) {
-            if (context._world)
-                context._world._setContext(null);
-        }
-        this._contextIdToContext.clear();
-    }
-    executionContextById(contextId) {
-        const context = this._contextIdToContext.get(contextId);
-        assert_1.assert(context, 'INTERNAL ERROR: missing context with id = ' + contextId);
-        return context;
-    }
-    _removeFramesRecursively(frame) {
-        for (const child of frame.childFrames())
-            this._removeFramesRecursively(child);
-        frame._detach();
-        this._frames.delete(frame._id);
-        this.emit(Events_1.Events.FrameManager.FrameDetached, frame);
-    }
-}
-exports.FrameManager = FrameManager;
-class Frame {
-    constructor(frameManager, client, parentFrame, frameId) {
-        this._url = '';
-        this._detached = false;
-        this._loaderId = '';
-        this._lifecycleEvents = new Set();
-        this._frameManager = frameManager;
-        this._client = client;
-        this._parentFrame = parentFrame;
-        this._url = '';
-        this._id = frameId;
-        this._detached = false;
-        this._loaderId = '';
-        this._mainWorld = new DOMWorld_1.DOMWorld(frameManager, this, frameManager._timeoutSettings);
-        this._secondaryWorld = new DOMWorld_1.DOMWorld(frameManager, this, frameManager._timeoutSettings);
-        this._childFrames = new Set();
-        if (this._parentFrame)
-            this._parentFrame._childFrames.add(this);
-    }
-    async goto(url, options = {}) {
-        return await this._frameManager.navigateFrame(this, url, options);
-    }
-    async waitForNavigation(options = {}) {
-        return await this._frameManager.waitForFrameNavigation(this, options);
-    }
-    executionContext() {
-        return this._mainWorld.executionContext();
-    }
-    async evaluateHandle(pageFunction, ...args) {
-        return this._mainWorld.evaluateHandle(pageFunction, ...args);
-    }
-    async evaluate(pageFunction, ...args) {
-        return this._mainWorld.evaluate(pageFunction, ...args);
-    }
-    async $(selector) {
-        return this._mainWorld.$(selector);
-    }
-    async $x(expression) {
-        return this._mainWorld.$x(expression);
-    }
-    async $eval(selector, pageFunction, ...args) {
-        return this._mainWorld.$eval(selector, pageFunction, ...args);
-    }
-    async $$eval(selector, pageFunction, ...args) {
-        return this._mainWorld.$$eval(selector, pageFunction, ...args);
-    }
-    async $$(selector) {
-        return this._mainWorld.$$(selector);
-    }
-    async content() {
-        return this._secondaryWorld.content();
-    }
-    async setContent(html, options = {}) {
-        return this._secondaryWorld.setContent(html, options);
-    }
-    name() {
-        return this._name || '';
-    }
-    url() {
-        return this._url;
-    }
-    parentFrame() {
-        return this._parentFrame;
-    }
-    childFrames() {
-        return Array.from(this._childFrames);
-    }
-    isDetached() {
-        return this._detached;
-    }
-    async addScriptTag(options) {
-        return this._mainWorld.addScriptTag(options);
-    }
-    async addStyleTag(options) {
-        return this._mainWorld.addStyleTag(options);
-    }
-    async click(selector, options = {}) {
-        return this._secondaryWorld.click(selector, options);
-    }
-    async focus(selector) {
-        return this._secondaryWorld.focus(selector);
-    }
-    async hover(selector) {
-        return this._secondaryWorld.hover(selector);
-    }
-    select(selector, ...values) {
-        return this._secondaryWorld.select(selector, ...values);
-    }
-    async tap(selector) {
-        return this._secondaryWorld.tap(selector);
-    }
-    async type(selector, text, options) {
-        return this._mainWorld.type(selector, text, options);
-    }
-    waitFor(selectorOrFunctionOrTimeout, options = {}, ...args) {
-        const xPathPattern = '//';
-        if (helper_1.helper.isString(selectorOrFunctionOrTimeout)) {
-            const string = selectorOrFunctionOrTimeout;
-            if (string.startsWith(xPathPattern))
-                return this.waitForXPath(string, options);
-            return this.waitForSelector(string, options);
-        }
-        if (helper_1.helper.isNumber(selectorOrFunctionOrTimeout))
-            return new Promise((fulfill) => setTimeout(fulfill, selectorOrFunctionOrTimeout));
-        if (typeof selectorOrFunctionOrTimeout === 'function')
-            return this.waitForFunction(selectorOrFunctionOrTimeout, options, ...args);
-        return Promise.reject(new Error('Unsupported target type: ' + typeof selectorOrFunctionOrTimeout));
-    }
-    async waitForSelector(selector, options = {}) {
-        const handle = await this._secondaryWorld.waitForSelector(selector, options);
-        if (!handle)
-            return null;
-        const mainExecutionContext = await this._mainWorld.executionContext();
-        const result = await mainExecutionContext._adoptElementHandle(handle);
-        await handle.dispose();
-        return result;
-    }
-    async waitForXPath(xpath, options = {}) {
-        const handle = await this._secondaryWorld.waitForXPath(xpath, options);
-        if (!handle)
-            return null;
-        const mainExecutionContext = await this._mainWorld.executionContext();
-        const result = await mainExecutionContext._adoptElementHandle(handle);
-        await handle.dispose();
-        return result;
-    }
-    waitForFunction(pageFunction, options = {}, ...args) {
-        return this._mainWorld.waitForFunction(pageFunction, options, ...args);
-    }
-    async title() {
-        return this._secondaryWorld.title();
-    }
-    _navigated(framePayload) {
-        this._name = framePayload.name;
-        this._url = framePayload.url;
-    }
-    _navigatedWithinDocument(url) {
-        this._url = url;
-    }
-    _onLifecycleEvent(loaderId, name) {
-        if (name === 'init') {
-            this._loaderId = loaderId;
-            this._lifecycleEvents.clear();
-        }
-        this._lifecycleEvents.add(name);
-    }
-    _onLoadingStopped() {
-        this._lifecycleEvents.add('DOMContentLoaded');
-        this._lifecycleEvents.add('load');
-    }
-    _detach() {
-        this._detached = true;
-        this._mainWorld._detach();
-        this._secondaryWorld._detach();
-        if (this._parentFrame)
-            this._parentFrame._childFrames.delete(this);
-        this._parentFrame = null;
-    }
-}
-exports.Frame = Frame;
-function assertNoLegacyNavigationOptions(options) {
-    assert_1.assert(options['networkIdleTimeout'] === undefined, 'ERROR: networkIdleTimeout option is no longer supported.');
-    assert_1.assert(options['networkIdleInflight'] === undefined, 'ERROR: networkIdleInflight option is no longer supported.');
-    assert_1.assert(options.waitUntil !== 'networkidle', 'ERROR: "networkidle" option is no longer supported. Use "networkidle2" instead');
-}
-
-
-/***/ }),
+/* 32 */,
 /* 33 */,
 /* 34 */,
 /* 35 */,
-/* 36 */
-/***/ (function(module) {
-
-module.exports = require("string_decoder");
-
-/***/ }),
+/* 36 */,
 /* 37 */,
 /* 38 */,
 /* 39 */
@@ -2977,50 +2283,7 @@ function onceStrict (fn) {
 /* 54 */,
 /* 55 */,
 /* 56 */,
-/* 57 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.EmulationManager = void 0;
-class EmulationManager {
-    constructor(client) {
-        this._emulatingMobile = false;
-        this._hasTouch = false;
-        this._client = client;
-    }
-    async emulateViewport(viewport) {
-        const mobile = viewport.isMobile || false;
-        const width = viewport.width;
-        const height = viewport.height;
-        const deviceScaleFactor = viewport.deviceScaleFactor || 1;
-        const screenOrientation = viewport.isLandscape
-            ? { angle: 90, type: 'landscapePrimary' }
-            : { angle: 0, type: 'portraitPrimary' };
-        const hasTouch = viewport.hasTouch || false;
-        await Promise.all([
-            this._client.send('Emulation.setDeviceMetricsOverride', {
-                mobile,
-                width,
-                height,
-                deviceScaleFactor,
-                screenOrientation,
-            }),
-            this._client.send('Emulation.setTouchEmulationEnabled', {
-                enabled: hasTouch,
-            }),
-        ]);
-        const reloadNeeded = this._emulatingMobile !== mobile || this._hasTouch !== hasTouch;
-        this._emulatingMobile = mobile;
-        this._hasTouch = hasTouch;
-        return reloadNeeded;
-    }
-}
-exports.EmulationManager = EmulationManager;
-
-
-/***/ }),
+/* 57 */,
 /* 58 */
 /***/ (function(module) {
 
@@ -3028,7 +2291,47 @@ module.exports = require("readline");
 
 /***/ }),
 /* 59 */,
-/* 60 */,
+/* 60 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+/**
+ * Copyright 2020 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.paperFormats = void 0;
+/**
+ * @internal
+ */
+exports.paperFormats = {
+    letter: { width: 8.5, height: 11 },
+    legal: { width: 8.5, height: 14 },
+    tabloid: { width: 11, height: 17 },
+    ledger: { width: 17, height: 11 },
+    a0: { width: 33.1, height: 46.8 },
+    a1: { width: 23.4, height: 33.1 },
+    a2: { width: 16.54, height: 23.4 },
+    a3: { width: 11.7, height: 16.54 },
+    a4: { width: 8.27, height: 11.7 },
+    a5: { width: 5.83, height: 8.27 },
+    a6: { width: 4.13, height: 5.83 },
+};
+
+
+/***/ }),
 /* 61 */,
 /* 62 */,
 /* 63 */,
@@ -3036,62 +2339,7 @@ module.exports = require("readline");
 /* 65 */,
 /* 66 */,
 /* 67 */,
-/* 68 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-
-Object.defineProperty(exports, '__esModule', { value: true });
-
-async function auth(token) {
-  const tokenType = token.split(/\./).length === 3 ? "app" : /^v\d+\./.test(token) ? "installation" : "oauth";
-  return {
-    type: "token",
-    token: token,
-    tokenType
-  };
-}
-
-/**
- * Prefix token for usage in the Authorization header
- *
- * @param token OAuth token or JSON Web Token
- */
-function withAuthorizationPrefix(token) {
-  if (token.split(/\./).length === 3) {
-    return `bearer ${token}`;
-  }
-
-  return `token ${token}`;
-}
-
-async function hook(token, request, route, parameters) {
-  const endpoint = request.endpoint.merge(route, parameters);
-  endpoint.headers.authorization = withAuthorizationPrefix(token);
-  return request(endpoint);
-}
-
-const createTokenAuth = function createTokenAuth(token) {
-  if (!token) {
-    throw new Error("[@octokit/auth-token] No token passed to createTokenAuth");
-  }
-
-  if (typeof token !== "string") {
-    throw new Error("[@octokit/auth-token] Token passed to createTokenAuth is not a string");
-  }
-
-  token = token.replace(/^(token|bearer) +/i, "");
-  return Object.assign(auth.bind(null, token), {
-    hook: hook.bind(null, token)
-  });
-};
-
-exports.createTokenAuth = createTokenAuth;
-//# sourceMappingURL=index.js.map
-
-
-/***/ }),
+/* 68 */,
 /* 69 */,
 /* 70 */,
 /* 71 */
@@ -3169,54 +2417,7 @@ module.exports.default = pTry;
 /* 75 */,
 /* 76 */,
 /* 77 */,
-/* 78 */
-/***/ (function(module) {
-
-"use strict";
-
-const alias = ['stdin', 'stdout', 'stderr'];
-
-const hasAlias = opts => alias.some(x => Boolean(opts[x]));
-
-module.exports = opts => {
-	if (!opts) {
-		return null;
-	}
-
-	if (opts.stdio && hasAlias(opts)) {
-		throw new Error(`It's not possible to provide \`stdio\` in combination with one of ${alias.map(x => `\`${x}\``).join(', ')}`);
-	}
-
-	if (typeof opts.stdio === 'string') {
-		return opts.stdio;
-	}
-
-	const stdio = opts.stdio || [];
-
-	if (!Array.isArray(stdio)) {
-		throw new TypeError(`Expected \`stdio\` to be of type \`string\` or \`Array\`, got \`${typeof stdio}\``);
-	}
-
-	const result = [];
-	const len = Math.max(stdio.length, alias.length);
-
-	for (let i = 0; i < len; i++) {
-		let value = null;
-
-		if (stdio[i] !== undefined) {
-			value = stdio[i];
-		} else if (opts[alias[i]] !== undefined) {
-			value = opts[alias[i]];
-		}
-
-		result[i] = value;
-	}
-
-	return result;
-};
-
-
-/***/ }),
+/* 78 */,
 /* 79 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -3538,7 +2739,31 @@ formatters.O = function (v) {
 
 
 /***/ }),
-/* 82 */,
+/* 82 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// We use any as a valid input type
+/* eslint-disable @typescript-eslint/no-explicit-any */
+Object.defineProperty(exports, "__esModule", { value: true });
+/**
+ * Sanitizes an input into a string so it can be passed into issueCommand safely
+ * @param input input to sanitize into a string
+ */
+function toCommandValue(input) {
+    if (input === null || input === undefined) {
+        return '';
+    }
+    else if (typeof input === 'string' || input instanceof String) {
+        return input;
+    }
+    return JSON.stringify(input);
+}
+exports.toCommandValue = toCommandValue;
+//# sourceMappingURL=utils.js.map
+
+/***/ }),
 /* 83 */,
 /* 84 */,
 /* 85 */,
@@ -3555,7 +2780,7 @@ module.exports = require("os");
 "use strict";
 
 /**
- * Copyright 2017 Google Inc. All rights reserved.
+ * Copyright 2020 Google Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -3570,865 +2795,11 @@ module.exports = require("os");
  * limitations under the License.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.devicesMap = void 0;
-const devices = [
-    {
-        name: 'Blackberry PlayBook',
-        userAgent: 'Mozilla/5.0 (PlayBook; U; RIM Tablet OS 2.1.0; en-US) AppleWebKit/536.2+ (KHTML like Gecko) Version/7.2.1.0 Safari/536.2+',
-        viewport: {
-            width: 600,
-            height: 1024,
-            deviceScaleFactor: 1,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Blackberry PlayBook landscape',
-        userAgent: 'Mozilla/5.0 (PlayBook; U; RIM Tablet OS 2.1.0; en-US) AppleWebKit/536.2+ (KHTML like Gecko) Version/7.2.1.0 Safari/536.2+',
-        viewport: {
-            width: 1024,
-            height: 600,
-            deviceScaleFactor: 1,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'BlackBerry Z30',
-        userAgent: 'Mozilla/5.0 (BB10; Touch) AppleWebKit/537.10+ (KHTML, like Gecko) Version/10.0.9.2372 Mobile Safari/537.10+',
-        viewport: {
-            width: 360,
-            height: 640,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'BlackBerry Z30 landscape',
-        userAgent: 'Mozilla/5.0 (BB10; Touch) AppleWebKit/537.10+ (KHTML, like Gecko) Version/10.0.9.2372 Mobile Safari/537.10+',
-        viewport: {
-            width: 640,
-            height: 360,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Galaxy Note 3',
-        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.3; en-us; SM-N900T Build/JSS15J) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
-        viewport: {
-            width: 360,
-            height: 640,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Galaxy Note 3 landscape',
-        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.3; en-us; SM-N900T Build/JSS15J) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
-        viewport: {
-            width: 640,
-            height: 360,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Galaxy Note II',
-        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.1; en-us; GT-N7100 Build/JRO03C) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
-        viewport: {
-            width: 360,
-            height: 640,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Galaxy Note II landscape',
-        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.1; en-us; GT-N7100 Build/JRO03C) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
-        viewport: {
-            width: 640,
-            height: 360,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Galaxy S III',
-        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.0; en-us; GT-I9300 Build/IMM76D) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
-        viewport: {
-            width: 360,
-            height: 640,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Galaxy S III landscape',
-        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.0; en-us; GT-I9300 Build/IMM76D) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
-        viewport: {
-            width: 640,
-            height: 360,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Galaxy S5',
-        userAgent: 'Mozilla/5.0 (Linux; Android 5.0; SM-G900P Build/LRX21T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 360,
-            height: 640,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Galaxy S5 landscape',
-        userAgent: 'Mozilla/5.0 (Linux; Android 5.0; SM-G900P Build/LRX21T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 640,
-            height: 360,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPad',
-        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
-        viewport: {
-            width: 768,
-            height: 1024,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPad landscape',
-        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
-        viewport: {
-            width: 1024,
-            height: 768,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPad Mini',
-        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
-        viewport: {
-            width: 768,
-            height: 1024,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPad Mini landscape',
-        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
-        viewport: {
-            width: 1024,
-            height: 768,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPad Pro',
-        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
-        viewport: {
-            width: 1024,
-            height: 1366,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPad Pro landscape',
-        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
-        viewport: {
-            width: 1366,
-            height: 1024,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone 4',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 7_1_2 like Mac OS X) AppleWebKit/537.51.2 (KHTML, like Gecko) Version/7.0 Mobile/11D257 Safari/9537.53',
-        viewport: {
-            width: 320,
-            height: 480,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone 4 landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 7_1_2 like Mac OS X) AppleWebKit/537.51.2 (KHTML, like Gecko) Version/7.0 Mobile/11D257 Safari/9537.53',
-        viewport: {
-            width: 480,
-            height: 320,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone 5',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_1 like Mac OS X) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.0 Mobile/14E304 Safari/602.1',
-        viewport: {
-            width: 320,
-            height: 568,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone 5 landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_1 like Mac OS X) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.0 Mobile/14E304 Safari/602.1',
-        viewport: {
-            width: 568,
-            height: 320,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone 6',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 375,
-            height: 667,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone 6 landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 667,
-            height: 375,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone 6 Plus',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 414,
-            height: 736,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone 6 Plus landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 736,
-            height: 414,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone 7',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 375,
-            height: 667,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone 7 landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 667,
-            height: 375,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone 7 Plus',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 414,
-            height: 736,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone 7 Plus landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 736,
-            height: 414,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone 8',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 375,
-            height: 667,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone 8 landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 667,
-            height: 375,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone 8 Plus',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 414,
-            height: 736,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone 8 Plus landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 736,
-            height: 414,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone SE',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_1 like Mac OS X) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.0 Mobile/14E304 Safari/602.1',
-        viewport: {
-            width: 320,
-            height: 568,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone SE landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_1 like Mac OS X) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.0 Mobile/14E304 Safari/602.1',
-        viewport: {
-            width: 568,
-            height: 320,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone X',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 375,
-            height: 812,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone X landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
-        viewport: {
-            width: 812,
-            height: 375,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'iPhone XR',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 12_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.0 Mobile/15E148 Safari/604.1',
-        viewport: {
-            width: 414,
-            height: 896,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'iPhone XR landscape',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 12_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.0 Mobile/15E148 Safari/604.1',
-        viewport: {
-            width: 896,
-            height: 414,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'JioPhone 2',
-        userAgent: 'Mozilla/5.0 (Mobile; LYF/F300B/LYF-F300B-001-01-15-130718-i;Android; rv:48.0) Gecko/48.0 Firefox/48.0 KAIOS/2.5',
-        viewport: {
-            width: 240,
-            height: 320,
-            deviceScaleFactor: 1,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'JioPhone 2 landscape',
-        userAgent: 'Mozilla/5.0 (Mobile; LYF/F300B/LYF-F300B-001-01-15-130718-i;Android; rv:48.0) Gecko/48.0 Firefox/48.0 KAIOS/2.5',
-        viewport: {
-            width: 320,
-            height: 240,
-            deviceScaleFactor: 1,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Kindle Fire HDX',
-        userAgent: 'Mozilla/5.0 (Linux; U; en-us; KFAPWI Build/JDQ39) AppleWebKit/535.19 (KHTML, like Gecko) Silk/3.13 Safari/535.19 Silk-Accelerated=true',
-        viewport: {
-            width: 800,
-            height: 1280,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Kindle Fire HDX landscape',
-        userAgent: 'Mozilla/5.0 (Linux; U; en-us; KFAPWI Build/JDQ39) AppleWebKit/535.19 (KHTML, like Gecko) Silk/3.13 Safari/535.19 Silk-Accelerated=true',
-        viewport: {
-            width: 1280,
-            height: 800,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'LG Optimus L70',
-        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.4.2; en-us; LGMS323 Build/KOT49I.MS32310c) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 384,
-            height: 640,
-            deviceScaleFactor: 1.25,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'LG Optimus L70 landscape',
-        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.4.2; en-us; LGMS323 Build/KOT49I.MS32310c) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 640,
-            height: 384,
-            deviceScaleFactor: 1.25,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Microsoft Lumia 550',
-        userAgent: 'Mozilla/5.0 (Windows Phone 10.0; Android 4.2.1; Microsoft; Lumia 550) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2486.0 Mobile Safari/537.36 Edge/14.14263',
-        viewport: {
-            width: 640,
-            height: 360,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Microsoft Lumia 950',
-        userAgent: 'Mozilla/5.0 (Windows Phone 10.0; Android 4.2.1; Microsoft; Lumia 950) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2486.0 Mobile Safari/537.36 Edge/14.14263',
-        viewport: {
-            width: 360,
-            height: 640,
-            deviceScaleFactor: 4,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Microsoft Lumia 950 landscape',
-        userAgent: 'Mozilla/5.0 (Windows Phone 10.0; Android 4.2.1; Microsoft; Lumia 950) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2486.0 Mobile Safari/537.36 Edge/14.14263',
-        viewport: {
-            width: 640,
-            height: 360,
-            deviceScaleFactor: 4,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Nexus 10',
-        userAgent: 'Mozilla/5.0 (Linux; Android 6.0.1; Nexus 10 Build/MOB31T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Safari/537.36',
-        viewport: {
-            width: 800,
-            height: 1280,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Nexus 10 landscape',
-        userAgent: 'Mozilla/5.0 (Linux; Android 6.0.1; Nexus 10 Build/MOB31T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Safari/537.36',
-        viewport: {
-            width: 1280,
-            height: 800,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Nexus 4',
-        userAgent: 'Mozilla/5.0 (Linux; Android 4.4.2; Nexus 4 Build/KOT49H) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 384,
-            height: 640,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Nexus 4 landscape',
-        userAgent: 'Mozilla/5.0 (Linux; Android 4.4.2; Nexus 4 Build/KOT49H) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 640,
-            height: 384,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Nexus 5',
-        userAgent: 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 360,
-            height: 640,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Nexus 5 landscape',
-        userAgent: 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 640,
-            height: 360,
-            deviceScaleFactor: 3,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Nexus 5X',
-        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Nexus 5X Build/OPR4.170623.006) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 412,
-            height: 732,
-            deviceScaleFactor: 2.625,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Nexus 5X landscape',
-        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Nexus 5X Build/OPR4.170623.006) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 732,
-            height: 412,
-            deviceScaleFactor: 2.625,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Nexus 6',
-        userAgent: 'Mozilla/5.0 (Linux; Android 7.1.1; Nexus 6 Build/N6F26U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 412,
-            height: 732,
-            deviceScaleFactor: 3.5,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Nexus 6 landscape',
-        userAgent: 'Mozilla/5.0 (Linux; Android 7.1.1; Nexus 6 Build/N6F26U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 732,
-            height: 412,
-            deviceScaleFactor: 3.5,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Nexus 6P',
-        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Nexus 6P Build/OPP3.170518.006) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 412,
-            height: 732,
-            deviceScaleFactor: 3.5,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Nexus 6P landscape',
-        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Nexus 6P Build/OPP3.170518.006) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 732,
-            height: 412,
-            deviceScaleFactor: 3.5,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Nexus 7',
-        userAgent: 'Mozilla/5.0 (Linux; Android 6.0.1; Nexus 7 Build/MOB30X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Safari/537.36',
-        viewport: {
-            width: 600,
-            height: 960,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Nexus 7 landscape',
-        userAgent: 'Mozilla/5.0 (Linux; Android 6.0.1; Nexus 7 Build/MOB30X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Safari/537.36',
-        viewport: {
-            width: 960,
-            height: 600,
-            deviceScaleFactor: 2,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Nokia Lumia 520',
-        userAgent: 'Mozilla/5.0 (compatible; MSIE 10.0; Windows Phone 8.0; Trident/6.0; IEMobile/10.0; ARM; Touch; NOKIA; Lumia 520)',
-        viewport: {
-            width: 320,
-            height: 533,
-            deviceScaleFactor: 1.5,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Nokia Lumia 520 landscape',
-        userAgent: 'Mozilla/5.0 (compatible; MSIE 10.0; Windows Phone 8.0; Trident/6.0; IEMobile/10.0; ARM; Touch; NOKIA; Lumia 520)',
-        viewport: {
-            width: 533,
-            height: 320,
-            deviceScaleFactor: 1.5,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Nokia N9',
-        userAgent: 'Mozilla/5.0 (MeeGo; NokiaN9) AppleWebKit/534.13 (KHTML, like Gecko) NokiaBrowser/8.5.0 Mobile Safari/534.13',
-        viewport: {
-            width: 480,
-            height: 854,
-            deviceScaleFactor: 1,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Nokia N9 landscape',
-        userAgent: 'Mozilla/5.0 (MeeGo; NokiaN9) AppleWebKit/534.13 (KHTML, like Gecko) NokiaBrowser/8.5.0 Mobile Safari/534.13',
-        viewport: {
-            width: 854,
-            height: 480,
-            deviceScaleFactor: 1,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Pixel 2',
-        userAgent: 'Mozilla/5.0 (Linux; Android 8.0; Pixel 2 Build/OPD3.170816.012) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 411,
-            height: 731,
-            deviceScaleFactor: 2.625,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Pixel 2 landscape',
-        userAgent: 'Mozilla/5.0 (Linux; Android 8.0; Pixel 2 Build/OPD3.170816.012) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 731,
-            height: 411,
-            deviceScaleFactor: 2.625,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-    {
-        name: 'Pixel 2 XL',
-        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Pixel 2 XL Build/OPD1.170816.004) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 411,
-            height: 823,
-            deviceScaleFactor: 3.5,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: false,
-        },
-    },
-    {
-        name: 'Pixel 2 XL landscape',
-        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Pixel 2 XL Build/OPD1.170816.004) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
-        viewport: {
-            width: 823,
-            height: 411,
-            deviceScaleFactor: 3.5,
-            isMobile: true,
-            hasTouch: true,
-            isLandscape: true,
-        },
-    },
-];
-const devicesMap = {};
-exports.devicesMap = devicesMap;
-for (const device of devices)
-    devicesMap[device.name] = device;
+exports.PUPPETEER_REVISIONS = void 0;
+exports.PUPPETEER_REVISIONS = {
+    chromium: '800071',
+    firefox: 'latest',
+};
 
 
 /***/ }),
@@ -5373,7 +3744,41 @@ function regExpEscape (s) {
 /* 99 */,
 /* 100 */,
 /* 101 */,
-/* 102 */,
+/* 102 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// For internal use, subject to change.
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (Object.hasOwnProperty.call(mod, k)) result[k] = mod[k];
+    result["default"] = mod;
+    return result;
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+// We use any as a valid input type
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const fs = __importStar(__webpack_require__(747));
+const os = __importStar(__webpack_require__(87));
+const utils_1 = __webpack_require__(82);
+function issueCommand(command, message) {
+    const filePath = process.env[`GITHUB_${command}`];
+    if (!filePath) {
+        throw new Error(`Unable to find environment variable for file command ${command}`);
+    }
+    if (!fs.existsSync(filePath)) {
+        throw new Error(`Missing file at path: ${filePath}`);
+    }
+    fs.appendFileSync(filePath, `${utils_1.toCommandValue(message)}${os.EOL}`, {
+        encoding: 'utf8'
+    });
+}
+exports.issueCommand = issueCommand;
+//# sourceMappingURL=file-command.js.map
+
+/***/ }),
 /* 103 */,
 /* 104 */,
 /* 105 */,
@@ -6095,10 +4500,1721 @@ function mkdirfix (name, opts, cb) {
 
 
 /***/ }),
-/* 121 */,
+/* 121 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Page = void 0;
+const fs = __importStar(__webpack_require__(747));
+const util_1 = __webpack_require__(669);
+const EventEmitter_js_1 = __webpack_require__(258);
+const Connection_js_1 = __webpack_require__(330);
+const Dialog_js_1 = __webpack_require__(838);
+const EmulationManager_js_1 = __webpack_require__(494);
+const FrameManager_js_1 = __webpack_require__(452);
+const Input_js_1 = __webpack_require__(340);
+const Tracing_js_1 = __webpack_require__(27);
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const Coverage_js_1 = __webpack_require__(665);
+const WebWorker_js_1 = __webpack_require__(702);
+const JSHandle_js_1 = __webpack_require__(933);
+const NetworkManager_js_1 = __webpack_require__(956);
+const Accessibility_js_1 = __webpack_require__(750);
+const TimeoutSettings_js_1 = __webpack_require__(817);
+const FileChooser_js_1 = __webpack_require__(488);
+const ConsoleMessage_js_1 = __webpack_require__(29);
+const PDFOptions_js_1 = __webpack_require__(60);
+const writeFileAsync = util_1.promisify(fs.writeFile);
+class ScreenshotTaskQueue {
+    constructor() {
+        this._chain = Promise.resolve(undefined);
+    }
+    postTask(task) {
+        const result = this._chain.then(task);
+        this._chain = result.catch(() => { });
+        return result;
+    }
+}
+/**
+ * Page provides methods to interact with a single tab or
+ * {@link https://developer.chrome.com/extensions/background_pages | extension background page} in Chromium.
+ *
+ * @remarks
+ *
+ * One Browser instance might have multiple Page instances.
+ *
+ * @example
+ * This example creates a page, navigates it to a URL, and then * saves a screenshot:
+ * ```js
+ * const puppeteer = require('puppeteer');
+ *
+ * (async () => {
+ *   const browser = await puppeteer.launch();
+ *   const page = await browser.newPage();
+ *   await page.goto('https://example.com');
+ *   await page.screenshot({path: 'screenshot.png'});
+ *   await browser.close();
+ * })();
+ * ```
+ *
+ * The Page class extends from Puppeteer's {@link EventEmitter} class and will
+ * emit various events which are documented in the {@link PageEmittedEvents} enum.
+ *
+ * @example
+ * This example logs a message for a single page `load` event:
+ * ```js
+ * page.once('load', () => console.log('Page loaded!'));
+ * ```
+ *
+ * To unsubscribe from events use the `off` method:
+ *
+ * ```js
+ * function logRequest(interceptedRequest) {
+ *   console.log('A request was made:', interceptedRequest.url());
+ * }
+ * page.on('request', logRequest);
+ * // Sometime later...
+ * page.off('request', logRequest);
+ * ```
+ * @public
+ */
+class Page extends EventEmitter_js_1.EventEmitter {
+    /**
+     * @internal
+     */
+    constructor(client, target, ignoreHTTPSErrors) {
+        super();
+        this._closed = false;
+        this._timeoutSettings = new TimeoutSettings_js_1.TimeoutSettings();
+        this._pageBindings = new Map();
+        this._javascriptEnabled = true;
+        this._workers = new Map();
+        // TODO: improve this typedef - it's a function that takes a file chooser or
+        // something?
+        this._fileChooserInterceptors = new Set();
+        this._client = client;
+        this._target = target;
+        this._keyboard = new Input_js_1.Keyboard(client);
+        this._mouse = new Input_js_1.Mouse(client, this._keyboard);
+        this._touchscreen = new Input_js_1.Touchscreen(client, this._keyboard);
+        this._accessibility = new Accessibility_js_1.Accessibility(client);
+        this._frameManager = new FrameManager_js_1.FrameManager(client, this, ignoreHTTPSErrors, this._timeoutSettings);
+        this._emulationManager = new EmulationManager_js_1.EmulationManager(client);
+        this._tracing = new Tracing_js_1.Tracing(client);
+        this._coverage = new Coverage_js_1.Coverage(client);
+        this._screenshotTaskQueue = new ScreenshotTaskQueue();
+        this._viewport = null;
+        client.on('Target.attachedToTarget', (event) => {
+            if (event.targetInfo.type !== 'worker') {
+                // If we don't detach from service workers, they will never die.
+                client
+                    .send('Target.detachFromTarget', {
+                    sessionId: event.sessionId,
+                })
+                    .catch(helper_js_1.debugError);
+                return;
+            }
+            const session = Connection_js_1.Connection.fromSession(client).session(event.sessionId);
+            const worker = new WebWorker_js_1.WebWorker(session, event.targetInfo.url, this._addConsoleMessage.bind(this), this._handleException.bind(this));
+            this._workers.set(event.sessionId, worker);
+            this.emit("workercreated" /* WorkerCreated */, worker);
+        });
+        client.on('Target.detachedFromTarget', (event) => {
+            const worker = this._workers.get(event.sessionId);
+            if (!worker)
+                return;
+            this.emit("workerdestroyed" /* WorkerDestroyed */, worker);
+            this._workers.delete(event.sessionId);
+        });
+        this._frameManager.on(FrameManager_js_1.FrameManagerEmittedEvents.FrameAttached, (event) => this.emit("frameattached" /* FrameAttached */, event));
+        this._frameManager.on(FrameManager_js_1.FrameManagerEmittedEvents.FrameDetached, (event) => this.emit("framedetached" /* FrameDetached */, event));
+        this._frameManager.on(FrameManager_js_1.FrameManagerEmittedEvents.FrameNavigated, (event) => this.emit("framenavigated" /* FrameNavigated */, event));
+        const networkManager = this._frameManager.networkManager();
+        networkManager.on(NetworkManager_js_1.NetworkManagerEmittedEvents.Request, (event) => this.emit("request" /* Request */, event));
+        networkManager.on(NetworkManager_js_1.NetworkManagerEmittedEvents.Response, (event) => this.emit("response" /* Response */, event));
+        networkManager.on(NetworkManager_js_1.NetworkManagerEmittedEvents.RequestFailed, (event) => this.emit("requestfailed" /* RequestFailed */, event));
+        networkManager.on(NetworkManager_js_1.NetworkManagerEmittedEvents.RequestFinished, (event) => this.emit("requestfinished" /* RequestFinished */, event));
+        this._fileChooserInterceptors = new Set();
+        client.on('Page.domContentEventFired', () => this.emit("domcontentloaded" /* DOMContentLoaded */));
+        client.on('Page.loadEventFired', () => this.emit("load" /* Load */));
+        client.on('Runtime.consoleAPICalled', (event) => this._onConsoleAPI(event));
+        client.on('Runtime.bindingCalled', (event) => this._onBindingCalled(event));
+        client.on('Page.javascriptDialogOpening', (event) => this._onDialog(event));
+        client.on('Runtime.exceptionThrown', (exception) => this._handleException(exception.exceptionDetails));
+        client.on('Inspector.targetCrashed', () => this._onTargetCrashed());
+        client.on('Performance.metrics', (event) => this._emitMetrics(event));
+        client.on('Log.entryAdded', (event) => this._onLogEntryAdded(event));
+        client.on('Page.fileChooserOpened', (event) => this._onFileChooser(event));
+        this._target._isClosedPromise.then(() => {
+            this.emit("close" /* Close */);
+            this._closed = true;
+        });
+    }
+    /**
+     * @internal
+     */
+    static async create(client, target, ignoreHTTPSErrors, defaultViewport) {
+        const page = new Page(client, target, ignoreHTTPSErrors);
+        await page._initialize();
+        if (defaultViewport)
+            await page.setViewport(defaultViewport);
+        return page;
+    }
+    async _initialize() {
+        await Promise.all([
+            this._frameManager.initialize(),
+            this._client.send('Target.setAutoAttach', {
+                autoAttach: true,
+                waitForDebuggerOnStart: false,
+                flatten: true,
+            }),
+            this._client.send('Performance.enable'),
+            this._client.send('Log.enable'),
+        ]);
+    }
+    async _onFileChooser(event) {
+        if (!this._fileChooserInterceptors.size)
+            return;
+        const frame = this._frameManager.frame(event.frameId);
+        const context = await frame.executionContext();
+        const element = await context._adoptBackendNodeId(event.backendNodeId);
+        const interceptors = Array.from(this._fileChooserInterceptors);
+        this._fileChooserInterceptors.clear();
+        const fileChooser = new FileChooser_js_1.FileChooser(element, event);
+        for (const interceptor of interceptors)
+            interceptor.call(null, fileChooser);
+    }
+    /**
+     * @returns `true` if the page has JavaScript enabled, `false` otherwise.
+     */
+    isJavaScriptEnabled() {
+        return this._javascriptEnabled;
+    }
+    /**
+     * @param options - Optional waiting parameters
+     * @returns Resolves after a page requests a file picker.
+     */
+    async waitForFileChooser(options = {}) {
+        if (!this._fileChooserInterceptors.size)
+            await this._client.send('Page.setInterceptFileChooserDialog', {
+                enabled: true,
+            });
+        const { timeout = this._timeoutSettings.timeout() } = options;
+        let callback;
+        const promise = new Promise((x) => (callback = x));
+        this._fileChooserInterceptors.add(callback);
+        return helper_js_1.helper
+            .waitWithTimeout(promise, 'waiting for file chooser', timeout)
+            .catch((error) => {
+            this._fileChooserInterceptors.delete(callback);
+            throw error;
+        });
+    }
+    /**
+     * Sets the page's geolocation.
+     *
+     * @remarks
+     * Consider using {@link BrowserContext.overridePermissions} to grant
+     * permissions for the page to read its geolocation.
+     *
+     * @example
+     * ```js
+     * await page.setGeolocation({latitude: 59.95, longitude: 30.31667});
+     * ```
+     */
+    async setGeolocation(options) {
+        const { longitude, latitude, accuracy = 0 } = options;
+        if (longitude < -180 || longitude > 180)
+            throw new Error(`Invalid longitude "${longitude}": precondition -180 <= LONGITUDE <= 180 failed.`);
+        if (latitude < -90 || latitude > 90)
+            throw new Error(`Invalid latitude "${latitude}": precondition -90 <= LATITUDE <= 90 failed.`);
+        if (accuracy < 0)
+            throw new Error(`Invalid accuracy "${accuracy}": precondition 0 <= ACCURACY failed.`);
+        await this._client.send('Emulation.setGeolocationOverride', {
+            longitude,
+            latitude,
+            accuracy,
+        });
+    }
+    /**
+     * @returns A target this page was created from.
+     */
+    target() {
+        return this._target;
+    }
+    /**
+     * @returns The browser this page belongs to.
+     */
+    browser() {
+        return this._target.browser();
+    }
+    /**
+     * @returns The browser context that the page belongs to
+     */
+    browserContext() {
+        return this._target.browserContext();
+    }
+    _onTargetCrashed() {
+        this.emit('error', new Error('Page crashed!'));
+    }
+    _onLogEntryAdded(event) {
+        const { level, text, args, source, url, lineNumber } = event.entry;
+        if (args)
+            args.map((arg) => helper_js_1.helper.releaseObject(this._client, arg));
+        if (source !== 'worker')
+            this.emit("console" /* Console */, new ConsoleMessage_js_1.ConsoleMessage(level, text, [], { url, lineNumber }));
+    }
+    /**
+     * @returns The page's main frame.
+     */
+    mainFrame() {
+        return this._frameManager.mainFrame();
+    }
+    get keyboard() {
+        return this._keyboard;
+    }
+    get touchscreen() {
+        return this._touchscreen;
+    }
+    get coverage() {
+        return this._coverage;
+    }
+    get tracing() {
+        return this._tracing;
+    }
+    get accessibility() {
+        return this._accessibility;
+    }
+    /**
+     * @returns An array of all frames attached to the page.
+     */
+    frames() {
+        return this._frameManager.frames();
+    }
+    /**
+     * @returns all of the dedicated
+     * {@link https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API | WebWorkers}
+     * associated with the page.
+     */
+    workers() {
+        return Array.from(this._workers.values());
+    }
+    /**
+     * @param value - Whether to enable request interception.
+     *
+     * @remarks
+     * Activating request interception enables {@link HTTPRequest.abort},
+     * {@link HTTPRequest.continue} and {@link HTTPRequest.respond} methods.  This
+     * provides the capability to modify network requests that are made by a page.
+     *
+     * Once request interception is enabled, every request will stall unless it's
+     * continued, responded or aborted.
+     *
+     * **NOTE** Enabling request interception disables page caching.
+     *
+     * @example
+     * An example of a naïve request interceptor that aborts all image requests:
+     * ```js
+     * const puppeteer = require('puppeteer');
+     * (async () => {
+     *   const browser = await puppeteer.launch();
+     *   const page = await browser.newPage();
+     *   await page.setRequestInterception(true);
+     *   page.on('request', interceptedRequest => {
+     *     if (interceptedRequest.url().endsWith('.png') ||
+     *         interceptedRequest.url().endsWith('.jpg'))
+     *       interceptedRequest.abort();
+     *     else
+     *       interceptedRequest.continue();
+     *     });
+     *   await page.goto('https://example.com');
+     *   await browser.close();
+     * })();
+     * ```
+     */
+    async setRequestInterception(value) {
+        return this._frameManager.networkManager().setRequestInterception(value);
+    }
+    /**
+     * @param enabled - When `true`, enables offline mode for the page.
+     */
+    setOfflineMode(enabled) {
+        return this._frameManager.networkManager().setOfflineMode(enabled);
+    }
+    /**
+     * @param timeout - Maximum navigation time in milliseconds.
+     */
+    setDefaultNavigationTimeout(timeout) {
+        this._timeoutSettings.setDefaultNavigationTimeout(timeout);
+    }
+    /**
+     * @param timeout - Maximum time in milliseconds.
+     */
+    setDefaultTimeout(timeout) {
+        this._timeoutSettings.setDefaultTimeout(timeout);
+    }
+    /**
+     * Runs `document.querySelector` within the page. If no element matches the
+     * selector, the return value resolves to `null`.
+     *
+     * @remarks
+     * Shortcut for {@link Frame.$ | Page.mainFrame().$(selector) }.
+     *
+     * @param selector - A
+     * {@link https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_Selectors | selector}
+     * to query page for.
+     */
+    async $(selector) {
+        return this.mainFrame().$(selector);
+    }
+    /**
+     * @remarks
+     *
+     * The only difference between {@link Page.evaluate | page.evaluate} and
+     * `page.evaluateHandle` is that `evaluateHandle` will return the value
+     * wrapped in an in-page object.
+     *
+     * If the function passed to `page.evaluteHandle` returns a Promise, the
+     * function will wait for the promise to resolve and return its value.
+     *
+     * You can pass a string instead of a function (although functions are
+     * recommended as they are easier to debug and use with TypeScript):
+     *
+     * @example
+     * ```
+     * const aHandle = await page.evaluateHandle('document')
+     * ```
+     *
+     * @example
+     * {@link JSHandle} instances can be passed as arguments to the `pageFunction`:
+     * ```
+     * const aHandle = await page.evaluateHandle(() => document.body);
+     * const resultHandle = await page.evaluateHandle(body => body.innerHTML, aHandle);
+     * console.log(await resultHandle.jsonValue());
+     * await resultHandle.dispose();
+     * ```
+     *
+     * Most of the time this function returns a {@link JSHandle},
+     * but if `pageFunction` returns a reference to an element,
+     * you instead get an {@link ElementHandle} back:
+     *
+     * @example
+     * ```
+     * const button = await page.evaluateHandle(() => document.querySelector('button'));
+     * // can call `click` because `button` is an `ElementHandle`
+     * await button.click();
+     * ```
+     *
+     * The TypeScript definitions assume that `evaluateHandle` returns
+     *  a `JSHandle`, but if you know it's going to return an
+     * `ElementHandle`, pass it as the generic argument:
+     *
+     * ```
+     * const button = await page.evaluateHandle<ElementHandle>(...);
+     * ```
+     *
+     * @param pageFunction - a function that is run within the page
+     * @param args - arguments to be passed to the pageFunction
+     */
+    async evaluateHandle(pageFunction, ...args) {
+        const context = await this.mainFrame().executionContext();
+        return context.evaluateHandle(pageFunction, ...args);
+    }
+    /**
+     * This method iterates the JavaScript heap and finds all objects with the
+     * given prototype.
+     *
+     * @remarks
+     *
+     * @example
+     *
+     * ```js
+     * // Create a Map object
+     * await page.evaluate(() => window.map = new Map());
+     * // Get a handle to the Map object prototype
+     * const mapPrototype = await page.evaluateHandle(() => Map.prototype);
+     * // Query all map instances into an array
+     * const mapInstances = await page.queryObjects(mapPrototype);
+     * // Count amount of map objects in heap
+     * const count = await page.evaluate(maps => maps.length, mapInstances);
+     * await mapInstances.dispose();
+     * await mapPrototype.dispose();
+     * ```
+     * @param prototypeHandle - a handle to the object prototype.
+     */
+    async queryObjects(prototypeHandle) {
+        const context = await this.mainFrame().executionContext();
+        return context.queryObjects(prototypeHandle);
+    }
+    /**
+     * This method runs `document.querySelector` within the page and passes the
+     * result as the first argument to the `pageFunction`.
+     *
+     * @remarks
+     *
+     * If no element is found matching `selector`, the method will throw an error.
+     *
+     * If `pageFunction` returns a promise `$eval` will wait for the promise to
+     * resolve and then return its value.
+     *
+     * @example
+     *
+     * ```
+     * const searchValue = await page.$eval('#search', el => el.value);
+     * const preloadHref = await page.$eval('link[rel=preload]', el => el.href);
+     * const html = await page.$eval('.main-container', el => el.outerHTML);
+     * ```
+     *
+     * If you are using TypeScript, you may have to provide an explicit type to the
+     * first argument of the `pageFunction`.
+     * By default it is typed as `Element`, but you may need to provide a more
+     * specific sub-type:
+     *
+     * @example
+     *
+     * ```
+     * // if you don't provide HTMLInputElement here, TS will error
+     * // as `value` is not on `Element`
+     * const searchValue = await page.$eval('#search', (el: HTMLInputElement) => el.value);
+     * ```
+     *
+     * The compiler should be able to infer the return type
+     * from the `pageFunction` you provide. If it is unable to, you can use the generic
+     * type to tell the compiler what return type you expect from `$eval`:
+     *
+     * @example
+     *
+     * ```
+     * // The compiler can infer the return type in this case, but if it can't
+     * // or if you want to be more explicit, provide it as the generic type.
+     * const searchValue = await page.$eval<string>(
+     *  '#search', (el: HTMLInputElement) => el.value
+     * );
+     * ```
+     *
+     * @param selector - the
+     * {@link https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_Selectors | selector}
+     * to query for
+     * @param pageFunction - the function to be evaluated in the page context.
+     * Will be passed the result of `document.querySelector(selector)` as its
+     * first argument.
+     * @param args - any additional arguments to pass through to `pageFunction`.
+     *
+     * @returns The result of calling `pageFunction`. If it returns an element it
+     * is wrapped in an {@link ElementHandle}, else the raw value itself is
+     * returned.
+     */
+    async $eval(selector, pageFunction, ...args) {
+        return this.mainFrame().$eval(selector, pageFunction, ...args);
+    }
+    /**
+     * This method runs `Array.from(document.querySelectorAll(selector))` within
+     * the page and passes the result as the first argument to the `pageFunction`.
+     *
+     * @remarks
+     *
+     * If `pageFunction` returns a promise `$$eval` will wait for the promise to
+     * resolve and then return its value.
+     *
+     * @example
+     *
+     * ```
+     * // get the amount of divs on the page
+     * const divCount = await page.$$eval('div', divs => divs.length);
+     *
+     * // get the text content of all the `.options` elements:
+     * const options = await page.$$eval('div > span.options', options => {
+     *   return options.map(option => option.textContent)
+     * });
+     * ```
+     *
+     * If you are using TypeScript, you may have to provide an explicit type to the
+     * first argument of the `pageFunction`.
+     * By default it is typed as `Element[]`, but you may need to provide a more
+     * specific sub-type:
+     *
+     * @example
+     *
+     * ```
+     * // if you don't provide HTMLInputElement here, TS will error
+     * // as `value` is not on `Element`
+     * await page.$$eval('input', (elements: HTMLInputElement[]) => {
+     *   return elements.map(e => e.value);
+     * });
+     * ```
+     *
+     * The compiler should be able to infer the return type
+     * from the `pageFunction` you provide. If it is unable to, you can use the generic
+     * type to tell the compiler what return type you expect from `$$eval`:
+     *
+     * @example
+     *
+     * ```
+     * // The compiler can infer the return type in this case, but if it can't
+     * // or if you want to be more explicit, provide it as the generic type.
+     * const allInputValues = await page.$$eval<string[]>(
+     *  'input', (elements: HTMLInputElement[]) => elements.map(e => e.textContent)
+     * );
+     * ```
+     *
+     * @param selector the
+     * {@link https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_Selectors | selector}
+     * to query for
+     * @param pageFunction the function to be evaluated in the page context. Will
+     * be passed the result of `Array.from(document.querySelectorAll(selector))`
+     * as its first argument.
+     * @param args any additional arguments to pass through to `pageFunction`.
+     *
+     * @returns The result of calling `pageFunction`. If it returns an element it
+     * is wrapped in an {@link ElementHandle}, else the raw value itself is
+     * returned.
+     */
+    async $$eval(selector, pageFunction, ...args) {
+        return this.mainFrame().$$eval(selector, pageFunction, ...args);
+    }
+    async $$(selector) {
+        return this.mainFrame().$$(selector);
+    }
+    async $x(expression) {
+        return this.mainFrame().$x(expression);
+    }
+    /**
+     * If no URLs are specified, this method returns cookies for the current page
+     * URL. If URLs are specified, only cookies for those URLs are returned.
+     */
+    async cookies(...urls) {
+        const originalCookies = (await this._client.send('Network.getCookies', {
+            urls: urls.length ? urls : [this.url()],
+        })).cookies;
+        const unsupportedCookieAttributes = ['priority'];
+        const filterUnsupportedAttributes = (cookie) => {
+            for (const attr of unsupportedCookieAttributes)
+                delete cookie[attr];
+            return cookie;
+        };
+        return originalCookies.map(filterUnsupportedAttributes);
+    }
+    async deleteCookie(...cookies) {
+        const pageURL = this.url();
+        for (const cookie of cookies) {
+            const item = Object.assign({}, cookie);
+            if (!cookie.url && pageURL.startsWith('http'))
+                item.url = pageURL;
+            await this._client.send('Network.deleteCookies', item);
+        }
+    }
+    async setCookie(...cookies) {
+        const pageURL = this.url();
+        const startsWithHTTP = pageURL.startsWith('http');
+        const items = cookies.map((cookie) => {
+            const item = Object.assign({}, cookie);
+            if (!item.url && startsWithHTTP)
+                item.url = pageURL;
+            assert_js_1.assert(item.url !== 'about:blank', `Blank page can not have cookie "${item.name}"`);
+            assert_js_1.assert(!String.prototype.startsWith.call(item.url || '', 'data:'), `Data URL page can not have cookie "${item.name}"`);
+            return item;
+        });
+        await this.deleteCookie(...items);
+        if (items.length)
+            await this._client.send('Network.setCookies', { cookies: items });
+    }
+    async addScriptTag(options) {
+        return this.mainFrame().addScriptTag(options);
+    }
+    async addStyleTag(options) {
+        return this.mainFrame().addStyleTag(options);
+    }
+    async exposeFunction(name, puppeteerFunction) {
+        if (this._pageBindings.has(name))
+            throw new Error(`Failed to add page binding with name ${name}: window['${name}'] already exists!`);
+        this._pageBindings.set(name, puppeteerFunction);
+        const expression = helper_js_1.helper.evaluationString(addPageBinding, name);
+        await this._client.send('Runtime.addBinding', { name: name });
+        await this._client.send('Page.addScriptToEvaluateOnNewDocument', {
+            source: expression,
+        });
+        await Promise.all(this.frames().map((frame) => frame.evaluate(expression).catch(helper_js_1.debugError)));
+        function addPageBinding(bindingName) {
+            /* Cast window to any here as we're about to add properties to it
+             * via win[bindingName] which TypeScript doesn't like.
+             */
+            const win = window;
+            const binding = win[bindingName];
+            win[bindingName] = (...args) => {
+                const me = window[bindingName];
+                let callbacks = me['callbacks'];
+                if (!callbacks) {
+                    callbacks = new Map();
+                    me['callbacks'] = callbacks;
+                }
+                const seq = (me['lastSeq'] || 0) + 1;
+                me['lastSeq'] = seq;
+                const promise = new Promise((resolve, reject) => callbacks.set(seq, { resolve, reject }));
+                binding(JSON.stringify({ name: bindingName, seq, args }));
+                return promise;
+            };
+        }
+    }
+    async authenticate(credentials) {
+        return this._frameManager.networkManager().authenticate(credentials);
+    }
+    async setExtraHTTPHeaders(headers) {
+        return this._frameManager.networkManager().setExtraHTTPHeaders(headers);
+    }
+    async setUserAgent(userAgent) {
+        return this._frameManager.networkManager().setUserAgent(userAgent);
+    }
+    async metrics() {
+        const response = await this._client.send('Performance.getMetrics');
+        return this._buildMetricsObject(response.metrics);
+    }
+    _emitMetrics(event) {
+        this.emit("metrics" /* Metrics */, {
+            title: event.title,
+            metrics: this._buildMetricsObject(event.metrics),
+        });
+    }
+    _buildMetricsObject(metrics) {
+        const result = {};
+        for (const metric of metrics || []) {
+            if (supportedMetrics.has(metric.name))
+                result[metric.name] = metric.value;
+        }
+        return result;
+    }
+    _handleException(exceptionDetails) {
+        const message = helper_js_1.helper.getExceptionMessage(exceptionDetails);
+        const err = new Error(message);
+        err.stack = ''; // Don't report clientside error with a node stack attached
+        this.emit("pageerror" /* PageError */, err);
+    }
+    async _onConsoleAPI(event) {
+        if (event.executionContextId === 0) {
+            // DevTools protocol stores the last 1000 console messages. These
+            // messages are always reported even for removed execution contexts. In
+            // this case, they are marked with executionContextId = 0 and are
+            // reported upon enabling Runtime agent.
+            //
+            // Ignore these messages since:
+            // - there's no execution context we can use to operate with message
+            //   arguments
+            // - these messages are reported before Puppeteer clients can subscribe
+            //   to the 'console'
+            //   page event.
+            //
+            // @see https://github.com/puppeteer/puppeteer/issues/3865
+            return;
+        }
+        const context = this._frameManager.executionContextById(event.executionContextId);
+        const values = event.args.map((arg) => JSHandle_js_1.createJSHandle(context, arg));
+        this._addConsoleMessage(event.type, values, event.stackTrace);
+    }
+    async _onBindingCalled(event) {
+        const { name, seq, args } = JSON.parse(event.payload);
+        let expression = null;
+        try {
+            const result = await this._pageBindings.get(name)(...args);
+            expression = helper_js_1.helper.evaluationString(deliverResult, name, seq, result);
+        }
+        catch (error) {
+            if (error instanceof Error)
+                expression = helper_js_1.helper.evaluationString(deliverError, name, seq, error.message, error.stack);
+            else
+                expression = helper_js_1.helper.evaluationString(deliverErrorValue, name, seq, error);
+        }
+        this._client
+            .send('Runtime.evaluate', {
+            expression,
+            contextId: event.executionContextId,
+        })
+            .catch(helper_js_1.debugError);
+        function deliverResult(name, seq, result) {
+            window[name]['callbacks'].get(seq).resolve(result);
+            window[name]['callbacks'].delete(seq);
+        }
+        function deliverError(name, seq, message, stack) {
+            const error = new Error(message);
+            error.stack = stack;
+            window[name]['callbacks'].get(seq).reject(error);
+            window[name]['callbacks'].delete(seq);
+        }
+        function deliverErrorValue(name, seq, value) {
+            window[name]['callbacks'].get(seq).reject(value);
+            window[name]['callbacks'].delete(seq);
+        }
+    }
+    _addConsoleMessage(type, args, stackTrace) {
+        if (!this.listenerCount("console" /* Console */)) {
+            args.forEach((arg) => arg.dispose());
+            return;
+        }
+        const textTokens = [];
+        for (const arg of args) {
+            const remoteObject = arg._remoteObject;
+            if (remoteObject.objectId)
+                textTokens.push(arg.toString());
+            else
+                textTokens.push(helper_js_1.helper.valueFromRemoteObject(remoteObject));
+        }
+        const location = stackTrace && stackTrace.callFrames.length
+            ? {
+                url: stackTrace.callFrames[0].url,
+                lineNumber: stackTrace.callFrames[0].lineNumber,
+                columnNumber: stackTrace.callFrames[0].columnNumber,
+            }
+            : {};
+        const message = new ConsoleMessage_js_1.ConsoleMessage(type, textTokens.join(' '), args, location);
+        this.emit("console" /* Console */, message);
+    }
+    _onDialog(event) {
+        let dialogType = null;
+        const validDialogTypes = new Set([
+            'alert',
+            'confirm',
+            'prompt',
+            'beforeunload',
+        ]);
+        if (validDialogTypes.has(event.type)) {
+            dialogType = event.type;
+        }
+        assert_js_1.assert(dialogType, 'Unknown javascript dialog type: ' + event.type);
+        const dialog = new Dialog_js_1.Dialog(this._client, dialogType, event.message, event.defaultPrompt);
+        this.emit("dialog" /* Dialog */, dialog);
+    }
+    url() {
+        return this.mainFrame().url();
+    }
+    async content() {
+        return await this._frameManager.mainFrame().content();
+    }
+    async setContent(html, options = {}) {
+        await this._frameManager.mainFrame().setContent(html, options);
+    }
+    async goto(url, options = {}) {
+        return await this._frameManager.mainFrame().goto(url, options);
+    }
+    async reload(options) {
+        const result = await Promise.all([
+            this.waitForNavigation(options),
+            this._client.send('Page.reload'),
+        ]);
+        return result[0];
+    }
+    async waitForNavigation(options = {}) {
+        return await this._frameManager.mainFrame().waitForNavigation(options);
+    }
+    _sessionClosePromise() {
+        if (!this._disconnectPromise)
+            this._disconnectPromise = new Promise((fulfill) => this._client.once(Connection_js_1.CDPSessionEmittedEvents.Disconnected, () => fulfill(new Error('Target closed'))));
+        return this._disconnectPromise;
+    }
+    async waitForRequest(urlOrPredicate, options = {}) {
+        const { timeout = this._timeoutSettings.timeout() } = options;
+        return helper_js_1.helper.waitForEvent(this._frameManager.networkManager(), NetworkManager_js_1.NetworkManagerEmittedEvents.Request, (request) => {
+            if (helper_js_1.helper.isString(urlOrPredicate))
+                return urlOrPredicate === request.url();
+            if (typeof urlOrPredicate === 'function')
+                return !!urlOrPredicate(request);
+            return false;
+        }, timeout, this._sessionClosePromise());
+    }
+    async waitForResponse(urlOrPredicate, options = {}) {
+        const { timeout = this._timeoutSettings.timeout() } = options;
+        return helper_js_1.helper.waitForEvent(this._frameManager.networkManager(), NetworkManager_js_1.NetworkManagerEmittedEvents.Response, (response) => {
+            if (helper_js_1.helper.isString(urlOrPredicate))
+                return urlOrPredicate === response.url();
+            if (typeof urlOrPredicate === 'function')
+                return !!urlOrPredicate(response);
+            return false;
+        }, timeout, this._sessionClosePromise());
+    }
+    async goBack(options = {}) {
+        return this._go(-1, options);
+    }
+    async goForward(options = {}) {
+        return this._go(+1, options);
+    }
+    async _go(delta, options) {
+        const history = await this._client.send('Page.getNavigationHistory');
+        const entry = history.entries[history.currentIndex + delta];
+        if (!entry)
+            return null;
+        const result = await Promise.all([
+            this.waitForNavigation(options),
+            this._client.send('Page.navigateToHistoryEntry', { entryId: entry.id }),
+        ]);
+        return result[0];
+    }
+    async bringToFront() {
+        await this._client.send('Page.bringToFront');
+    }
+    async emulate(options) {
+        await Promise.all([
+            this.setViewport(options.viewport),
+            this.setUserAgent(options.userAgent),
+        ]);
+    }
+    async setJavaScriptEnabled(enabled) {
+        if (this._javascriptEnabled === enabled)
+            return;
+        this._javascriptEnabled = enabled;
+        await this._client.send('Emulation.setScriptExecutionDisabled', {
+            value: !enabled,
+        });
+    }
+    async setBypassCSP(enabled) {
+        await this._client.send('Page.setBypassCSP', { enabled });
+    }
+    async emulateMediaType(type) {
+        assert_js_1.assert(type === 'screen' || type === 'print' || type === null, 'Unsupported media type: ' + type);
+        await this._client.send('Emulation.setEmulatedMedia', {
+            media: type || '',
+        });
+    }
+    async emulateMediaFeatures(features) {
+        if (features === null)
+            await this._client.send('Emulation.setEmulatedMedia', { features: null });
+        if (Array.isArray(features)) {
+            features.every((mediaFeature) => {
+                const name = mediaFeature.name;
+                assert_js_1.assert(/^prefers-(?:color-scheme|reduced-motion)$/.test(name), 'Unsupported media feature: ' + name);
+                return true;
+            });
+            await this._client.send('Emulation.setEmulatedMedia', {
+                features: features,
+            });
+        }
+    }
+    async emulateTimezone(timezoneId) {
+        try {
+            await this._client.send('Emulation.setTimezoneOverride', {
+                timezoneId: timezoneId || '',
+            });
+        }
+        catch (error) {
+            if (error.message.includes('Invalid timezone'))
+                throw new Error(`Invalid timezone ID: ${timezoneId}`);
+            throw error;
+        }
+    }
+    /**
+     * Emulates the idle state.
+     * If no arguments set, clears idle state emulation.
+     *
+     * @example
+     * ```js
+     * // set idle emulation
+     * await page.emulateIdleState({isUserActive: true, isScreenUnlocked: false});
+     *
+     * // do some checks here
+     * ...
+     *
+     * // clear idle emulation
+     * await page.emulateIdleState();
+     * ```
+     *
+     * @param overrides Mock idle state. If not set, clears idle overrides
+     * @param isUserActive Mock isUserActive
+     * @param isScreenUnlocked Mock isScreenUnlocked
+     */
+    async emulateIdleState(overrides) {
+        if (overrides) {
+            await this._client.send('Emulation.setIdleOverride', {
+                isUserActive: overrides.isUserActive,
+                isScreenUnlocked: overrides.isScreenUnlocked,
+            });
+        }
+        else {
+            await this._client.send('Emulation.clearIdleOverride');
+        }
+    }
+    /**
+     * Simulates the given vision deficiency on the page.
+     *
+     * @example
+     * ```js
+     * const puppeteer = require('puppeteer');
+     *
+     * (async () => {
+     *   const browser = await puppeteer.launch();
+     *   const page = await browser.newPage();
+     *   await page.goto('https://v8.dev/blog/10-years');
+     *
+     *   await page.emulateVisionDeficiency('achromatopsia');
+     *   await page.screenshot({ path: 'achromatopsia.png' });
+     *
+     *   await page.emulateVisionDeficiency('deuteranopia');
+     *   await page.screenshot({ path: 'deuteranopia.png' });
+     *
+     *   await page.emulateVisionDeficiency('blurredVision');
+     *   await page.screenshot({ path: 'blurred-vision.png' });
+     *
+     *   await browser.close();
+     * })();
+     * ```
+     *
+     * @param type - the type of deficiency to simulate, or `'none'` to reset.
+     */
+    async emulateVisionDeficiency(type) {
+        const visionDeficiencies = new Set([
+            'none',
+            'achromatopsia',
+            'blurredVision',
+            'deuteranopia',
+            'protanopia',
+            'tritanopia',
+        ]);
+        try {
+            assert_js_1.assert(!type || visionDeficiencies.has(type), `Unsupported vision deficiency: ${type}`);
+            await this._client.send('Emulation.setEmulatedVisionDeficiency', {
+                type: type || 'none',
+            });
+        }
+        catch (error) {
+            throw error;
+        }
+    }
+    async setViewport(viewport) {
+        const needsReload = await this._emulationManager.emulateViewport(viewport);
+        this._viewport = viewport;
+        if (needsReload)
+            await this.reload();
+    }
+    viewport() {
+        return this._viewport;
+    }
+    /**
+     * @remarks
+     *
+     * Evaluates a function in the page's context and returns the result.
+     *
+     * If the function passed to `page.evaluteHandle` returns a Promise, the
+     * function will wait for the promise to resolve and return its value.
+     *
+     * @example
+     *
+     * ```js
+     * const result = await frame.evaluate(() => {
+     *   return Promise.resolve(8 * 7);
+     * });
+     * console.log(result); // prints "56"
+     * ```
+     *
+     * You can pass a string instead of a function (although functions are
+     * recommended as they are easier to debug and use with TypeScript):
+     *
+     * @example
+     * ```
+     * const aHandle = await page.evaluate('1 + 2');
+     * ```
+     *
+     * To get the best TypeScript experience, you should pass in as the
+     * generic the type of `pageFunction`:
+     *
+     * ```
+     * const aHandle = await page.evaluate<() => number>(() => 2);
+     * ```
+     *
+     * @example
+     *
+     * {@link ElementHandle} instances (including {@link JSHandle}s) can be passed
+     * as arguments to the `pageFunction`:
+     *
+     * ```
+     * const bodyHandle = await page.$('body');
+     * const html = await page.evaluate(body => body.innerHTML, bodyHandle);
+     * await bodyHandle.dispose();
+     * ```
+     *
+     * @param pageFunction - a function that is run within the page
+     * @param args - arguments to be passed to the pageFunction
+     *
+     * @returns the return value of `pageFunction`.
+     */
+    async evaluate(pageFunction, ...args) {
+        return this._frameManager.mainFrame().evaluate(pageFunction, ...args);
+    }
+    async evaluateOnNewDocument(pageFunction, ...args) {
+        const source = helper_js_1.helper.evaluationString(pageFunction, ...args);
+        await this._client.send('Page.addScriptToEvaluateOnNewDocument', {
+            source,
+        });
+    }
+    async setCacheEnabled(enabled = true) {
+        await this._frameManager.networkManager().setCacheEnabled(enabled);
+    }
+    async screenshot(options = {}) {
+        let screenshotType = null;
+        // options.type takes precedence over inferring the type from options.path
+        // because it may be a 0-length file with no extension created beforehand
+        // (i.e. as a temp file).
+        if (options.type) {
+            assert_js_1.assert(options.type === 'png' || options.type === 'jpeg', 'Unknown options.type value: ' + options.type);
+            screenshotType = options.type;
+        }
+        else if (options.path) {
+            const filePath = options.path;
+            const extension = filePath
+                .slice(filePath.lastIndexOf('.') + 1)
+                .toLowerCase();
+            if (extension === 'png')
+                screenshotType = 'png';
+            else if (extension === 'jpg' || extension === 'jpeg')
+                screenshotType = 'jpeg';
+            assert_js_1.assert(screenshotType, `Unsupported screenshot type for extension \`.${extension}\``);
+        }
+        if (!screenshotType)
+            screenshotType = 'png';
+        if (options.quality) {
+            assert_js_1.assert(screenshotType === 'jpeg', 'options.quality is unsupported for the ' +
+                screenshotType +
+                ' screenshots');
+            assert_js_1.assert(typeof options.quality === 'number', 'Expected options.quality to be a number but found ' +
+                typeof options.quality);
+            assert_js_1.assert(Number.isInteger(options.quality), 'Expected options.quality to be an integer');
+            assert_js_1.assert(options.quality >= 0 && options.quality <= 100, 'Expected options.quality to be between 0 and 100 (inclusive), got ' +
+                options.quality);
+        }
+        assert_js_1.assert(!options.clip || !options.fullPage, 'options.clip and options.fullPage are exclusive');
+        if (options.clip) {
+            assert_js_1.assert(typeof options.clip.x === 'number', 'Expected options.clip.x to be a number but found ' +
+                typeof options.clip.x);
+            assert_js_1.assert(typeof options.clip.y === 'number', 'Expected options.clip.y to be a number but found ' +
+                typeof options.clip.y);
+            assert_js_1.assert(typeof options.clip.width === 'number', 'Expected options.clip.width to be a number but found ' +
+                typeof options.clip.width);
+            assert_js_1.assert(typeof options.clip.height === 'number', 'Expected options.clip.height to be a number but found ' +
+                typeof options.clip.height);
+            assert_js_1.assert(options.clip.width !== 0, 'Expected options.clip.width not to be 0.');
+            assert_js_1.assert(options.clip.height !== 0, 'Expected options.clip.height not to be 0.');
+        }
+        return this._screenshotTaskQueue.postTask(() => this._screenshotTask(screenshotType, options));
+    }
+    async _screenshotTask(format, options) {
+        await this._client.send('Target.activateTarget', {
+            targetId: this._target._targetId,
+        });
+        let clip = options.clip ? processClip(options.clip) : undefined;
+        if (options.fullPage) {
+            const metrics = await this._client.send('Page.getLayoutMetrics');
+            const width = Math.ceil(metrics.contentSize.width);
+            const height = Math.ceil(metrics.contentSize.height);
+            // Overwrite clip for full page at all times.
+            clip = { x: 0, y: 0, width, height, scale: 1 };
+            const { isMobile = false, deviceScaleFactor = 1, isLandscape = false } = this._viewport || {};
+            const screenOrientation = isLandscape
+                ? { angle: 90, type: 'landscapePrimary' }
+                : { angle: 0, type: 'portraitPrimary' };
+            await this._client.send('Emulation.setDeviceMetricsOverride', {
+                mobile: isMobile,
+                width,
+                height,
+                deviceScaleFactor,
+                screenOrientation,
+            });
+        }
+        const shouldSetDefaultBackground = options.omitBackground && format === 'png';
+        if (shouldSetDefaultBackground)
+            await this._client.send('Emulation.setDefaultBackgroundColorOverride', {
+                color: { r: 0, g: 0, b: 0, a: 0 },
+            });
+        const result = await this._client.send('Page.captureScreenshot', {
+            format,
+            quality: options.quality,
+            clip,
+        });
+        if (shouldSetDefaultBackground)
+            await this._client.send('Emulation.setDefaultBackgroundColorOverride');
+        if (options.fullPage && this._viewport)
+            await this.setViewport(this._viewport);
+        const buffer = options.encoding === 'base64'
+            ? result.data
+            : Buffer.from(result.data, 'base64');
+        if (options.path)
+            await writeFileAsync(options.path, buffer);
+        return buffer;
+        function processClip(clip) {
+            const x = Math.round(clip.x);
+            const y = Math.round(clip.y);
+            const width = Math.round(clip.width + clip.x - x);
+            const height = Math.round(clip.height + clip.y - y);
+            return { x, y, width, height, scale: 1 };
+        }
+    }
+    /**
+     * Generatees a PDF of the page with the `print` CSS media type.
+     * @remarks
+     *
+     * IMPORTANT: PDF generation is only supported in Chrome headless mode.
+     *
+     * To generate a PDF with the `screen` media type, call
+     * {@link Page.emulateMediaType | `page.emulateMediaType('screen')`} before
+     * calling `page.pdf()`.
+     *
+     * By default, `page.pdf()` generates a pdf with modified colors for printing.
+     * Use the
+     * {@link https://developer.mozilla.org/en-US/docs/Web/CSS/-webkit-print-color-adjust | `-webkit-print-color-adjust`}
+     * property to force rendering of exact colors.
+     *
+     *
+     * @param options - options for generating the PDF.
+     */
+    async pdf(options = {}) {
+        const { scale = 1, displayHeaderFooter = false, headerTemplate = '', footerTemplate = '', printBackground = false, landscape = false, pageRanges = '', preferCSSPageSize = false, margin = {}, path = null, } = options;
+        let paperWidth = 8.5;
+        let paperHeight = 11;
+        if (options.format) {
+            const format = PDFOptions_js_1.paperFormats[options.format.toLowerCase()];
+            assert_js_1.assert(format, 'Unknown paper format: ' + options.format);
+            paperWidth = format.width;
+            paperHeight = format.height;
+        }
+        else {
+            paperWidth = convertPrintParameterToInches(options.width) || paperWidth;
+            paperHeight =
+                convertPrintParameterToInches(options.height) || paperHeight;
+        }
+        const marginTop = convertPrintParameterToInches(margin.top) || 0;
+        const marginLeft = convertPrintParameterToInches(margin.left) || 0;
+        const marginBottom = convertPrintParameterToInches(margin.bottom) || 0;
+        const marginRight = convertPrintParameterToInches(margin.right) || 0;
+        const result = await this._client.send('Page.printToPDF', {
+            transferMode: 'ReturnAsStream',
+            landscape,
+            displayHeaderFooter,
+            headerTemplate,
+            footerTemplate,
+            printBackground,
+            scale,
+            paperWidth,
+            paperHeight,
+            marginTop,
+            marginBottom,
+            marginLeft,
+            marginRight,
+            pageRanges,
+            preferCSSPageSize,
+        });
+        return await helper_js_1.helper.readProtocolStream(this._client, result.stream, path);
+    }
+    async title() {
+        return this.mainFrame().title();
+    }
+    async close(options = { runBeforeUnload: undefined }) {
+        assert_js_1.assert(!!this._client._connection, 'Protocol error: Connection closed. Most likely the page has been closed.');
+        const runBeforeUnload = !!options.runBeforeUnload;
+        if (runBeforeUnload) {
+            await this._client.send('Page.close');
+        }
+        else {
+            await this._client._connection.send('Target.closeTarget', {
+                targetId: this._target._targetId,
+            });
+            await this._target._isClosedPromise;
+        }
+    }
+    isClosed() {
+        return this._closed;
+    }
+    get mouse() {
+        return this._mouse;
+    }
+    click(selector, options = {}) {
+        return this.mainFrame().click(selector, options);
+    }
+    focus(selector) {
+        return this.mainFrame().focus(selector);
+    }
+    hover(selector) {
+        return this.mainFrame().hover(selector);
+    }
+    select(selector, ...values) {
+        return this.mainFrame().select(selector, ...values);
+    }
+    tap(selector) {
+        return this.mainFrame().tap(selector);
+    }
+    type(selector, text, options) {
+        return this.mainFrame().type(selector, text, options);
+    }
+    /**
+     * @remarks
+     *
+     * This method behaves differently depending on the first parameter. If it's a
+     * `string`, it will be treated as a `selector` or `xpath` (if the string
+     * starts with `//`). This method then is a shortcut for
+     * {@link Page.waitForSelector} or {@link Page.waitForXPath}.
+     *
+     * If the first argument is a function this method is a shortcut for
+     * {@link Page.waitForFunction}.
+     *
+     * If the first argument is a `number`, it's treated as a timeout in
+     * milliseconds and the method returns a promise which resolves after the
+     * timeout.
+     *
+     * @param selectorOrFunctionOrTimeout - a selector, predicate or timeout to
+     * wait for.
+     * @param options - optional waiting parameters.
+     * @param args - arguments to pass to `pageFunction`.
+     *
+     * @deprecated Don't use this method directly. Instead use the more explicit
+     * methods available: {@link Page.waitForSelector},
+     * {@link Page.waitForXPath}, {@link Page.waitForFunction} or
+     * {@link Page.waitForTimeout}.
+     */
+    waitFor(selectorOrFunctionOrTimeout, options = {}, ...args) {
+        return this.mainFrame().waitFor(selectorOrFunctionOrTimeout, options, ...args);
+    }
+    /**
+     * Causes your script to wait for the given number of milliseconds.
+     *
+     * @remarks
+     *
+     * It's generally recommended to not wait for a number of seconds, but instead
+     * use {@link Page.waitForSelector}, {@link Page.waitForXPath} or
+     * {@link Page.waitForFunction} to wait for exactly the conditions you want.
+     *
+     * @example
+     *
+     * Wait for 1 second:
+     *
+     * ```
+     * await page.waitForTimeout(1000);
+     * ```
+     *
+     * @param milliseconds - the number of milliseconds to wait.
+     */
+    waitForTimeout(milliseconds) {
+        return this.mainFrame().waitForTimeout(milliseconds);
+    }
+    waitForSelector(selector, options = {}) {
+        return this.mainFrame().waitForSelector(selector, options);
+    }
+    waitForXPath(xpath, options = {}) {
+        return this.mainFrame().waitForXPath(xpath, options);
+    }
+    waitForFunction(pageFunction, options = {}, ...args) {
+        return this.mainFrame().waitForFunction(pageFunction, options, ...args);
+    }
+}
+exports.Page = Page;
+const supportedMetrics = new Set([
+    'Timestamp',
+    'Documents',
+    'Frames',
+    'JSEventListeners',
+    'Nodes',
+    'LayoutCount',
+    'RecalcStyleCount',
+    'LayoutDuration',
+    'RecalcStyleDuration',
+    'ScriptDuration',
+    'TaskDuration',
+    'JSHeapUsedSize',
+    'JSHeapTotalSize',
+]);
+const unitToPixels = {
+    px: 1,
+    in: 96,
+    cm: 37.8,
+    mm: 3.78,
+};
+function convertPrintParameterToInches(parameter) {
+    if (typeof parameter === 'undefined')
+        return undefined;
+    let pixels;
+    if (helper_js_1.helper.isNumber(parameter)) {
+        // Treat numbers as pixel values to be aligned with phantom's paperSize.
+        pixels = /** @type {number} */ parameter;
+    }
+    else if (helper_js_1.helper.isString(parameter)) {
+        const text = /** @type {string} */ parameter;
+        let unit = text.substring(text.length - 2).toLowerCase();
+        let valueText = '';
+        if (unitToPixels.hasOwnProperty(unit)) {
+            valueText = text.substring(0, text.length - 2);
+        }
+        else {
+            // In case of unknown unit try to parse the whole parameter as number of pixels.
+            // This is consistent with phantom's paperSize behavior.
+            unit = 'px';
+            valueText = text;
+        }
+        const value = Number(valueText);
+        assert_js_1.assert(!isNaN(value), 'Failed to parse parameter value: ' + text);
+        pixels = value * unitToPixels[unit];
+    }
+    else {
+        throw new Error('page.pdf() Cannot handle parameter type: ' + typeof parameter);
+    }
+    return pixels / 96;
+}
+
+
+/***/ }),
 /* 122 */,
 /* 123 */,
-/* 124 */,
+/* 124 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.ExecutionContext = exports.EVALUATION_SCRIPT_URL = void 0;
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const JSHandle_js_1 = __webpack_require__(933);
+exports.EVALUATION_SCRIPT_URL = '__puppeteer_evaluation_script__';
+const SOURCE_URL_REGEX = /^[\040\t]*\/\/[@#] sourceURL=\s*(\S*?)\s*$/m;
+/**
+ * This class represents a context for JavaScript execution. A [Page] might have
+ * many execution contexts:
+ * - each
+ *   {@link https://developer.mozilla.org/en-US/docs/Web/HTML/Element/iframe |
+ *   frame } has "default" execution context that is always created after frame is
+ *   attached to DOM. This context is returned by the
+ *   {@link frame.executionContext()} method.
+ * - {@link https://developer.chrome.com/extensions | Extension}'s content scripts
+ *   create additional execution contexts.
+ *
+ * Besides pages, execution contexts can be found in
+ * {@link https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API |
+ * workers }.
+ *
+ * @public
+ */
+class ExecutionContext {
+    /**
+     * @internal
+     */
+    constructor(client, contextPayload, world) {
+        this._client = client;
+        this._world = world;
+        this._contextId = contextPayload.id;
+    }
+    /**
+     * @remarks
+     *
+     * Not every execution context is associated with a frame. For
+     * example, workers and extensions have execution contexts that are not
+     * associated with frames.
+     *
+     * @returns The frame associated with this execution context.
+     */
+    frame() {
+        return this._world ? this._world.frame() : null;
+    }
+    /**
+     * @remarks
+     * If the function passed to the `executionContext.evaluate` returns a
+     * Promise, then `executionContext.evaluate` would wait for the promise to
+     * resolve and return its value. If the function passed to the
+     * `executionContext.evaluate` returns a non-serializable value, then
+     * `executionContext.evaluate` resolves to `undefined`. DevTools Protocol also
+     * supports transferring some additional values that are not serializable by
+     * `JSON`: `-0`, `NaN`, `Infinity`, `-Infinity`, and bigint literals.
+     *
+     *
+     * @example
+     * ```js
+     * const executionContext = await page.mainFrame().executionContext();
+     * const result = await executionContext.evaluate(() => Promise.resolve(8 * 7))* ;
+     * console.log(result); // prints "56"
+     * ```
+     *
+     * @example
+     * A string can also be passed in instead of a function.
+     *
+     * ```js
+     * console.log(await executionContext.evaluate('1 + 2')); // prints "3"
+     * ```
+     *
+     * @example
+     * {@link JSHandle} instances can be passed as arguments to the
+     * `executionContext.* evaluate`:
+     * ```js
+     * const oneHandle = await executionContext.evaluateHandle(() => 1);
+     * const twoHandle = await executionContext.evaluateHandle(() => 2);
+     * const result = await executionContext.evaluate(
+     *    (a, b) => a + b, oneHandle, * twoHandle
+     * );
+     * await oneHandle.dispose();
+     * await twoHandle.dispose();
+     * console.log(result); // prints '3'.
+     * ```
+     * @param pageFunction a function to be evaluated in the `executionContext`
+     * @param args argument to pass to the page function
+     *
+     * @returns A promise that resolves to the return value of the given function.
+     */
+    async evaluate(pageFunction, ...args) {
+        return await this._evaluateInternal(true, pageFunction, ...args);
+    }
+    /**
+     * @remarks
+     * The only difference between `executionContext.evaluate` and
+     * `executionContext.evaluateHandle` is that `executionContext.evaluateHandle`
+     * returns an in-page object (a {@link JSHandle}).
+     * If the function passed to the `executionContext.evaluateHandle` returns a
+     * Promise, then `executionContext.evaluateHandle` would wait for the
+     * promise to resolve and return its value.
+     *
+     * @example
+     * ```js
+     * const context = await page.mainFrame().executionContext();
+     * const aHandle = await context.evaluateHandle(() => Promise.resolve(self));
+     * aHandle; // Handle for the global object.
+     * ```
+     *
+     * @example
+     * A string can also be passed in instead of a function.
+     *
+     * ```js
+     * // Handle for the '3' * object.
+     * const aHandle = await context.evaluateHandle('1 + 2');
+     * ```
+     *
+     * @example
+     * JSHandle instances can be passed as arguments
+     * to the `executionContext.* evaluateHandle`:
+     *
+     * ```js
+     * const aHandle = await context.evaluateHandle(() => document.body);
+     * const resultHandle = await context.evaluateHandle(body => body.innerHTML, * aHandle);
+     * console.log(await resultHandle.jsonValue()); // prints body's innerHTML
+     * await aHandle.dispose();
+     * await resultHandle.dispose();
+     * ```
+     *
+     * @param pageFunction a function to be evaluated in the `executionContext`
+     * @param args argument to pass to the page function
+     *
+     * @returns A promise that resolves to the return value of the given function
+     * as an in-page object (a {@link JSHandle}).
+     */
+    async evaluateHandle(pageFunction, ...args) {
+        return this._evaluateInternal(false, pageFunction, ...args);
+    }
+    async _evaluateInternal(returnByValue, pageFunction, ...args) {
+        const suffix = `//# sourceURL=${exports.EVALUATION_SCRIPT_URL}`;
+        if (helper_js_1.helper.isString(pageFunction)) {
+            const contextId = this._contextId;
+            const expression = pageFunction;
+            const expressionWithSourceUrl = SOURCE_URL_REGEX.test(expression)
+                ? expression
+                : expression + '\n' + suffix;
+            const { exceptionDetails, result: remoteObject } = await this._client
+                .send('Runtime.evaluate', {
+                expression: expressionWithSourceUrl,
+                contextId,
+                returnByValue,
+                awaitPromise: true,
+                userGesture: true,
+            })
+                .catch(rewriteError);
+            if (exceptionDetails)
+                throw new Error('Evaluation failed: ' + helper_js_1.helper.getExceptionMessage(exceptionDetails));
+            return returnByValue
+                ? helper_js_1.helper.valueFromRemoteObject(remoteObject)
+                : JSHandle_js_1.createJSHandle(this, remoteObject);
+        }
+        if (typeof pageFunction !== 'function')
+            throw new Error(`Expected to get |string| or |function| as the first argument, but got "${pageFunction}" instead.`);
+        let functionText = pageFunction.toString();
+        try {
+            new Function('(' + functionText + ')');
+        }
+        catch (error) {
+            // This means we might have a function shorthand. Try another
+            // time prefixing 'function '.
+            if (functionText.startsWith('async '))
+                functionText =
+                    'async function ' + functionText.substring('async '.length);
+            else
+                functionText = 'function ' + functionText;
+            try {
+                new Function('(' + functionText + ')');
+            }
+            catch (error) {
+                // We tried hard to serialize, but there's a weird beast here.
+                throw new Error('Passed function is not well-serializable!');
+            }
+        }
+        let callFunctionOnPromise;
+        try {
+            callFunctionOnPromise = this._client.send('Runtime.callFunctionOn', {
+                functionDeclaration: functionText + '\n' + suffix + '\n',
+                executionContextId: this._contextId,
+                arguments: args.map(convertArgument.bind(this)),
+                returnByValue,
+                awaitPromise: true,
+                userGesture: true,
+            });
+        }
+        catch (error) {
+            if (error instanceof TypeError &&
+                error.message.startsWith('Converting circular structure to JSON'))
+                error.message += ' Are you passing a nested JSHandle?';
+            throw error;
+        }
+        const { exceptionDetails, result: remoteObject, } = await callFunctionOnPromise.catch(rewriteError);
+        if (exceptionDetails)
+            throw new Error('Evaluation failed: ' + helper_js_1.helper.getExceptionMessage(exceptionDetails));
+        return returnByValue
+            ? helper_js_1.helper.valueFromRemoteObject(remoteObject)
+            : JSHandle_js_1.createJSHandle(this, remoteObject);
+        /**
+         * @param {*} arg
+         * @returns {*}
+         * @this {ExecutionContext}
+         */
+        function convertArgument(arg) {
+            if (typeof arg === 'bigint')
+                // eslint-disable-line valid-typeof
+                return { unserializableValue: `${arg.toString()}n` };
+            if (Object.is(arg, -0))
+                return { unserializableValue: '-0' };
+            if (Object.is(arg, Infinity))
+                return { unserializableValue: 'Infinity' };
+            if (Object.is(arg, -Infinity))
+                return { unserializableValue: '-Infinity' };
+            if (Object.is(arg, NaN))
+                return { unserializableValue: 'NaN' };
+            const objectHandle = arg && arg instanceof JSHandle_js_1.JSHandle ? arg : null;
+            if (objectHandle) {
+                if (objectHandle._context !== this)
+                    throw new Error('JSHandles can be evaluated only in the context they were created!');
+                if (objectHandle._disposed)
+                    throw new Error('JSHandle is disposed!');
+                if (objectHandle._remoteObject.unserializableValue)
+                    return {
+                        unserializableValue: objectHandle._remoteObject.unserializableValue,
+                    };
+                if (!objectHandle._remoteObject.objectId)
+                    return { value: objectHandle._remoteObject.value };
+                return { objectId: objectHandle._remoteObject.objectId };
+            }
+            return { value: arg };
+        }
+        function rewriteError(error) {
+            if (error.message.includes('Object reference chain is too long'))
+                return { result: { type: 'undefined' } };
+            if (error.message.includes("Object couldn't be returned by value"))
+                return { result: { type: 'undefined' } };
+            if (error.message.endsWith('Cannot find context with specified id') ||
+                error.message.endsWith('Inspected target navigated or closed'))
+                throw new Error('Execution context was destroyed, most likely because of a navigation.');
+            throw error;
+        }
+    }
+    /**
+     * This method iterates the JavaScript heap and finds all the objects with the
+     * given prototype.
+     * @remarks
+     * @example
+     * ```js
+     * // Create a Map object
+     * await page.evaluate(() => window.map = new Map());
+     * // Get a handle to the Map object prototype
+     * const mapPrototype = await page.evaluateHandle(() => Map.prototype);
+     * // Query all map instances into an array
+     * const mapInstances = await page.queryObjects(mapPrototype);
+     * // Count amount of map objects in heap
+     * const count = await page.evaluate(maps => maps.length, mapInstances);
+     * await mapInstances.dispose();
+     * await mapPrototype.dispose();
+     * ```
+     *
+     * @param prototypeHandle a handle to the object prototype
+     *
+     * @returns A handle to an array of objects with the given prototype.
+     */
+    async queryObjects(prototypeHandle) {
+        assert_js_1.assert(!prototypeHandle._disposed, 'Prototype JSHandle is disposed!');
+        assert_js_1.assert(prototypeHandle._remoteObject.objectId, 'Prototype JSHandle must not be referencing primitive value');
+        const response = await this._client.send('Runtime.queryObjects', {
+            prototypeObjectId: prototypeHandle._remoteObject.objectId,
+        });
+        return JSHandle_js_1.createJSHandle(this, response.objects);
+    }
+    /**
+     * @internal
+     */
+    async _adoptBackendNodeId(backendNodeId) {
+        const { object } = await this._client.send('DOM.resolveNode', {
+            backendNodeId: backendNodeId,
+            executionContextId: this._contextId,
+        });
+        return JSHandle_js_1.createJSHandle(this, object);
+    }
+    /**
+     * @internal
+     */
+    async _adoptElementHandle(elementHandle) {
+        assert_js_1.assert(elementHandle.executionContext() !== this, 'Cannot adopt handle that already belongs to this execution context');
+        assert_js_1.assert(this._world, 'Cannot adopt handle without DOMWorld');
+        const nodeInfo = await this._client.send('DOM.describeNode', {
+            objectId: elementHandle._remoteObject.objectId,
+        });
+        return this._adoptBackendNodeId(nodeInfo.node.backendNodeId);
+    }
+}
+exports.ExecutionContext = ExecutionContext;
+
+
+/***/ }),
 /* 125 */,
 /* 126 */,
 /* 127 */
@@ -6443,54 +6559,67 @@ exports.debug = debug; // for test
 /* 143 */,
 /* 144 */,
 /* 145 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
 "use strict";
 
-/**
- * Copyright 2020 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.debug = void 0;
-const environment_1 = __webpack_require__(629);
-/**
- * A debug function that can be used in any environment.
- *
- * If used in Node, it falls back to the
- * {@link https://www.npmjs.com/package/debug | debug module}. In the browser it
- * uses `console.log`.
- *
- * @param prefix - this will be prefixed to each log.
- * @returns a function that can be called to log to that debug channel.
- *
- * @example
- * ```
- * const log = debug('Page');
- *
- * log('new page created')
- * // logs "Page: new page created"
- * ```
- */
-exports.debug = (prefix) => {
-    if (environment_1.isNode) {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        return __webpack_require__(784)(prefix);
-    }
-    // eslint-disable-next-line no-console
-    return (...logArgs) => console.log(`${prefix}:`, ...logArgs);
-};
+const pump = __webpack_require__(453);
+const bufferStream = __webpack_require__(966);
+
+class MaxBufferError extends Error {
+	constructor() {
+		super('maxBuffer exceeded');
+		this.name = 'MaxBufferError';
+	}
+}
+
+async function getStream(inputStream, options) {
+	if (!inputStream) {
+		return Promise.reject(new Error('Expected a stream'));
+	}
+
+	options = {
+		maxBuffer: Infinity,
+		...options
+	};
+
+	const {maxBuffer} = options;
+
+	let stream;
+	await new Promise((resolve, reject) => {
+		const rejectPromise = error => {
+			if (error) { // A null check
+				error.bufferedData = stream.getBufferedValue();
+			}
+
+			reject(error);
+		};
+
+		stream = pump(inputStream, bufferStream(options), error => {
+			if (error) {
+				rejectPromise(error);
+				return;
+			}
+
+			resolve();
+		});
+
+		stream.on('data', () => {
+			if (stream.getBufferedLength() > maxBuffer) {
+				rejectPromise(new MaxBufferError());
+			}
+		});
+	});
+
+	return stream.getBufferedValue();
+}
+
+module.exports = getStream;
+// TODO: Remove this for the next major release
+module.exports.default = getStream;
+module.exports.buffer = (stream, options) => getStream(stream, {...options, encoding: 'buffer'});
+module.exports.array = (stream, options) => getStream(stream, {...options, array: true});
+module.exports.MaxBufferError = MaxBufferError;
 
 
 /***/ }),
@@ -6873,82 +7002,11 @@ exports.decode = function (buf, filenameEncoding) {
 /***/ }),
 /* 155 */,
 /* 156 */,
-/* 157 */,
-/* 158 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-"use strict";
-
-const {PassThrough: PassThroughStream} = __webpack_require__(418);
-
-module.exports = options => {
-	options = {...options};
-
-	const {array} = options;
-	let {encoding} = options;
-	const isBuffer = encoding === 'buffer';
-	let objectMode = false;
-
-	if (array) {
-		objectMode = !(encoding || isBuffer);
-	} else {
-		encoding = encoding || 'utf8';
-	}
-
-	if (isBuffer) {
-		encoding = null;
-	}
-
-	const stream = new PassThroughStream({objectMode});
-
-	if (encoding) {
-		stream.setEncoding(encoding);
-	}
-
-	let length = 0;
-	const chunks = [];
-
-	stream.on('data', chunk => {
-		chunks.push(chunk);
-
-		if (objectMode) {
-			length = chunks.length;
-		} else {
-			length += chunk.length;
-		}
-	});
-
-	stream.getBufferedValue = () => {
-		if (array) {
-			return chunks;
-		}
-
-		return isBuffer ? Buffer.concat(chunks, length) : chunks.join('');
-	};
-
-	stream.getBufferedLength = () => length;
-
-	return stream;
-};
-
-
-/***/ }),
-/* 159 */,
-/* 160 */,
-/* 161 */,
-/* 162 */,
-/* 163 */,
-/* 164 */,
-/* 165 */,
-/* 166 */,
-/* 167 */,
-/* 168 */
+/* 157 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.NetworkManager = void 0;
 /**
  * Copyright 2017 Google Inc. All rights reserved.
  *
@@ -6964,242 +7022,540 @@ exports.NetworkManager = void 0;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-const EventEmitter_1 = __webpack_require__(304);
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const Events_1 = __webpack_require__(872);
-const HTTPRequest_1 = __webpack_require__(401);
-const HTTPResponse_1 = __webpack_require__(413);
-class NetworkManager extends EventEmitter_1.EventEmitter {
-    constructor(client, ignoreHTTPSErrors, frameManager) {
-        super();
-        this._requestIdToRequest = new Map();
-        this._requestIdToRequestWillBeSentEvent = new Map();
-        this._extraHTTPHeaders = {};
-        this._offline = false;
-        this._credentials = null;
-        this._attemptedAuthentications = new Set();
-        this._userRequestInterceptionEnabled = false;
-        this._protocolRequestInterceptionEnabled = false;
-        this._userCacheDisabled = false;
-        this._requestIdToInterceptionId = new Map();
-        this._client = client;
-        this._ignoreHTTPSErrors = ignoreHTTPSErrors;
-        this._frameManager = frameManager;
-        this._client.on('Fetch.requestPaused', this._onRequestPaused.bind(this));
-        this._client.on('Fetch.authRequired', this._onAuthRequired.bind(this));
-        this._client.on('Network.requestWillBeSent', this._onRequestWillBeSent.bind(this));
-        this._client.on('Network.requestServedFromCache', this._onRequestServedFromCache.bind(this));
-        this._client.on('Network.responseReceived', this._onResponseReceived.bind(this));
-        this._client.on('Network.loadingFinished', this._onLoadingFinished.bind(this));
-        this._client.on('Network.loadingFailed', this._onLoadingFailed.bind(this));
-    }
-    async initialize() {
-        await this._client.send('Network.enable');
-        if (this._ignoreHTTPSErrors)
-            await this._client.send('Security.setIgnoreCertificateErrors', {
-                ignore: true,
-            });
-    }
-    async authenticate(credentials) {
-        this._credentials = credentials;
-        await this._updateProtocolRequestInterception();
-    }
-    async setExtraHTTPHeaders(extraHTTPHeaders) {
-        this._extraHTTPHeaders = {};
-        for (const key of Object.keys(extraHTTPHeaders)) {
-            const value = extraHTTPHeaders[key];
-            assert_1.assert(helper_1.helper.isString(value), `Expected value of header "${key}" to be String, but "${typeof value}" is found.`);
-            this._extraHTTPHeaders[key.toLowerCase()] = value;
-        }
-        await this._client.send('Network.setExtraHTTPHeaders', {
-            headers: this._extraHTTPHeaders,
-        });
-    }
-    extraHTTPHeaders() {
-        return Object.assign({}, this._extraHTTPHeaders);
-    }
-    async setOfflineMode(value) {
-        if (this._offline === value)
-            return;
-        this._offline = value;
-        await this._client.send('Network.emulateNetworkConditions', {
-            offline: this._offline,
-            // values of 0 remove any active throttling. crbug.com/456324#c9
-            latency: 0,
-            downloadThroughput: -1,
-            uploadThroughput: -1,
-        });
-    }
-    async setUserAgent(userAgent) {
-        await this._client.send('Network.setUserAgentOverride', { userAgent });
-    }
-    async setCacheEnabled(enabled) {
-        this._userCacheDisabled = !enabled;
-        await this._updateProtocolCacheDisabled();
-    }
-    async setRequestInterception(value) {
-        this._userRequestInterceptionEnabled = value;
-        await this._updateProtocolRequestInterception();
-    }
-    async _updateProtocolRequestInterception() {
-        const enabled = this._userRequestInterceptionEnabled || !!this._credentials;
-        if (enabled === this._protocolRequestInterceptionEnabled)
-            return;
-        this._protocolRequestInterceptionEnabled = enabled;
-        if (enabled) {
-            await Promise.all([
-                this._updateProtocolCacheDisabled(),
-                this._client.send('Fetch.enable', {
-                    handleAuthRequests: true,
-                    patterns: [{ urlPattern: '*' }],
-                }),
-            ]);
-        }
-        else {
-            await Promise.all([
-                this._updateProtocolCacheDisabled(),
-                this._client.send('Fetch.disable'),
-            ]);
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.BrowserFetcher = void 0;
+const os = __importStar(__webpack_require__(87));
+const fs = __importStar(__webpack_require__(747));
+const path = __importStar(__webpack_require__(622));
+const util = __importStar(__webpack_require__(669));
+const childProcess = __importStar(__webpack_require__(129));
+const https = __importStar(__webpack_require__(211));
+const http = __importStar(__webpack_require__(605));
+const extract_zip_1 = __importDefault(__webpack_require__(641));
+const Debug_js_1 = __webpack_require__(459);
+const util_1 = __webpack_require__(669);
+const rimraf_1 = __importDefault(__webpack_require__(569));
+const URL = __importStar(__webpack_require__(835));
+const https_proxy_agent_1 = __importDefault(__webpack_require__(717));
+const proxy_from_env_1 = __webpack_require__(18);
+const assert_js_1 = __webpack_require__(716);
+const debugFetcher = Debug_js_1.debug(`puppeteer:fetcher`);
+const downloadURLs = {
+    chrome: {
+        linux: '%s/chromium-browser-snapshots/Linux_x64/%d/%s.zip',
+        mac: '%s/chromium-browser-snapshots/Mac/%d/%s.zip',
+        win32: '%s/chromium-browser-snapshots/Win/%d/%s.zip',
+        win64: '%s/chromium-browser-snapshots/Win_x64/%d/%s.zip',
+    },
+    firefox: {
+        linux: '%s/firefox-%s.en-US.%s-x86_64.tar.bz2',
+        mac: '%s/firefox-%s.en-US.%s.dmg',
+        win32: '%s/firefox-%s.en-US.%s.zip',
+        win64: '%s/firefox-%s.en-US.%s.zip',
+    },
+};
+const browserConfig = {
+    chrome: {
+        host: 'https://storage.googleapis.com',
+        destination: '.local-chromium',
+    },
+    firefox: {
+        host: 'https://archive.mozilla.org/pub/firefox/nightly/latest-mozilla-central',
+        destination: '.local-firefox',
+    },
+};
+function archiveName(product, platform, revision) {
+    if (product === 'chrome') {
+        if (platform === 'linux')
+            return 'chrome-linux';
+        if (platform === 'mac')
+            return 'chrome-mac';
+        if (platform === 'win32' || platform === 'win64') {
+            // Windows archive name changed at r591479.
+            return parseInt(revision, 10) > 591479 ? 'chrome-win' : 'chrome-win32';
         }
     }
-    async _updateProtocolCacheDisabled() {
-        await this._client.send('Network.setCacheDisabled', {
-            cacheDisabled: this._userCacheDisabled || this._protocolRequestInterceptionEnabled,
-        });
-    }
-    _onRequestWillBeSent(event) {
-        // Request interception doesn't happen for data URLs with Network Service.
-        if (this._protocolRequestInterceptionEnabled &&
-            !event.request.url.startsWith('data:')) {
-            const requestId = event.requestId;
-            const interceptionId = this._requestIdToInterceptionId.get(requestId);
-            if (interceptionId) {
-                this._onRequest(event, interceptionId);
-                this._requestIdToInterceptionId.delete(requestId);
-            }
-            else {
-                this._requestIdToRequestWillBeSentEvent.set(event.requestId, event);
-            }
-            return;
-        }
-        this._onRequest(event, null);
-    }
-    /**
-     * @param {!Protocol.Fetch.authRequiredPayload} event
-     */
-    _onAuthRequired(event) {
-        let response = 'Default';
-        if (this._attemptedAuthentications.has(event.requestId)) {
-            response = 'CancelAuth';
-        }
-        else if (this._credentials) {
-            response = 'ProvideCredentials';
-            this._attemptedAuthentications.add(event.requestId);
-        }
-        const { username, password } = this._credentials || {
-            username: undefined,
-            password: undefined,
-        };
-        this._client
-            .send('Fetch.continueWithAuth', {
-            requestId: event.requestId,
-            authChallengeResponse: { response, username, password },
-        })
-            .catch(helper_1.debugError);
-    }
-    _onRequestPaused(event) {
-        if (!this._userRequestInterceptionEnabled &&
-            this._protocolRequestInterceptionEnabled) {
-            this._client
-                .send('Fetch.continueRequest', {
-                requestId: event.requestId,
-            })
-                .catch(helper_1.debugError);
-        }
-        const requestId = event.networkId;
-        const interceptionId = event.requestId;
-        if (requestId && this._requestIdToRequestWillBeSentEvent.has(requestId)) {
-            const requestWillBeSentEvent = this._requestIdToRequestWillBeSentEvent.get(requestId);
-            this._onRequest(requestWillBeSentEvent, interceptionId);
-            this._requestIdToRequestWillBeSentEvent.delete(requestId);
-        }
-        else {
-            this._requestIdToInterceptionId.set(requestId, interceptionId);
-        }
-    }
-    _onRequest(event, interceptionId) {
-        let redirectChain = [];
-        if (event.redirectResponse) {
-            const request = this._requestIdToRequest.get(event.requestId);
-            // If we connect late to the target, we could have missed the
-            // requestWillBeSent event.
-            if (request) {
-                this._handleRequestRedirect(request, event.redirectResponse);
-                redirectChain = request._redirectChain;
-            }
-        }
-        const frame = event.frameId
-            ? this._frameManager.frame(event.frameId)
-            : null;
-        const request = new HTTPRequest_1.HTTPRequest(this._client, frame, interceptionId, this._userRequestInterceptionEnabled, event, redirectChain);
-        this._requestIdToRequest.set(event.requestId, request);
-        this.emit(Events_1.Events.NetworkManager.Request, request);
-    }
-    _onRequestServedFromCache(event) {
-        const request = this._requestIdToRequest.get(event.requestId);
-        if (request)
-            request._fromMemoryCache = true;
-    }
-    _handleRequestRedirect(request, responsePayload) {
-        const response = new HTTPResponse_1.HTTPResponse(this._client, request, responsePayload);
-        request._response = response;
-        request._redirectChain.push(request);
-        response._resolveBody(new Error('Response body is unavailable for redirect responses'));
-        this._requestIdToRequest.delete(request._requestId);
-        this._attemptedAuthentications.delete(request._interceptionId);
-        this.emit(Events_1.Events.NetworkManager.Response, response);
-        this.emit(Events_1.Events.NetworkManager.RequestFinished, request);
-    }
-    _onResponseReceived(event) {
-        const request = this._requestIdToRequest.get(event.requestId);
-        // FileUpload sends a response without a matching request.
-        if (!request)
-            return;
-        const response = new HTTPResponse_1.HTTPResponse(this._client, request, event.response);
-        request._response = response;
-        this.emit(Events_1.Events.NetworkManager.Response, response);
-    }
-    _onLoadingFinished(event) {
-        const request = this._requestIdToRequest.get(event.requestId);
-        // For certain requestIds we never receive requestWillBeSent event.
-        // @see https://crbug.com/750469
-        if (!request)
-            return;
-        // Under certain conditions we never get the Network.responseReceived
-        // event from protocol. @see https://crbug.com/883475
-        if (request.response())
-            request.response()._resolveBody(null);
-        this._requestIdToRequest.delete(request._requestId);
-        this._attemptedAuthentications.delete(request._interceptionId);
-        this.emit(Events_1.Events.NetworkManager.RequestFinished, request);
-    }
-    _onLoadingFailed(event) {
-        const request = this._requestIdToRequest.get(event.requestId);
-        // For certain requestIds we never receive requestWillBeSent event.
-        // @see https://crbug.com/750469
-        if (!request)
-            return;
-        request._failureText = event.errorText;
-        const response = request.response();
-        if (response)
-            response._resolveBody(null);
-        this._requestIdToRequest.delete(request._requestId);
-        this._attemptedAuthentications.delete(request._interceptionId);
-        this.emit(Events_1.Events.NetworkManager.RequestFailed, request);
+    else if (product === 'firefox') {
+        return platform;
     }
 }
-exports.NetworkManager = NetworkManager;
+/**
+ * @internal
+ */
+function downloadURL(product, platform, host, revision) {
+    const url = util.format(downloadURLs[product][platform], host, revision, archiveName(product, platform, revision));
+    return url;
+}
+/**
+ * @internal
+ */
+function handleArm64() {
+    fs.stat('/usr/bin/chromium-browser', function (err, stats) {
+        if (stats === undefined) {
+            console.error(`The chromium binary is not available for arm64: `);
+            console.error(`If you are on Ubuntu, you can install with: `);
+            console.error(`\n apt-get install chromium-browser\n`);
+            throw new Error();
+        }
+    });
+}
+const readdirAsync = util_1.promisify(fs.readdir.bind(fs));
+const mkdirAsync = util_1.promisify(fs.mkdir.bind(fs));
+const unlinkAsync = util_1.promisify(fs.unlink.bind(fs));
+const chmodAsync = util_1.promisify(fs.chmod.bind(fs));
+function existsAsync(filePath) {
+    return new Promise((resolve) => {
+        fs.access(filePath, (err) => resolve(!err));
+    });
+}
+/**
+ * BrowserFetcher can download and manage different versions of Chromium and Firefox.
+ *
+ * @remarks
+ * BrowserFetcher operates on revision strings that specify a precise version of Chromium, e.g. `"533271"`. Revision strings can be obtained from {@link http://omahaproxy.appspot.com/ | omahaproxy.appspot.com}.
+ * In the Firefox case, BrowserFetcher downloads Firefox Nightly and
+ * operates on version numbers such as `"75"`.
+ *
+ * @example
+ * An example of using BrowserFetcher to download a specific version of Chromium
+ * and running Puppeteer against it:
+ *
+ * ```js
+ * const browserFetcher = puppeteer.createBrowserFetcher();
+ * const revisionInfo = await browserFetcher.download('533271');
+ * const browser = await puppeteer.launch({executablePath: revisionInfo.executablePath})
+ * ```
+ *
+ * **NOTE** BrowserFetcher is not designed to work concurrently with other
+ * instances of BrowserFetcher that share the same downloads directory.
+ *
+ * @public
+ */
+class BrowserFetcher {
+    /**
+     * @internal
+     */
+    constructor(projectRoot, options = {}) {
+        this._product = (options.product || 'chrome').toLowerCase();
+        assert_js_1.assert(this._product === 'chrome' || this._product === 'firefox', `Unknown product: "${options.product}"`);
+        this._downloadsFolder =
+            options.path ||
+                path.join(projectRoot, browserConfig[this._product].destination);
+        this._downloadHost = options.host || browserConfig[this._product].host;
+        this.setPlatform(options.platform);
+        assert_js_1.assert(downloadURLs[this._product][this._platform], 'Unsupported platform: ' + this._platform);
+    }
+    setPlatform(platformFromOptions) {
+        if (platformFromOptions) {
+            this._platform = platformFromOptions;
+            return;
+        }
+        const platform = os.platform();
+        if (platform === 'darwin')
+            this._platform = 'mac';
+        else if (platform === 'linux')
+            this._platform = 'linux';
+        else if (platform === 'win32')
+            this._platform = os.arch() === 'x64' ? 'win64' : 'win32';
+        else
+            assert_js_1.assert(this._platform, 'Unsupported platform: ' + os.platform());
+    }
+    /**
+     * @returns Returns the current `Platform`.
+     */
+    platform() {
+        return this._platform;
+    }
+    /**
+     * @returns Returns the current `Product`.
+     */
+    product() {
+        return this._product;
+    }
+    /**
+     * @returns The download host being used.
+     */
+    host() {
+        return this._downloadHost;
+    }
+    /**
+     * Initiates a HEAD request to check if the revision is available.
+     * @remarks
+     * This method is affected by the current `product`.
+     * @param revision - The revision to check availability for.
+     * @returns A promise that resolves to `true` if the revision could be downloaded
+     * from the host.
+     */
+    canDownload(revision) {
+        const url = downloadURL(this._product, this._platform, this._downloadHost, revision);
+        return new Promise((resolve) => {
+            const request = httpRequest(url, 'HEAD', (response) => {
+                resolve(response.statusCode === 200);
+            });
+            request.on('error', (error) => {
+                console.error(error);
+                resolve(false);
+            });
+        });
+    }
+    /**
+     * Initiates a GET request to download the revision from the host.
+     * @remarks
+     * This method is affected by the current `product`.
+     * @param revision - The revision to download.
+     * @param progressCallback - A function that will be called with two arguments:
+     * How many bytes have been downloaded and the total number of bytes of the download.
+     * @returns A promise with revision information when the revision is downloaded
+     * and extracted.
+     */
+    async download(revision, progressCallback = () => { }) {
+        const url = downloadURL(this._product, this._platform, this._downloadHost, revision);
+        const fileName = url.split('/').pop();
+        const archivePath = path.join(this._downloadsFolder, fileName);
+        const outputPath = this._getFolderPath(revision);
+        if (await existsAsync(outputPath))
+            return this.revisionInfo(revision);
+        if (!(await existsAsync(this._downloadsFolder)))
+            await mkdirAsync(this._downloadsFolder);
+        if (os.arch() === 'arm64') {
+            handleArm64();
+            return;
+        }
+        try {
+            await downloadFile(url, archivePath, progressCallback);
+            await install(archivePath, outputPath);
+        }
+        finally {
+            if (await existsAsync(archivePath))
+                await unlinkAsync(archivePath);
+        }
+        const revisionInfo = this.revisionInfo(revision);
+        if (revisionInfo)
+            await chmodAsync(revisionInfo.executablePath, 0o755);
+        return revisionInfo;
+    }
+    /**
+     * @remarks
+     * This method is affected by the current `product`.
+     * @returns A promise with a list of all revision strings (for the current `product`)
+     * available locally on disk.
+     */
+    async localRevisions() {
+        if (!(await existsAsync(this._downloadsFolder)))
+            return [];
+        const fileNames = await readdirAsync(this._downloadsFolder);
+        return fileNames
+            .map((fileName) => parseFolderPath(this._product, fileName))
+            .filter((entry) => entry && entry.platform === this._platform)
+            .map((entry) => entry.revision);
+    }
+    /**
+     * @remarks
+     * This method is affected by the current `product`.
+     * @param revision - A revision to remove for the current `product`.
+     * @returns A promise that resolves when the revision has been removes or
+     * throws if the revision has not been downloaded.
+     */
+    async remove(revision) {
+        const folderPath = this._getFolderPath(revision);
+        assert_js_1.assert(await existsAsync(folderPath), `Failed to remove: revision ${revision} is not downloaded`);
+        await new Promise((fulfill) => rimraf_1.default(folderPath, fulfill));
+    }
+    /**
+     * @param revision - The revision to get info for.
+     * @returns The revision info for the given revision.
+     */
+    revisionInfo(revision) {
+        const folderPath = this._getFolderPath(revision);
+        let executablePath = '';
+        if (this._product === 'chrome') {
+            if (this._platform === 'mac')
+                executablePath = path.join(folderPath, archiveName(this._product, this._platform, revision), 'Chromium.app', 'Contents', 'MacOS', 'Chromium');
+            else if (this._platform === 'linux')
+                executablePath = path.join(folderPath, archiveName(this._product, this._platform, revision), 'chrome');
+            else if (this._platform === 'win32' || this._platform === 'win64')
+                executablePath = path.join(folderPath, archiveName(this._product, this._platform, revision), 'chrome.exe');
+            else
+                throw new Error('Unsupported platform: ' + this._platform);
+        }
+        else if (this._product === 'firefox') {
+            if (this._platform === 'mac')
+                executablePath = path.join(folderPath, 'Firefox Nightly.app', 'Contents', 'MacOS', 'firefox');
+            else if (this._platform === 'linux')
+                executablePath = path.join(folderPath, 'firefox', 'firefox');
+            else if (this._platform === 'win32' || this._platform === 'win64')
+                executablePath = path.join(folderPath, 'firefox', 'firefox.exe');
+            else
+                throw new Error('Unsupported platform: ' + this._platform);
+        }
+        else {
+            throw new Error('Unsupported product: ' + this._product);
+        }
+        const url = downloadURL(this._product, this._platform, this._downloadHost, revision);
+        const local = fs.existsSync(folderPath);
+        debugFetcher({
+            revision,
+            executablePath,
+            folderPath,
+            local,
+            url,
+            product: this._product,
+        });
+        return {
+            revision,
+            executablePath,
+            folderPath,
+            local,
+            url,
+            product: this._product,
+        };
+    }
+    /**
+     * @internal
+     */
+    _getFolderPath(revision) {
+        return path.join(this._downloadsFolder, this._platform + '-' + revision);
+    }
+}
+exports.BrowserFetcher = BrowserFetcher;
+function parseFolderPath(product, folderPath) {
+    const name = path.basename(folderPath);
+    const splits = name.split('-');
+    if (splits.length !== 2)
+        return null;
+    const [platform, revision] = splits;
+    if (!downloadURLs[product][platform])
+        return null;
+    return { product, platform, revision };
+}
+/**
+ * @internal
+ */
+function downloadFile(url, destinationPath, progressCallback) {
+    debugFetcher(`Downloading binary from ${url}`);
+    let fulfill, reject;
+    let downloadedBytes = 0;
+    let totalBytes = 0;
+    const promise = new Promise((x, y) => {
+        fulfill = x;
+        reject = y;
+    });
+    const request = httpRequest(url, 'GET', (response) => {
+        if (response.statusCode !== 200) {
+            const error = new Error(`Download failed: server returned code ${response.statusCode}. URL: ${url}`);
+            // consume response data to free up memory
+            response.resume();
+            reject(error);
+            return;
+        }
+        const file = fs.createWriteStream(destinationPath);
+        file.on('finish', () => fulfill());
+        file.on('error', (error) => reject(error));
+        response.pipe(file);
+        totalBytes = parseInt(
+        /** @type {string} */ response.headers['content-length'], 10);
+        if (progressCallback)
+            response.on('data', onData);
+    });
+    request.on('error', (error) => reject(error));
+    return promise;
+    function onData(chunk) {
+        downloadedBytes += chunk.length;
+        progressCallback(downloadedBytes, totalBytes);
+    }
+}
+function install(archivePath, folderPath) {
+    debugFetcher(`Installing ${archivePath} to ${folderPath}`);
+    if (archivePath.endsWith('.zip'))
+        return extract_zip_1.default(archivePath, { dir: folderPath });
+    else if (archivePath.endsWith('.tar.bz2'))
+        return extractTar(archivePath, folderPath);
+    else if (archivePath.endsWith('.dmg'))
+        return mkdirAsync(folderPath).then(() => installDMG(archivePath, folderPath));
+    else
+        throw new Error(`Unsupported archive format: ${archivePath}`);
+}
+/**
+ * @internal
+ */
+function extractTar(tarPath, folderPath) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const tar = __webpack_require__(120);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const bzip = __webpack_require__(849);
+    return new Promise((fulfill, reject) => {
+        const tarStream = tar.extract(folderPath);
+        tarStream.on('error', reject);
+        tarStream.on('finish', fulfill);
+        const readStream = fs.createReadStream(tarPath);
+        readStream.pipe(bzip()).pipe(tarStream);
+    });
+}
+/**
+ * @internal
+ */
+function installDMG(dmgPath, folderPath) {
+    let mountPath;
+    function mountAndCopy(fulfill, reject) {
+        const mountCommand = `hdiutil attach -nobrowse -noautoopen "${dmgPath}"`;
+        childProcess.exec(mountCommand, (err, stdout) => {
+            if (err)
+                return reject(err);
+            const volumes = stdout.match(/\/Volumes\/(.*)/m);
+            if (!volumes)
+                return reject(new Error(`Could not find volume path in ${stdout}`));
+            mountPath = volumes[0];
+            readdirAsync(mountPath)
+                .then((fileNames) => {
+                const appName = fileNames.filter((item) => typeof item === 'string' && item.endsWith('.app'))[0];
+                if (!appName)
+                    return reject(new Error(`Cannot find app in ${mountPath}`));
+                const copyPath = path.join(mountPath, appName);
+                debugFetcher(`Copying ${copyPath} to ${folderPath}`);
+                childProcess.exec(`cp -R "${copyPath}" "${folderPath}"`, (err) => {
+                    if (err)
+                        reject(err);
+                    else
+                        fulfill();
+                });
+            })
+                .catch(reject);
+        });
+    }
+    function unmount() {
+        if (!mountPath)
+            return;
+        const unmountCommand = `hdiutil detach "${mountPath}" -quiet`;
+        debugFetcher(`Unmounting ${mountPath}`);
+        childProcess.exec(unmountCommand, (err) => {
+            if (err)
+                console.error(`Error unmounting dmg: ${err}`);
+        });
+    }
+    return new Promise(mountAndCopy)
+        .catch((error) => {
+        console.error(error);
+    })
+        .finally(unmount);
+}
+function httpRequest(url, method, response) {
+    const urlParsed = URL.parse(url);
+    let options = {
+        ...urlParsed,
+        method,
+    };
+    const proxyURL = proxy_from_env_1.getProxyForUrl(url);
+    if (proxyURL) {
+        if (url.startsWith('http:')) {
+            const proxy = URL.parse(proxyURL);
+            options = {
+                path: options.href,
+                host: proxy.hostname,
+                port: proxy.port,
+            };
+        }
+        else {
+            const parsedProxyURL = URL.parse(proxyURL);
+            const proxyOptions = {
+                ...parsedProxyURL,
+                secureProxy: parsedProxyURL.protocol === 'https:',
+            };
+            options.agent = new https_proxy_agent_1.default(proxyOptions);
+            options.rejectUnauthorized = false;
+        }
+    }
+    const requestCallback = (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
+            httpRequest(res.headers.location, method, response);
+        else
+            response(res);
+    };
+    const request = options.protocol === 'https:'
+        ? https.request(options, requestCallback)
+        : http.request(options, requestCallback);
+    request.end();
+    return request;
+}
+
+
+/***/ }),
+/* 158 */,
+/* 159 */,
+/* 160 */,
+/* 161 */,
+/* 162 */,
+/* 163 */,
+/* 164 */,
+/* 165 */,
+/* 166 */,
+/* 167 */,
+/* 168 */
+/***/ (function(module) {
+
+"use strict";
+
+const alias = ['stdin', 'stdout', 'stderr'];
+
+const hasAlias = opts => alias.some(x => Boolean(opts[x]));
+
+module.exports = opts => {
+	if (!opts) {
+		return null;
+	}
+
+	if (opts.stdio && hasAlias(opts)) {
+		throw new Error(`It's not possible to provide \`stdio\` in combination with one of ${alias.map(x => `\`${x}\``).join(', ')}`);
+	}
+
+	if (typeof opts.stdio === 'string') {
+		return opts.stdio;
+	}
+
+	const stdio = opts.stdio || [];
+
+	if (!Array.isArray(stdio)) {
+		throw new TypeError(`Expected \`stdio\` to be of type \`string\` or \`Array\`, got \`${typeof stdio}\``);
+	}
+
+	const result = [];
+	const len = Math.max(stdio.length, alias.length);
+
+	for (let i = 0; i < len; i++) {
+		let value = null;
+
+		if (stdio[i] !== undefined) {
+			value = stdio[i];
+		} else if (opts[alias[i]] !== undefined) {
+			value = opts[alias[i]];
+		}
+
+		result[i] = value;
+	}
+
+	return result;
+};
 
 
 /***/ }),
@@ -7290,65 +7646,7 @@ module.exports = from;
 /* 184 */,
 /* 185 */,
 /* 186 */,
-/* 187 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-/**
- * Copyright 2020 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.initializePuppeteer = void 0;
-// api.ts has to use module.exports as it's also consumed by DocLint which runs
-// on Node.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const api = __webpack_require__(892);
-const helper_1 = __webpack_require__(758);
-const Puppeteer_1 = __webpack_require__(718);
-const revisions_1 = __webpack_require__(3);
-const pkg_dir_1 = __importDefault(__webpack_require__(474));
-exports.initializePuppeteer = (packageName) => {
-    const puppeteerRootDirectory = pkg_dir_1.default.sync(__dirname);
-    for (const className in api) {
-        if (typeof api[className] === 'function')
-            helper_1.helper.installAsyncStackHooks(api[className]);
-    }
-    let preferredRevision = revisions_1.PUPPETEER_REVISIONS.chromium;
-    const isPuppeteerCore = packageName === 'puppeteer-core';
-    // puppeteer-core ignores environment variables
-    const product = isPuppeteerCore
-        ? undefined
-        : process.env.PUPPETEER_PRODUCT ||
-            process.env.npm_config_puppeteer_product ||
-            process.env.npm_package_config_puppeteer_product;
-    if (!isPuppeteerCore && product === 'firefox')
-        preferredRevision = revisions_1.PUPPETEER_REVISIONS.firefox;
-    const puppeteer = new Puppeteer_1.Puppeteer(puppeteerRootDirectory, preferredRevision, isPuppeteerCore, product);
-    // The introspection in `Helper.installAsyncStackHooks` references
-    // `Puppeteer._launcher` before the Puppeteer ctor is called, such that an
-    // invalid Launcher is selected at import, so we reset it.
-    puppeteer._lazyLauncher = undefined;
-    return puppeteer;
-};
-
-
-/***/ }),
+/* 187 */,
 /* 188 */,
 /* 189 */,
 /* 190 */,
@@ -7413,7 +7711,889 @@ function checkMode (stat, options) {
 /* 203 */,
 /* 204 */,
 /* 205 */,
-/* 206 */,
+/* 206 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.devicesMap = void 0;
+const devices = [
+    {
+        name: 'Blackberry PlayBook',
+        userAgent: 'Mozilla/5.0 (PlayBook; U; RIM Tablet OS 2.1.0; en-US) AppleWebKit/536.2+ (KHTML like Gecko) Version/7.2.1.0 Safari/536.2+',
+        viewport: {
+            width: 600,
+            height: 1024,
+            deviceScaleFactor: 1,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Blackberry PlayBook landscape',
+        userAgent: 'Mozilla/5.0 (PlayBook; U; RIM Tablet OS 2.1.0; en-US) AppleWebKit/536.2+ (KHTML like Gecko) Version/7.2.1.0 Safari/536.2+',
+        viewport: {
+            width: 1024,
+            height: 600,
+            deviceScaleFactor: 1,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'BlackBerry Z30',
+        userAgent: 'Mozilla/5.0 (BB10; Touch) AppleWebKit/537.10+ (KHTML, like Gecko) Version/10.0.9.2372 Mobile Safari/537.10+',
+        viewport: {
+            width: 360,
+            height: 640,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'BlackBerry Z30 landscape',
+        userAgent: 'Mozilla/5.0 (BB10; Touch) AppleWebKit/537.10+ (KHTML, like Gecko) Version/10.0.9.2372 Mobile Safari/537.10+',
+        viewport: {
+            width: 640,
+            height: 360,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Galaxy Note 3',
+        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.3; en-us; SM-N900T Build/JSS15J) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
+        viewport: {
+            width: 360,
+            height: 640,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Galaxy Note 3 landscape',
+        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.3; en-us; SM-N900T Build/JSS15J) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
+        viewport: {
+            width: 640,
+            height: 360,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Galaxy Note II',
+        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.1; en-us; GT-N7100 Build/JRO03C) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
+        viewport: {
+            width: 360,
+            height: 640,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Galaxy Note II landscape',
+        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.1; en-us; GT-N7100 Build/JRO03C) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
+        viewport: {
+            width: 640,
+            height: 360,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Galaxy S III',
+        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.0; en-us; GT-I9300 Build/IMM76D) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
+        viewport: {
+            width: 360,
+            height: 640,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Galaxy S III landscape',
+        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.0; en-us; GT-I9300 Build/IMM76D) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
+        viewport: {
+            width: 640,
+            height: 360,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Galaxy S5',
+        userAgent: 'Mozilla/5.0 (Linux; Android 5.0; SM-G900P Build/LRX21T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 360,
+            height: 640,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Galaxy S5 landscape',
+        userAgent: 'Mozilla/5.0 (Linux; Android 5.0; SM-G900P Build/LRX21T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 640,
+            height: 360,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPad',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
+        viewport: {
+            width: 768,
+            height: 1024,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPad landscape',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
+        viewport: {
+            width: 1024,
+            height: 768,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPad Mini',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
+        viewport: {
+            width: 768,
+            height: 1024,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPad Mini landscape',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
+        viewport: {
+            width: 1024,
+            height: 768,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPad Pro',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
+        viewport: {
+            width: 1024,
+            height: 1366,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPad Pro landscape',
+        userAgent: 'Mozilla/5.0 (iPad; CPU OS 11_0 like Mac OS X) AppleWebKit/604.1.34 (KHTML, like Gecko) Version/11.0 Mobile/15A5341f Safari/604.1',
+        viewport: {
+            width: 1366,
+            height: 1024,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone 4',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 7_1_2 like Mac OS X) AppleWebKit/537.51.2 (KHTML, like Gecko) Version/7.0 Mobile/11D257 Safari/9537.53',
+        viewport: {
+            width: 320,
+            height: 480,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone 4 landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 7_1_2 like Mac OS X) AppleWebKit/537.51.2 (KHTML, like Gecko) Version/7.0 Mobile/11D257 Safari/9537.53',
+        viewport: {
+            width: 480,
+            height: 320,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone 5',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_1 like Mac OS X) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.0 Mobile/14E304 Safari/602.1',
+        viewport: {
+            width: 320,
+            height: 568,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone 5 landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_1 like Mac OS X) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.0 Mobile/14E304 Safari/602.1',
+        viewport: {
+            width: 568,
+            height: 320,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone 6',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 375,
+            height: 667,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone 6 landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 667,
+            height: 375,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone 6 Plus',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 414,
+            height: 736,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone 6 Plus landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 736,
+            height: 414,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone 7',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 375,
+            height: 667,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone 7 landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 667,
+            height: 375,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone 7 Plus',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 414,
+            height: 736,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone 7 Plus landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 736,
+            height: 414,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone 8',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 375,
+            height: 667,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone 8 landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 667,
+            height: 375,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone 8 Plus',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 414,
+            height: 736,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone 8 Plus landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 736,
+            height: 414,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone SE',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_1 like Mac OS X) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.0 Mobile/14E304 Safari/602.1',
+        viewport: {
+            width: 320,
+            height: 568,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone SE landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 10_3_1 like Mac OS X) AppleWebKit/603.1.30 (KHTML, like Gecko) Version/10.0 Mobile/14E304 Safari/602.1',
+        viewport: {
+            width: 568,
+            height: 320,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone X',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 375,
+            height: 812,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone X landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 11_0 like Mac OS X) AppleWebKit/604.1.38 (KHTML, like Gecko) Version/11.0 Mobile/15A372 Safari/604.1',
+        viewport: {
+            width: 812,
+            height: 375,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'iPhone XR',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 12_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.0 Mobile/15E148 Safari/604.1',
+        viewport: {
+            width: 414,
+            height: 896,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'iPhone XR landscape',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 12_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/12.0 Mobile/15E148 Safari/604.1',
+        viewport: {
+            width: 896,
+            height: 414,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'JioPhone 2',
+        userAgent: 'Mozilla/5.0 (Mobile; LYF/F300B/LYF-F300B-001-01-15-130718-i;Android; rv:48.0) Gecko/48.0 Firefox/48.0 KAIOS/2.5',
+        viewport: {
+            width: 240,
+            height: 320,
+            deviceScaleFactor: 1,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'JioPhone 2 landscape',
+        userAgent: 'Mozilla/5.0 (Mobile; LYF/F300B/LYF-F300B-001-01-15-130718-i;Android; rv:48.0) Gecko/48.0 Firefox/48.0 KAIOS/2.5',
+        viewport: {
+            width: 320,
+            height: 240,
+            deviceScaleFactor: 1,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Kindle Fire HDX',
+        userAgent: 'Mozilla/5.0 (Linux; U; en-us; KFAPWI Build/JDQ39) AppleWebKit/535.19 (KHTML, like Gecko) Silk/3.13 Safari/535.19 Silk-Accelerated=true',
+        viewport: {
+            width: 800,
+            height: 1280,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Kindle Fire HDX landscape',
+        userAgent: 'Mozilla/5.0 (Linux; U; en-us; KFAPWI Build/JDQ39) AppleWebKit/535.19 (KHTML, like Gecko) Silk/3.13 Safari/535.19 Silk-Accelerated=true',
+        viewport: {
+            width: 1280,
+            height: 800,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'LG Optimus L70',
+        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.4.2; en-us; LGMS323 Build/KOT49I.MS32310c) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 384,
+            height: 640,
+            deviceScaleFactor: 1.25,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'LG Optimus L70 landscape',
+        userAgent: 'Mozilla/5.0 (Linux; U; Android 4.4.2; en-us; LGMS323 Build/KOT49I.MS32310c) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 640,
+            height: 384,
+            deviceScaleFactor: 1.25,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Microsoft Lumia 550',
+        userAgent: 'Mozilla/5.0 (Windows Phone 10.0; Android 4.2.1; Microsoft; Lumia 550) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2486.0 Mobile Safari/537.36 Edge/14.14263',
+        viewport: {
+            width: 640,
+            height: 360,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Microsoft Lumia 950',
+        userAgent: 'Mozilla/5.0 (Windows Phone 10.0; Android 4.2.1; Microsoft; Lumia 950) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2486.0 Mobile Safari/537.36 Edge/14.14263',
+        viewport: {
+            width: 360,
+            height: 640,
+            deviceScaleFactor: 4,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Microsoft Lumia 950 landscape',
+        userAgent: 'Mozilla/5.0 (Windows Phone 10.0; Android 4.2.1; Microsoft; Lumia 950) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2486.0 Mobile Safari/537.36 Edge/14.14263',
+        viewport: {
+            width: 640,
+            height: 360,
+            deviceScaleFactor: 4,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Nexus 10',
+        userAgent: 'Mozilla/5.0 (Linux; Android 6.0.1; Nexus 10 Build/MOB31T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Safari/537.36',
+        viewport: {
+            width: 800,
+            height: 1280,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Nexus 10 landscape',
+        userAgent: 'Mozilla/5.0 (Linux; Android 6.0.1; Nexus 10 Build/MOB31T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Safari/537.36',
+        viewport: {
+            width: 1280,
+            height: 800,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Nexus 4',
+        userAgent: 'Mozilla/5.0 (Linux; Android 4.4.2; Nexus 4 Build/KOT49H) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 384,
+            height: 640,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Nexus 4 landscape',
+        userAgent: 'Mozilla/5.0 (Linux; Android 4.4.2; Nexus 4 Build/KOT49H) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 640,
+            height: 384,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Nexus 5',
+        userAgent: 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 360,
+            height: 640,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Nexus 5 landscape',
+        userAgent: 'Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 640,
+            height: 360,
+            deviceScaleFactor: 3,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Nexus 5X',
+        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Nexus 5X Build/OPR4.170623.006) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 412,
+            height: 732,
+            deviceScaleFactor: 2.625,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Nexus 5X landscape',
+        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Nexus 5X Build/OPR4.170623.006) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 732,
+            height: 412,
+            deviceScaleFactor: 2.625,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Nexus 6',
+        userAgent: 'Mozilla/5.0 (Linux; Android 7.1.1; Nexus 6 Build/N6F26U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 412,
+            height: 732,
+            deviceScaleFactor: 3.5,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Nexus 6 landscape',
+        userAgent: 'Mozilla/5.0 (Linux; Android 7.1.1; Nexus 6 Build/N6F26U) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 732,
+            height: 412,
+            deviceScaleFactor: 3.5,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Nexus 6P',
+        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Nexus 6P Build/OPP3.170518.006) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 412,
+            height: 732,
+            deviceScaleFactor: 3.5,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Nexus 6P landscape',
+        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Nexus 6P Build/OPP3.170518.006) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 732,
+            height: 412,
+            deviceScaleFactor: 3.5,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Nexus 7',
+        userAgent: 'Mozilla/5.0 (Linux; Android 6.0.1; Nexus 7 Build/MOB30X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Safari/537.36',
+        viewport: {
+            width: 600,
+            height: 960,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Nexus 7 landscape',
+        userAgent: 'Mozilla/5.0 (Linux; Android 6.0.1; Nexus 7 Build/MOB30X) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Safari/537.36',
+        viewport: {
+            width: 960,
+            height: 600,
+            deviceScaleFactor: 2,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Nokia Lumia 520',
+        userAgent: 'Mozilla/5.0 (compatible; MSIE 10.0; Windows Phone 8.0; Trident/6.0; IEMobile/10.0; ARM; Touch; NOKIA; Lumia 520)',
+        viewport: {
+            width: 320,
+            height: 533,
+            deviceScaleFactor: 1.5,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Nokia Lumia 520 landscape',
+        userAgent: 'Mozilla/5.0 (compatible; MSIE 10.0; Windows Phone 8.0; Trident/6.0; IEMobile/10.0; ARM; Touch; NOKIA; Lumia 520)',
+        viewport: {
+            width: 533,
+            height: 320,
+            deviceScaleFactor: 1.5,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Nokia N9',
+        userAgent: 'Mozilla/5.0 (MeeGo; NokiaN9) AppleWebKit/534.13 (KHTML, like Gecko) NokiaBrowser/8.5.0 Mobile Safari/534.13',
+        viewport: {
+            width: 480,
+            height: 854,
+            deviceScaleFactor: 1,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Nokia N9 landscape',
+        userAgent: 'Mozilla/5.0 (MeeGo; NokiaN9) AppleWebKit/534.13 (KHTML, like Gecko) NokiaBrowser/8.5.0 Mobile Safari/534.13',
+        viewport: {
+            width: 854,
+            height: 480,
+            deviceScaleFactor: 1,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Pixel 2',
+        userAgent: 'Mozilla/5.0 (Linux; Android 8.0; Pixel 2 Build/OPD3.170816.012) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 411,
+            height: 731,
+            deviceScaleFactor: 2.625,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Pixel 2 landscape',
+        userAgent: 'Mozilla/5.0 (Linux; Android 8.0; Pixel 2 Build/OPD3.170816.012) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 731,
+            height: 411,
+            deviceScaleFactor: 2.625,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+    {
+        name: 'Pixel 2 XL',
+        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Pixel 2 XL Build/OPD1.170816.004) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 411,
+            height: 823,
+            deviceScaleFactor: 3.5,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: false,
+        },
+    },
+    {
+        name: 'Pixel 2 XL landscape',
+        userAgent: 'Mozilla/5.0 (Linux; Android 8.0.0; Pixel 2 XL Build/OPD1.170816.004) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/75.0.3765.0 Mobile Safari/537.36',
+        viewport: {
+            width: 823,
+            height: 411,
+            deviceScaleFactor: 3.5,
+            isMobile: true,
+            hasTouch: true,
+            isLandscape: true,
+        },
+    },
+];
+const devicesMap = {};
+exports.devicesMap = devicesMap;
+for (const device of devices)
+    devicesMap[device.name] = device;
+
+
+/***/ }),
 /* 207 */,
 /* 208 */,
 /* 209 */,
@@ -7461,108 +8641,7 @@ module.exports = {
 };
 
 /***/ }),
-/* 217 */
-/***/ (function(module) {
-
-"use strict";
-
-
-/**
- * @param typeMap [Object] Map of MIME type -> Array[extensions]
- * @param ...
- */
-function Mime() {
-  this._types = Object.create(null);
-  this._extensions = Object.create(null);
-
-  for (var i = 0; i < arguments.length; i++) {
-    this.define(arguments[i]);
-  }
-
-  this.define = this.define.bind(this);
-  this.getType = this.getType.bind(this);
-  this.getExtension = this.getExtension.bind(this);
-}
-
-/**
- * Define mimetype -> extension mappings.  Each key is a mime-type that maps
- * to an array of extensions associated with the type.  The first extension is
- * used as the default extension for the type.
- *
- * e.g. mime.define({'audio/ogg', ['oga', 'ogg', 'spx']});
- *
- * If a type declares an extension that has already been defined, an error will
- * be thrown.  To suppress this error and force the extension to be associated
- * with the new type, pass `force`=true.  Alternatively, you may prefix the
- * extension with "*" to map the type to extension, without mapping the
- * extension to the type.
- *
- * e.g. mime.define({'audio/wav', ['wav']}, {'audio/x-wav', ['*wav']});
- *
- *
- * @param map (Object) type definitions
- * @param force (Boolean) if true, force overriding of existing definitions
- */
-Mime.prototype.define = function(typeMap, force) {
-  for (var type in typeMap) {
-    var extensions = typeMap[type].map(function(t) {return t.toLowerCase()});
-    type = type.toLowerCase();
-
-    for (var i = 0; i < extensions.length; i++) {
-      var ext = extensions[i];
-
-      // '*' prefix = not the preferred type for this extension.  So fixup the
-      // extension, and skip it.
-      if (ext[0] == '*') {
-        continue;
-      }
-
-      if (!force && (ext in this._types)) {
-        throw new Error(
-          'Attempt to change mapping for "' + ext +
-          '" extension from "' + this._types[ext] + '" to "' + type +
-          '". Pass `force=true` to allow this, otherwise remove "' + ext +
-          '" from the list of extensions for "' + type + '".'
-        );
-      }
-
-      this._types[ext] = type;
-    }
-
-    // Use first extension as default
-    if (force || !this._extensions[type]) {
-      var ext = extensions[0];
-      this._extensions[type] = (ext[0] != '*') ? ext : ext.substr(1)
-    }
-  }
-};
-
-/**
- * Lookup a mime type based on extension
- */
-Mime.prototype.getType = function(path) {
-  path = String(path);
-  var last = path.replace(/^.*[/\\]/, '').toLowerCase();
-  var ext = last.replace(/^.*\./, '').toLowerCase();
-
-  var hasPath = last.length < path.length;
-  var hasDot = ext.length < last.length - 1;
-
-  return (hasDot || !hasPath) && this._types[ext] || null;
-};
-
-/**
- * Return file extension associated with a mime type
- */
-Mime.prototype.getExtension = function(type) {
-  type = /^\s*([^;\s]*)/.test(type) && RegExp.$1;
-  return type && this._extensions[type.toLowerCase()] || null;
-};
-
-module.exports = Mime;
-
-
-/***/ }),
+/* 217 */,
 /* 218 */,
 /* 219 */,
 /* 220 */,
@@ -7570,7 +8649,550 @@ module.exports = Mime;
 /* 222 */,
 /* 223 */,
 /* 224 */,
-/* 225 */,
+/* 225 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/**
+ * Copyright 2019 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.DOMWorld = void 0;
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const LifecycleWatcher_js_1 = __webpack_require__(662);
+const Errors_js_1 = __webpack_require__(422);
+const QueryHandler_js_1 = __webpack_require__(647);
+const environment_js_1 = __webpack_require__(975);
+/**
+ * @internal
+ */
+class DOMWorld {
+    constructor(frameManager, frame, timeoutSettings) {
+        this._documentPromise = null;
+        this._contextPromise = null;
+        this._contextResolveCallback = null;
+        this._detached = false;
+        /**
+         * internal
+         */
+        this._waitTasks = new Set();
+        this._frameManager = frameManager;
+        this._frame = frame;
+        this._timeoutSettings = timeoutSettings;
+        this._setContext(null);
+    }
+    frame() {
+        return this._frame;
+    }
+    _setContext(context) {
+        if (context) {
+            this._contextResolveCallback.call(null, context);
+            this._contextResolveCallback = null;
+            for (const waitTask of this._waitTasks)
+                waitTask.rerun();
+        }
+        else {
+            this._documentPromise = null;
+            this._contextPromise = new Promise((fulfill) => {
+                this._contextResolveCallback = fulfill;
+            });
+        }
+    }
+    _hasContext() {
+        return !this._contextResolveCallback;
+    }
+    _detach() {
+        this._detached = true;
+        for (const waitTask of this._waitTasks)
+            waitTask.terminate(new Error('waitForFunction failed: frame got detached.'));
+    }
+    executionContext() {
+        if (this._detached)
+            throw new Error(`Execution Context is not available in detached frame "${this._frame.url()}" (are you trying to evaluate?)`);
+        return this._contextPromise;
+    }
+    async evaluateHandle(pageFunction, ...args) {
+        const context = await this.executionContext();
+        return context.evaluateHandle(pageFunction, ...args);
+    }
+    async evaluate(pageFunction, ...args) {
+        const context = await this.executionContext();
+        return context.evaluate(pageFunction, ...args);
+    }
+    async $(selector) {
+        const document = await this._document();
+        const value = await document.$(selector);
+        return value;
+    }
+    async _document() {
+        if (this._documentPromise)
+            return this._documentPromise;
+        this._documentPromise = this.executionContext().then(async (context) => {
+            const document = await context.evaluateHandle('document');
+            return document.asElement();
+        });
+        return this._documentPromise;
+    }
+    async $x(expression) {
+        const document = await this._document();
+        const value = await document.$x(expression);
+        return value;
+    }
+    async $eval(selector, pageFunction, ...args) {
+        const document = await this._document();
+        return document.$eval(selector, pageFunction, ...args);
+    }
+    async $$eval(selector, pageFunction, ...args) {
+        const document = await this._document();
+        const value = await document.$$eval(selector, pageFunction, ...args);
+        return value;
+    }
+    async $$(selector) {
+        const document = await this._document();
+        const value = await document.$$(selector);
+        return value;
+    }
+    async content() {
+        return await this.evaluate(() => {
+            let retVal = '';
+            if (document.doctype)
+                retVal = new XMLSerializer().serializeToString(document.doctype);
+            if (document.documentElement)
+                retVal += document.documentElement.outerHTML;
+            return retVal;
+        });
+    }
+    async setContent(html, options = {}) {
+        const { waitUntil = ['load'], timeout = this._timeoutSettings.navigationTimeout(), } = options;
+        // We rely upon the fact that document.open() will reset frame lifecycle with "init"
+        // lifecycle event. @see https://crrev.com/608658
+        await this.evaluate((html) => {
+            document.open();
+            document.write(html);
+            document.close();
+        }, html);
+        const watcher = new LifecycleWatcher_js_1.LifecycleWatcher(this._frameManager, this._frame, waitUntil, timeout);
+        const error = await Promise.race([
+            watcher.timeoutOrTerminationPromise(),
+            watcher.lifecyclePromise(),
+        ]);
+        watcher.dispose();
+        if (error)
+            throw error;
+    }
+    /**
+     * Adds a script tag into the current context.
+     *
+     * @remarks
+     *
+     * You can pass a URL, filepath or string of contents. Note that when running Puppeteer
+     * in a browser environment you cannot pass a filepath and should use either
+     * `url` or `content`.
+     */
+    async addScriptTag(options) {
+        const { url = null, path = null, content = null, type = '' } = options;
+        if (url !== null) {
+            try {
+                const context = await this.executionContext();
+                return (await context.evaluateHandle(addScriptUrl, url, type)).asElement();
+            }
+            catch (error) {
+                throw new Error(`Loading script from ${url} failed`);
+            }
+        }
+        if (path !== null) {
+            if (!environment_js_1.isNode) {
+                throw new Error('Cannot pass a filepath to addScriptTag in the browser environment.');
+            }
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const fs = __webpack_require__(747);
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { promisify } = __webpack_require__(669);
+            const readFileAsync = promisify(fs.readFile);
+            let contents = await readFileAsync(path, 'utf8');
+            contents += '//# sourceURL=' + path.replace(/\n/g, '');
+            const context = await this.executionContext();
+            return (await context.evaluateHandle(addScriptContent, contents, type)).asElement();
+        }
+        if (content !== null) {
+            const context = await this.executionContext();
+            return (await context.evaluateHandle(addScriptContent, content, type)).asElement();
+        }
+        throw new Error('Provide an object with a `url`, `path` or `content` property');
+        async function addScriptUrl(url, type) {
+            const script = document.createElement('script');
+            script.src = url;
+            if (type)
+                script.type = type;
+            const promise = new Promise((res, rej) => {
+                script.onload = res;
+                script.onerror = rej;
+            });
+            document.head.appendChild(script);
+            await promise;
+            return script;
+        }
+        function addScriptContent(content, type = 'text/javascript') {
+            const script = document.createElement('script');
+            script.type = type;
+            script.text = content;
+            let error = null;
+            script.onerror = (e) => (error = e);
+            document.head.appendChild(script);
+            if (error)
+                throw error;
+            return script;
+        }
+    }
+    /**
+     * Adds a style tag into the current context.
+     *
+     * @remarks
+     *
+     * You can pass a URL, filepath or string of contents. Note that when running Puppeteer
+     * in a browser environment you cannot pass a filepath and should use either
+     * `url` or `content`.
+     *
+     */
+    async addStyleTag(options) {
+        const { url = null, path = null, content = null } = options;
+        if (url !== null) {
+            try {
+                const context = await this.executionContext();
+                return (await context.evaluateHandle(addStyleUrl, url)).asElement();
+            }
+            catch (error) {
+                throw new Error(`Loading style from ${url} failed`);
+            }
+        }
+        if (path !== null) {
+            if (!environment_js_1.isNode) {
+                throw new Error('Cannot pass a filepath to addStyleTag in the browser environment.');
+            }
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const fs = __webpack_require__(747);
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const { promisify } = __webpack_require__(669);
+            const readFileAsync = promisify(fs.readFile);
+            let contents = await readFileAsync(path, 'utf8');
+            contents += '/*# sourceURL=' + path.replace(/\n/g, '') + '*/';
+            const context = await this.executionContext();
+            return (await context.evaluateHandle(addStyleContent, contents)).asElement();
+        }
+        if (content !== null) {
+            const context = await this.executionContext();
+            return (await context.evaluateHandle(addStyleContent, content)).asElement();
+        }
+        throw new Error('Provide an object with a `url`, `path` or `content` property');
+        async function addStyleUrl(url) {
+            const link = document.createElement('link');
+            link.rel = 'stylesheet';
+            link.href = url;
+            const promise = new Promise((res, rej) => {
+                link.onload = res;
+                link.onerror = rej;
+            });
+            document.head.appendChild(link);
+            await promise;
+            return link;
+        }
+        async function addStyleContent(content) {
+            const style = document.createElement('style');
+            style.type = 'text/css';
+            style.appendChild(document.createTextNode(content));
+            const promise = new Promise((res, rej) => {
+                style.onload = res;
+                style.onerror = rej;
+            });
+            document.head.appendChild(style);
+            await promise;
+            return style;
+        }
+    }
+    async click(selector, options) {
+        const handle = await this.$(selector);
+        assert_js_1.assert(handle, 'No node found for selector: ' + selector);
+        await handle.click(options);
+        await handle.dispose();
+    }
+    async focus(selector) {
+        const handle = await this.$(selector);
+        assert_js_1.assert(handle, 'No node found for selector: ' + selector);
+        await handle.focus();
+        await handle.dispose();
+    }
+    async hover(selector) {
+        const handle = await this.$(selector);
+        assert_js_1.assert(handle, 'No node found for selector: ' + selector);
+        await handle.hover();
+        await handle.dispose();
+    }
+    async select(selector, ...values) {
+        const handle = await this.$(selector);
+        assert_js_1.assert(handle, 'No node found for selector: ' + selector);
+        const result = await handle.select(...values);
+        await handle.dispose();
+        return result;
+    }
+    async tap(selector) {
+        const handle = await this.$(selector);
+        assert_js_1.assert(handle, 'No node found for selector: ' + selector);
+        await handle.tap();
+        await handle.dispose();
+    }
+    async type(selector, text, options) {
+        const handle = await this.$(selector);
+        assert_js_1.assert(handle, 'No node found for selector: ' + selector);
+        await handle.type(text, options);
+        await handle.dispose();
+    }
+    async waitForSelector(selector, options) {
+        const { visible: waitForVisible = false, hidden: waitForHidden = false, timeout = this._timeoutSettings.timeout(), } = options;
+        const polling = waitForVisible || waitForHidden ? 'raf' : 'mutation';
+        const title = `selector \`${selector}\`${waitForHidden ? ' to be hidden' : ''}`;
+        const { updatedSelector, queryHandler } = QueryHandler_js_1.getQueryHandlerAndSelector(selector);
+        function predicate(selector, waitForVisible, waitForHidden) {
+            const node = predicateQueryHandler
+                ? predicateQueryHandler(document, selector)
+                : document.querySelector(selector);
+            return checkWaitForOptions(node, waitForVisible, waitForHidden);
+        }
+        const waitTask = new WaitTask(this, this._makePredicateString(predicate, queryHandler.queryOne), title, polling, timeout, updatedSelector, waitForVisible, waitForHidden);
+        const jsHandle = await waitTask.promise;
+        const elementHandle = jsHandle.asElement();
+        if (!elementHandle) {
+            await jsHandle.dispose();
+            return null;
+        }
+        return elementHandle;
+    }
+    async waitForXPath(xpath, options) {
+        const { visible: waitForVisible = false, hidden: waitForHidden = false, timeout = this._timeoutSettings.timeout(), } = options;
+        const polling = waitForVisible || waitForHidden ? 'raf' : 'mutation';
+        const title = `XPath \`${xpath}\`${waitForHidden ? ' to be hidden' : ''}`;
+        function predicate(xpath, waitForVisible, waitForHidden) {
+            const node = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            return checkWaitForOptions(node, waitForVisible, waitForHidden);
+        }
+        const waitTask = new WaitTask(this, this._makePredicateString(predicate), title, polling, timeout, xpath, waitForVisible, waitForHidden);
+        const jsHandle = await waitTask.promise;
+        const elementHandle = jsHandle.asElement();
+        if (!elementHandle) {
+            await jsHandle.dispose();
+            return null;
+        }
+        return elementHandle;
+    }
+    _makePredicateString(predicate, predicateQueryHandler) {
+        const predicateQueryHandlerDef = predicateQueryHandler
+            ? `const predicateQueryHandler = ${predicateQueryHandler};`
+            : '';
+        return `
+    (() => {
+      ${predicateQueryHandlerDef}
+      const checkWaitForOptions = ${checkWaitForOptions};
+      return (${predicate})(...args)
+    })() `;
+        function checkWaitForOptions(node, waitForVisible, waitForHidden) {
+            if (!node)
+                return waitForHidden;
+            if (!waitForVisible && !waitForHidden)
+                return node;
+            const element = node.nodeType === Node.TEXT_NODE
+                ? node.parentElement
+                : node;
+            const style = window.getComputedStyle(element);
+            const isVisible = style && style.visibility !== 'hidden' && hasVisibleBoundingBox();
+            const success = waitForVisible === isVisible || waitForHidden === !isVisible;
+            return success ? node : null;
+            function hasVisibleBoundingBox() {
+                const rect = element.getBoundingClientRect();
+                return !!(rect.top || rect.bottom || rect.width || rect.height);
+            }
+        }
+    }
+    waitForFunction(pageFunction, options = {}, ...args) {
+        const { polling = 'raf', timeout = this._timeoutSettings.timeout(), } = options;
+        return new WaitTask(this, pageFunction, 'function', polling, timeout, ...args).promise;
+    }
+    async title() {
+        return this.evaluate(() => document.title);
+    }
+}
+exports.DOMWorld = DOMWorld;
+class WaitTask {
+    constructor(domWorld, predicateBody, title, polling, timeout, ...args) {
+        this._runCount = 0;
+        this._terminated = false;
+        if (helper_js_1.helper.isString(polling))
+            assert_js_1.assert(polling === 'raf' || polling === 'mutation', 'Unknown polling option: ' + polling);
+        else if (helper_js_1.helper.isNumber(polling))
+            assert_js_1.assert(polling > 0, 'Cannot poll with non-positive interval: ' + polling);
+        else
+            throw new Error('Unknown polling options: ' + polling);
+        function getPredicateBody(predicateBody) {
+            if (helper_js_1.helper.isString(predicateBody))
+                return `return (${predicateBody});`;
+            return `return (${predicateBody})(...args);`;
+        }
+        this._domWorld = domWorld;
+        this._polling = polling;
+        this._timeout = timeout;
+        this._predicateBody = getPredicateBody(predicateBody);
+        this._args = args;
+        this._runCount = 0;
+        domWorld._waitTasks.add(this);
+        this.promise = new Promise((resolve, reject) => {
+            this._resolve = resolve;
+            this._reject = reject;
+        });
+        // Since page navigation requires us to re-install the pageScript, we should track
+        // timeout on our end.
+        if (timeout) {
+            const timeoutError = new Errors_js_1.TimeoutError(`waiting for ${title} failed: timeout ${timeout}ms exceeded`);
+            this._timeoutTimer = setTimeout(() => this.terminate(timeoutError), timeout);
+        }
+        this.rerun();
+    }
+    terminate(error) {
+        this._terminated = true;
+        this._reject(error);
+        this._cleanup();
+    }
+    async rerun() {
+        const runCount = ++this._runCount;
+        /** @type {?JSHandle} */
+        let success = null;
+        let error = null;
+        try {
+            success = await (await this._domWorld.executionContext()).evaluateHandle(waitForPredicatePageFunction, this._predicateBody, this._polling, this._timeout, ...this._args);
+        }
+        catch (error_) {
+            error = error_;
+        }
+        if (this._terminated || runCount !== this._runCount) {
+            if (success)
+                await success.dispose();
+            return;
+        }
+        // Ignore timeouts in pageScript - we track timeouts ourselves.
+        // If the frame's execution context has already changed, `frame.evaluate` will
+        // throw an error - ignore this predicate run altogether.
+        if (!error &&
+            (await this._domWorld.evaluate((s) => !s, success).catch(() => true))) {
+            await success.dispose();
+            return;
+        }
+        // When the page is navigated, the promise is rejected.
+        // We will try again in the new execution context.
+        if (error && error.message.includes('Execution context was destroyed'))
+            return;
+        // We could have tried to evaluate in a context which was already
+        // destroyed.
+        if (error &&
+            error.message.includes('Cannot find context with specified id'))
+            return;
+        if (error)
+            this._reject(error);
+        else
+            this._resolve(success);
+        this._cleanup();
+    }
+    _cleanup() {
+        clearTimeout(this._timeoutTimer);
+        this._domWorld._waitTasks.delete(this);
+    }
+}
+async function waitForPredicatePageFunction(predicateBody, polling, timeout, ...args) {
+    const predicate = new Function('...args', predicateBody);
+    let timedOut = false;
+    if (timeout)
+        setTimeout(() => (timedOut = true), timeout);
+    if (polling === 'raf')
+        return await pollRaf();
+    if (polling === 'mutation')
+        return await pollMutation();
+    if (typeof polling === 'number')
+        return await pollInterval(polling);
+    /**
+     * @returns {!Promise<*>}
+     */
+    async function pollMutation() {
+        const success = await predicate(...args);
+        if (success)
+            return Promise.resolve(success);
+        let fulfill;
+        const result = new Promise((x) => (fulfill = x));
+        const observer = new MutationObserver(async () => {
+            if (timedOut) {
+                observer.disconnect();
+                fulfill();
+            }
+            const success = await predicate(...args);
+            if (success) {
+                observer.disconnect();
+                fulfill(success);
+            }
+        });
+        observer.observe(document, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+        });
+        return result;
+    }
+    async function pollRaf() {
+        let fulfill;
+        const result = new Promise((x) => (fulfill = x));
+        await onRaf();
+        return result;
+        async function onRaf() {
+            if (timedOut) {
+                fulfill();
+                return;
+            }
+            const success = await predicate(...args);
+            if (success)
+                fulfill(success);
+            else
+                requestAnimationFrame(onRaf);
+        }
+    }
+    async function pollInterval(pollInterval) {
+        let fulfill;
+        const result = new Promise((x) => (fulfill = x));
+        await onTimeout();
+        return result;
+        async function onTimeout() {
+            if (timedOut) {
+                fulfill();
+                return;
+            }
+            const success = await predicate(...args);
+            if (success)
+                fulfill(success);
+            else
+                setTimeout(onTimeout, pollInterval);
+        }
+    }
+}
+
+
+/***/ }),
 /* 226 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -7616,7 +9238,7 @@ var EElistenerCount = function EElistenerCount(emitter, type) {
 /*<replacement>*/
 
 
-var Stream = __webpack_require__(626);
+var Stream = __webpack_require__(427);
 /*</replacement>*/
 
 
@@ -8835,10 +10457,10 @@ module.exports = eval("require")("utf-8-validate");
 
 const WebSocket = __webpack_require__(21);
 
-WebSocket.createWebSocketStream = __webpack_require__(28);
+WebSocket.createWebSocketStream = __webpack_require__(948);
 WebSocket.Server = __webpack_require__(613);
 WebSocket.Receiver = __webpack_require__(312);
-WebSocket.Sender = __webpack_require__(837);
+WebSocket.Sender = __webpack_require__(10);
 
 module.exports = WebSocket;
 
@@ -9018,7 +10640,7 @@ var internalUtil = {
 
 /*<replacement>*/
 
-var Stream = __webpack_require__(626);
+var Stream = __webpack_require__(427);
 /*</replacement>*/
 
 
@@ -10155,423 +11777,133 @@ GlobSync.prototype._makeAbs = function (f) {
 /* 251 */,
 /* 252 */,
 /* 253 */,
-/* 254 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the 'License');
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an 'AS IS' BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.keyDefinitions = void 0;
-/**
- * @internal
- */
-exports.keyDefinitions = {
-    '0': { keyCode: 48, key: '0', code: 'Digit0' },
-    '1': { keyCode: 49, key: '1', code: 'Digit1' },
-    '2': { keyCode: 50, key: '2', code: 'Digit2' },
-    '3': { keyCode: 51, key: '3', code: 'Digit3' },
-    '4': { keyCode: 52, key: '4', code: 'Digit4' },
-    '5': { keyCode: 53, key: '5', code: 'Digit5' },
-    '6': { keyCode: 54, key: '6', code: 'Digit6' },
-    '7': { keyCode: 55, key: '7', code: 'Digit7' },
-    '8': { keyCode: 56, key: '8', code: 'Digit8' },
-    '9': { keyCode: 57, key: '9', code: 'Digit9' },
-    Power: { key: 'Power', code: 'Power' },
-    Eject: { key: 'Eject', code: 'Eject' },
-    Abort: { keyCode: 3, code: 'Abort', key: 'Cancel' },
-    Help: { keyCode: 6, code: 'Help', key: 'Help' },
-    Backspace: { keyCode: 8, code: 'Backspace', key: 'Backspace' },
-    Tab: { keyCode: 9, code: 'Tab', key: 'Tab' },
-    Numpad5: {
-        keyCode: 12,
-        shiftKeyCode: 101,
-        key: 'Clear',
-        code: 'Numpad5',
-        shiftKey: '5',
-        location: 3,
-    },
-    NumpadEnter: {
-        keyCode: 13,
-        code: 'NumpadEnter',
-        key: 'Enter',
-        text: '\r',
-        location: 3,
-    },
-    Enter: { keyCode: 13, code: 'Enter', key: 'Enter', text: '\r' },
-    '\r': { keyCode: 13, code: 'Enter', key: 'Enter', text: '\r' },
-    '\n': { keyCode: 13, code: 'Enter', key: 'Enter', text: '\r' },
-    ShiftLeft: { keyCode: 16, code: 'ShiftLeft', key: 'Shift', location: 1 },
-    ShiftRight: { keyCode: 16, code: 'ShiftRight', key: 'Shift', location: 2 },
-    ControlLeft: {
-        keyCode: 17,
-        code: 'ControlLeft',
-        key: 'Control',
-        location: 1,
-    },
-    ControlRight: {
-        keyCode: 17,
-        code: 'ControlRight',
-        key: 'Control',
-        location: 2,
-    },
-    AltLeft: { keyCode: 18, code: 'AltLeft', key: 'Alt', location: 1 },
-    AltRight: { keyCode: 18, code: 'AltRight', key: 'Alt', location: 2 },
-    Pause: { keyCode: 19, code: 'Pause', key: 'Pause' },
-    CapsLock: { keyCode: 20, code: 'CapsLock', key: 'CapsLock' },
-    Escape: { keyCode: 27, code: 'Escape', key: 'Escape' },
-    Convert: { keyCode: 28, code: 'Convert', key: 'Convert' },
-    NonConvert: { keyCode: 29, code: 'NonConvert', key: 'NonConvert' },
-    Space: { keyCode: 32, code: 'Space', key: ' ' },
-    Numpad9: {
-        keyCode: 33,
-        shiftKeyCode: 105,
-        key: 'PageUp',
-        code: 'Numpad9',
-        shiftKey: '9',
-        location: 3,
-    },
-    PageUp: { keyCode: 33, code: 'PageUp', key: 'PageUp' },
-    Numpad3: {
-        keyCode: 34,
-        shiftKeyCode: 99,
-        key: 'PageDown',
-        code: 'Numpad3',
-        shiftKey: '3',
-        location: 3,
-    },
-    PageDown: { keyCode: 34, code: 'PageDown', key: 'PageDown' },
-    End: { keyCode: 35, code: 'End', key: 'End' },
-    Numpad1: {
-        keyCode: 35,
-        shiftKeyCode: 97,
-        key: 'End',
-        code: 'Numpad1',
-        shiftKey: '1',
-        location: 3,
-    },
-    Home: { keyCode: 36, code: 'Home', key: 'Home' },
-    Numpad7: {
-        keyCode: 36,
-        shiftKeyCode: 103,
-        key: 'Home',
-        code: 'Numpad7',
-        shiftKey: '7',
-        location: 3,
-    },
-    ArrowLeft: { keyCode: 37, code: 'ArrowLeft', key: 'ArrowLeft' },
-    Numpad4: {
-        keyCode: 37,
-        shiftKeyCode: 100,
-        key: 'ArrowLeft',
-        code: 'Numpad4',
-        shiftKey: '4',
-        location: 3,
-    },
-    Numpad8: {
-        keyCode: 38,
-        shiftKeyCode: 104,
-        key: 'ArrowUp',
-        code: 'Numpad8',
-        shiftKey: '8',
-        location: 3,
-    },
-    ArrowUp: { keyCode: 38, code: 'ArrowUp', key: 'ArrowUp' },
-    ArrowRight: { keyCode: 39, code: 'ArrowRight', key: 'ArrowRight' },
-    Numpad6: {
-        keyCode: 39,
-        shiftKeyCode: 102,
-        key: 'ArrowRight',
-        code: 'Numpad6',
-        shiftKey: '6',
-        location: 3,
-    },
-    Numpad2: {
-        keyCode: 40,
-        shiftKeyCode: 98,
-        key: 'ArrowDown',
-        code: 'Numpad2',
-        shiftKey: '2',
-        location: 3,
-    },
-    ArrowDown: { keyCode: 40, code: 'ArrowDown', key: 'ArrowDown' },
-    Select: { keyCode: 41, code: 'Select', key: 'Select' },
-    Open: { keyCode: 43, code: 'Open', key: 'Execute' },
-    PrintScreen: { keyCode: 44, code: 'PrintScreen', key: 'PrintScreen' },
-    Insert: { keyCode: 45, code: 'Insert', key: 'Insert' },
-    Numpad0: {
-        keyCode: 45,
-        shiftKeyCode: 96,
-        key: 'Insert',
-        code: 'Numpad0',
-        shiftKey: '0',
-        location: 3,
-    },
-    Delete: { keyCode: 46, code: 'Delete', key: 'Delete' },
-    NumpadDecimal: {
-        keyCode: 46,
-        shiftKeyCode: 110,
-        code: 'NumpadDecimal',
-        key: '\u0000',
-        shiftKey: '.',
-        location: 3,
-    },
-    Digit0: { keyCode: 48, code: 'Digit0', shiftKey: ')', key: '0' },
-    Digit1: { keyCode: 49, code: 'Digit1', shiftKey: '!', key: '1' },
-    Digit2: { keyCode: 50, code: 'Digit2', shiftKey: '@', key: '2' },
-    Digit3: { keyCode: 51, code: 'Digit3', shiftKey: '#', key: '3' },
-    Digit4: { keyCode: 52, code: 'Digit4', shiftKey: '$', key: '4' },
-    Digit5: { keyCode: 53, code: 'Digit5', shiftKey: '%', key: '5' },
-    Digit6: { keyCode: 54, code: 'Digit6', shiftKey: '^', key: '6' },
-    Digit7: { keyCode: 55, code: 'Digit7', shiftKey: '&', key: '7' },
-    Digit8: { keyCode: 56, code: 'Digit8', shiftKey: '*', key: '8' },
-    Digit9: { keyCode: 57, code: 'Digit9', shiftKey: '(', key: '9' },
-    KeyA: { keyCode: 65, code: 'KeyA', shiftKey: 'A', key: 'a' },
-    KeyB: { keyCode: 66, code: 'KeyB', shiftKey: 'B', key: 'b' },
-    KeyC: { keyCode: 67, code: 'KeyC', shiftKey: 'C', key: 'c' },
-    KeyD: { keyCode: 68, code: 'KeyD', shiftKey: 'D', key: 'd' },
-    KeyE: { keyCode: 69, code: 'KeyE', shiftKey: 'E', key: 'e' },
-    KeyF: { keyCode: 70, code: 'KeyF', shiftKey: 'F', key: 'f' },
-    KeyG: { keyCode: 71, code: 'KeyG', shiftKey: 'G', key: 'g' },
-    KeyH: { keyCode: 72, code: 'KeyH', shiftKey: 'H', key: 'h' },
-    KeyI: { keyCode: 73, code: 'KeyI', shiftKey: 'I', key: 'i' },
-    KeyJ: { keyCode: 74, code: 'KeyJ', shiftKey: 'J', key: 'j' },
-    KeyK: { keyCode: 75, code: 'KeyK', shiftKey: 'K', key: 'k' },
-    KeyL: { keyCode: 76, code: 'KeyL', shiftKey: 'L', key: 'l' },
-    KeyM: { keyCode: 77, code: 'KeyM', shiftKey: 'M', key: 'm' },
-    KeyN: { keyCode: 78, code: 'KeyN', shiftKey: 'N', key: 'n' },
-    KeyO: { keyCode: 79, code: 'KeyO', shiftKey: 'O', key: 'o' },
-    KeyP: { keyCode: 80, code: 'KeyP', shiftKey: 'P', key: 'p' },
-    KeyQ: { keyCode: 81, code: 'KeyQ', shiftKey: 'Q', key: 'q' },
-    KeyR: { keyCode: 82, code: 'KeyR', shiftKey: 'R', key: 'r' },
-    KeyS: { keyCode: 83, code: 'KeyS', shiftKey: 'S', key: 's' },
-    KeyT: { keyCode: 84, code: 'KeyT', shiftKey: 'T', key: 't' },
-    KeyU: { keyCode: 85, code: 'KeyU', shiftKey: 'U', key: 'u' },
-    KeyV: { keyCode: 86, code: 'KeyV', shiftKey: 'V', key: 'v' },
-    KeyW: { keyCode: 87, code: 'KeyW', shiftKey: 'W', key: 'w' },
-    KeyX: { keyCode: 88, code: 'KeyX', shiftKey: 'X', key: 'x' },
-    KeyY: { keyCode: 89, code: 'KeyY', shiftKey: 'Y', key: 'y' },
-    KeyZ: { keyCode: 90, code: 'KeyZ', shiftKey: 'Z', key: 'z' },
-    MetaLeft: { keyCode: 91, code: 'MetaLeft', key: 'Meta', location: 1 },
-    MetaRight: { keyCode: 92, code: 'MetaRight', key: 'Meta', location: 2 },
-    ContextMenu: { keyCode: 93, code: 'ContextMenu', key: 'ContextMenu' },
-    NumpadMultiply: {
-        keyCode: 106,
-        code: 'NumpadMultiply',
-        key: '*',
-        location: 3,
-    },
-    NumpadAdd: { keyCode: 107, code: 'NumpadAdd', key: '+', location: 3 },
-    NumpadSubtract: {
-        keyCode: 109,
-        code: 'NumpadSubtract',
-        key: '-',
-        location: 3,
-    },
-    NumpadDivide: { keyCode: 111, code: 'NumpadDivide', key: '/', location: 3 },
-    F1: { keyCode: 112, code: 'F1', key: 'F1' },
-    F2: { keyCode: 113, code: 'F2', key: 'F2' },
-    F3: { keyCode: 114, code: 'F3', key: 'F3' },
-    F4: { keyCode: 115, code: 'F4', key: 'F4' },
-    F5: { keyCode: 116, code: 'F5', key: 'F5' },
-    F6: { keyCode: 117, code: 'F6', key: 'F6' },
-    F7: { keyCode: 118, code: 'F7', key: 'F7' },
-    F8: { keyCode: 119, code: 'F8', key: 'F8' },
-    F9: { keyCode: 120, code: 'F9', key: 'F9' },
-    F10: { keyCode: 121, code: 'F10', key: 'F10' },
-    F11: { keyCode: 122, code: 'F11', key: 'F11' },
-    F12: { keyCode: 123, code: 'F12', key: 'F12' },
-    F13: { keyCode: 124, code: 'F13', key: 'F13' },
-    F14: { keyCode: 125, code: 'F14', key: 'F14' },
-    F15: { keyCode: 126, code: 'F15', key: 'F15' },
-    F16: { keyCode: 127, code: 'F16', key: 'F16' },
-    F17: { keyCode: 128, code: 'F17', key: 'F17' },
-    F18: { keyCode: 129, code: 'F18', key: 'F18' },
-    F19: { keyCode: 130, code: 'F19', key: 'F19' },
-    F20: { keyCode: 131, code: 'F20', key: 'F20' },
-    F21: { keyCode: 132, code: 'F21', key: 'F21' },
-    F22: { keyCode: 133, code: 'F22', key: 'F22' },
-    F23: { keyCode: 134, code: 'F23', key: 'F23' },
-    F24: { keyCode: 135, code: 'F24', key: 'F24' },
-    NumLock: { keyCode: 144, code: 'NumLock', key: 'NumLock' },
-    ScrollLock: { keyCode: 145, code: 'ScrollLock', key: 'ScrollLock' },
-    AudioVolumeMute: {
-        keyCode: 173,
-        code: 'AudioVolumeMute',
-        key: 'AudioVolumeMute',
-    },
-    AudioVolumeDown: {
-        keyCode: 174,
-        code: 'AudioVolumeDown',
-        key: 'AudioVolumeDown',
-    },
-    AudioVolumeUp: { keyCode: 175, code: 'AudioVolumeUp', key: 'AudioVolumeUp' },
-    MediaTrackNext: {
-        keyCode: 176,
-        code: 'MediaTrackNext',
-        key: 'MediaTrackNext',
-    },
-    MediaTrackPrevious: {
-        keyCode: 177,
-        code: 'MediaTrackPrevious',
-        key: 'MediaTrackPrevious',
-    },
-    MediaStop: { keyCode: 178, code: 'MediaStop', key: 'MediaStop' },
-    MediaPlayPause: {
-        keyCode: 179,
-        code: 'MediaPlayPause',
-        key: 'MediaPlayPause',
-    },
-    Semicolon: { keyCode: 186, code: 'Semicolon', shiftKey: ':', key: ';' },
-    Equal: { keyCode: 187, code: 'Equal', shiftKey: '+', key: '=' },
-    NumpadEqual: { keyCode: 187, code: 'NumpadEqual', key: '=', location: 3 },
-    Comma: { keyCode: 188, code: 'Comma', shiftKey: '<', key: ',' },
-    Minus: { keyCode: 189, code: 'Minus', shiftKey: '_', key: '-' },
-    Period: { keyCode: 190, code: 'Period', shiftKey: '>', key: '.' },
-    Slash: { keyCode: 191, code: 'Slash', shiftKey: '?', key: '/' },
-    Backquote: { keyCode: 192, code: 'Backquote', shiftKey: '~', key: '`' },
-    BracketLeft: { keyCode: 219, code: 'BracketLeft', shiftKey: '{', key: '[' },
-    Backslash: { keyCode: 220, code: 'Backslash', shiftKey: '|', key: '\\' },
-    BracketRight: { keyCode: 221, code: 'BracketRight', shiftKey: '}', key: ']' },
-    Quote: { keyCode: 222, code: 'Quote', shiftKey: '"', key: "'" },
-    AltGraph: { keyCode: 225, code: 'AltGraph', key: 'AltGraph' },
-    Props: { keyCode: 247, code: 'Props', key: 'CrSel' },
-    Cancel: { keyCode: 3, key: 'Cancel', code: 'Abort' },
-    Clear: { keyCode: 12, key: 'Clear', code: 'Numpad5', location: 3 },
-    Shift: { keyCode: 16, key: 'Shift', code: 'ShiftLeft', location: 1 },
-    Control: { keyCode: 17, key: 'Control', code: 'ControlLeft', location: 1 },
-    Alt: { keyCode: 18, key: 'Alt', code: 'AltLeft', location: 1 },
-    Accept: { keyCode: 30, key: 'Accept' },
-    ModeChange: { keyCode: 31, key: 'ModeChange' },
-    ' ': { keyCode: 32, key: ' ', code: 'Space' },
-    Print: { keyCode: 42, key: 'Print' },
-    Execute: { keyCode: 43, key: 'Execute', code: 'Open' },
-    '\u0000': { keyCode: 46, key: '\u0000', code: 'NumpadDecimal', location: 3 },
-    a: { keyCode: 65, key: 'a', code: 'KeyA' },
-    b: { keyCode: 66, key: 'b', code: 'KeyB' },
-    c: { keyCode: 67, key: 'c', code: 'KeyC' },
-    d: { keyCode: 68, key: 'd', code: 'KeyD' },
-    e: { keyCode: 69, key: 'e', code: 'KeyE' },
-    f: { keyCode: 70, key: 'f', code: 'KeyF' },
-    g: { keyCode: 71, key: 'g', code: 'KeyG' },
-    h: { keyCode: 72, key: 'h', code: 'KeyH' },
-    i: { keyCode: 73, key: 'i', code: 'KeyI' },
-    j: { keyCode: 74, key: 'j', code: 'KeyJ' },
-    k: { keyCode: 75, key: 'k', code: 'KeyK' },
-    l: { keyCode: 76, key: 'l', code: 'KeyL' },
-    m: { keyCode: 77, key: 'm', code: 'KeyM' },
-    n: { keyCode: 78, key: 'n', code: 'KeyN' },
-    o: { keyCode: 79, key: 'o', code: 'KeyO' },
-    p: { keyCode: 80, key: 'p', code: 'KeyP' },
-    q: { keyCode: 81, key: 'q', code: 'KeyQ' },
-    r: { keyCode: 82, key: 'r', code: 'KeyR' },
-    s: { keyCode: 83, key: 's', code: 'KeyS' },
-    t: { keyCode: 84, key: 't', code: 'KeyT' },
-    u: { keyCode: 85, key: 'u', code: 'KeyU' },
-    v: { keyCode: 86, key: 'v', code: 'KeyV' },
-    w: { keyCode: 87, key: 'w', code: 'KeyW' },
-    x: { keyCode: 88, key: 'x', code: 'KeyX' },
-    y: { keyCode: 89, key: 'y', code: 'KeyY' },
-    z: { keyCode: 90, key: 'z', code: 'KeyZ' },
-    Meta: { keyCode: 91, key: 'Meta', code: 'MetaLeft', location: 1 },
-    '*': { keyCode: 106, key: '*', code: 'NumpadMultiply', location: 3 },
-    '+': { keyCode: 107, key: '+', code: 'NumpadAdd', location: 3 },
-    '-': { keyCode: 109, key: '-', code: 'NumpadSubtract', location: 3 },
-    '/': { keyCode: 111, key: '/', code: 'NumpadDivide', location: 3 },
-    ';': { keyCode: 186, key: ';', code: 'Semicolon' },
-    '=': { keyCode: 187, key: '=', code: 'Equal' },
-    ',': { keyCode: 188, key: ',', code: 'Comma' },
-    '.': { keyCode: 190, key: '.', code: 'Period' },
-    '`': { keyCode: 192, key: '`', code: 'Backquote' },
-    '[': { keyCode: 219, key: '[', code: 'BracketLeft' },
-    '\\': { keyCode: 220, key: '\\', code: 'Backslash' },
-    ']': { keyCode: 221, key: ']', code: 'BracketRight' },
-    "'": { keyCode: 222, key: "'", code: 'Quote' },
-    Attn: { keyCode: 246, key: 'Attn' },
-    CrSel: { keyCode: 247, key: 'CrSel', code: 'Props' },
-    ExSel: { keyCode: 248, key: 'ExSel' },
-    EraseEof: { keyCode: 249, key: 'EraseEof' },
-    Play: { keyCode: 250, key: 'Play' },
-    ZoomOut: { keyCode: 251, key: 'ZoomOut' },
-    ')': { keyCode: 48, key: ')', code: 'Digit0' },
-    '!': { keyCode: 49, key: '!', code: 'Digit1' },
-    '@': { keyCode: 50, key: '@', code: 'Digit2' },
-    '#': { keyCode: 51, key: '#', code: 'Digit3' },
-    $: { keyCode: 52, key: '$', code: 'Digit4' },
-    '%': { keyCode: 53, key: '%', code: 'Digit5' },
-    '^': { keyCode: 54, key: '^', code: 'Digit6' },
-    '&': { keyCode: 55, key: '&', code: 'Digit7' },
-    '(': { keyCode: 57, key: '(', code: 'Digit9' },
-    A: { keyCode: 65, key: 'A', code: 'KeyA' },
-    B: { keyCode: 66, key: 'B', code: 'KeyB' },
-    C: { keyCode: 67, key: 'C', code: 'KeyC' },
-    D: { keyCode: 68, key: 'D', code: 'KeyD' },
-    E: { keyCode: 69, key: 'E', code: 'KeyE' },
-    F: { keyCode: 70, key: 'F', code: 'KeyF' },
-    G: { keyCode: 71, key: 'G', code: 'KeyG' },
-    H: { keyCode: 72, key: 'H', code: 'KeyH' },
-    I: { keyCode: 73, key: 'I', code: 'KeyI' },
-    J: { keyCode: 74, key: 'J', code: 'KeyJ' },
-    K: { keyCode: 75, key: 'K', code: 'KeyK' },
-    L: { keyCode: 76, key: 'L', code: 'KeyL' },
-    M: { keyCode: 77, key: 'M', code: 'KeyM' },
-    N: { keyCode: 78, key: 'N', code: 'KeyN' },
-    O: { keyCode: 79, key: 'O', code: 'KeyO' },
-    P: { keyCode: 80, key: 'P', code: 'KeyP' },
-    Q: { keyCode: 81, key: 'Q', code: 'KeyQ' },
-    R: { keyCode: 82, key: 'R', code: 'KeyR' },
-    S: { keyCode: 83, key: 'S', code: 'KeyS' },
-    T: { keyCode: 84, key: 'T', code: 'KeyT' },
-    U: { keyCode: 85, key: 'U', code: 'KeyU' },
-    V: { keyCode: 86, key: 'V', code: 'KeyV' },
-    W: { keyCode: 87, key: 'W', code: 'KeyW' },
-    X: { keyCode: 88, key: 'X', code: 'KeyX' },
-    Y: { keyCode: 89, key: 'Y', code: 'KeyY' },
-    Z: { keyCode: 90, key: 'Z', code: 'KeyZ' },
-    ':': { keyCode: 186, key: ':', code: 'Semicolon' },
-    '<': { keyCode: 188, key: '<', code: 'Comma' },
-    _: { keyCode: 189, key: '_', code: 'Minus' },
-    '>': { keyCode: 190, key: '>', code: 'Period' },
-    '?': { keyCode: 191, key: '?', code: 'Slash' },
-    '~': { keyCode: 192, key: '~', code: 'Backquote' },
-    '{': { keyCode: 219, key: '{', code: 'BracketLeft' },
-    '|': { keyCode: 220, key: '|', code: 'Backslash' },
-    '}': { keyCode: 221, key: '}', code: 'BracketRight' },
-    '"': { keyCode: 222, key: '"', code: 'Quote' },
-    SoftLeft: { key: 'SoftLeft', code: 'SoftLeft', location: 4 },
-    SoftRight: { key: 'SoftRight', code: 'SoftRight', location: 4 },
-    Camera: { keyCode: 44, key: 'Camera', code: 'Camera', location: 4 },
-    Call: { key: 'Call', code: 'Call', location: 4 },
-    EndCall: { keyCode: 95, key: 'EndCall', code: 'EndCall', location: 4 },
-    VolumeDown: {
-        keyCode: 182,
-        key: 'VolumeDown',
-        code: 'VolumeDown',
-        location: 4,
-    },
-    VolumeUp: { keyCode: 183, key: 'VolumeUp', code: 'VolumeUp', location: 4 },
-};
-
-
-/***/ }),
+/* 254 */,
 /* 255 */,
 /* 256 */,
 /* 257 */,
-/* 258 */,
+/* 258 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.EventEmitter = void 0;
+const index_js_1 = __importDefault(__webpack_require__(19));
+/**
+ * The EventEmitter class that many Puppeteer classes extend.
+ *
+ * @remarks
+ *
+ * This allows you to listen to events that Puppeteer classes fire and act
+ * accordingly. Therefore you'll mostly use {@link EventEmitter.on | on} and
+ * {@link EventEmitter.off | off} to bind
+ * and unbind to event listeners.
+ *
+ * @public
+ */
+class EventEmitter {
+    /**
+     * @internal
+     */
+    constructor() {
+        this.eventsMap = new Map();
+        this.emitter = index_js_1.default(this.eventsMap);
+    }
+    /**
+     * Bind an event listener to fire when an event occurs.
+     * @param event - the event type you'd like to listen to. Can be a string or symbol.
+     * @param handler  - the function to be called when the event occurs.
+     * @returns `this` to enable you to chain calls.
+     */
+    on(event, handler) {
+        this.emitter.on(event, handler);
+        return this;
+    }
+    /**
+     * Remove an event listener from firing.
+     * @param event - the event type you'd like to stop listening to.
+     * @param handler  - the function that should be removed.
+     * @returns `this` to enable you to chain calls.
+     */
+    off(event, handler) {
+        this.emitter.off(event, handler);
+        return this;
+    }
+    /**
+     * Remove an event listener.
+     * @deprecated please use `off` instead.
+     */
+    removeListener(event, handler) {
+        this.off(event, handler);
+        return this;
+    }
+    /**
+     * Add an event listener.
+     * @deprecated please use `on` instead.
+     */
+    addListener(event, handler) {
+        this.on(event, handler);
+        return this;
+    }
+    /**
+     * Emit an event and call any associated listeners.
+     *
+     * @param event - the event you'd like to emit
+     * @param eventData - any data you'd like to emit with the event
+     * @returns `true` if there are any listeners, `false` if there are not.
+     */
+    emit(event, eventData) {
+        this.emitter.emit(event, eventData);
+        return this.eventListenersCount(event) > 0;
+    }
+    /**
+     * Like `on` but the listener will only be fired once and then it will be removed.
+     * @param event - the event you'd like to listen to
+     * @param handler - the handler function to run when the event occurs
+     * @returns `this` to enable you to chain calls.
+     */
+    once(event, handler) {
+        const onceHandler = (eventData) => {
+            handler(eventData);
+            this.off(event, onceHandler);
+        };
+        return this.on(event, onceHandler);
+    }
+    /**
+     * Gets the number of listeners for a given event.
+     *
+     * @param event - the event to get the listener count for
+     * @returns the number of listeners bound to the given event
+     */
+    listenerCount(event) {
+        return this.eventListenersCount(event);
+    }
+    /**
+     * Removes all listeners. If given an event argument, it will remove only
+     * listeners for that event.
+     * @param event - the event to remove listeners for.
+     * @returns `this` to enable you to chain calls.
+     */
+    removeAllListeners(event) {
+        if (event) {
+            this.eventsMap.delete(event);
+        }
+        else {
+            this.eventsMap.clear();
+        }
+        return this;
+    }
+    eventListenersCount(event) {
+        return this.eventsMap.has(event) ? this.eventsMap.get(event).length : 0;
+    }
+}
+exports.EventEmitter = EventEmitter;
+
+
+/***/ }),
 /* 259 */,
 /* 260 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
@@ -12308,11 +13640,1089 @@ function coerce (version) {
 /* 281 */,
 /* 282 */,
 /* 283 */,
-/* 284 */,
-/* 285 */,
+/* 284 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const os = __importStar(__webpack_require__(87));
+const path = __importStar(__webpack_require__(622));
+const http = __importStar(__webpack_require__(605));
+const https = __importStar(__webpack_require__(211));
+const URL = __importStar(__webpack_require__(835));
+const fs = __importStar(__webpack_require__(747));
+const BrowserFetcher_js_1 = __webpack_require__(157);
+const Connection_js_1 = __webpack_require__(330);
+const Browser_js_1 = __webpack_require__(528);
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const WebSocketTransport_js_1 = __webpack_require__(299);
+const BrowserRunner_js_1 = __webpack_require__(624);
+const util_1 = __webpack_require__(669);
+const mkdtempAsync = util_1.promisify(fs.mkdtemp);
+const writeFileAsync = util_1.promisify(fs.writeFile);
+/**
+ * @internal
+ */
+class ChromeLauncher {
+    constructor(projectRoot, preferredRevision, isPuppeteerCore) {
+        this._projectRoot = projectRoot;
+        this._preferredRevision = preferredRevision;
+        this._isPuppeteerCore = isPuppeteerCore;
+    }
+    async launch(options = {}) {
+        const { ignoreDefaultArgs = false, args = [], dumpio = false, executablePath = null, pipe = false, env = process.env, handleSIGINT = true, handleSIGTERM = true, handleSIGHUP = true, ignoreHTTPSErrors = false, defaultViewport = { width: 800, height: 600 }, slowMo = 0, timeout = 30000, } = options;
+        const profilePath = path.join(os.tmpdir(), 'puppeteer_dev_chrome_profile-');
+        const chromeArguments = [];
+        if (!ignoreDefaultArgs)
+            chromeArguments.push(...this.defaultArgs(options));
+        else if (Array.isArray(ignoreDefaultArgs))
+            chromeArguments.push(...this.defaultArgs(options).filter((arg) => !ignoreDefaultArgs.includes(arg)));
+        else
+            chromeArguments.push(...args);
+        let temporaryUserDataDir = null;
+        if (!chromeArguments.some((argument) => argument.startsWith('--remote-debugging-')))
+            chromeArguments.push(pipe ? '--remote-debugging-pipe' : '--remote-debugging-port=0');
+        if (!chromeArguments.some((arg) => arg.startsWith('--user-data-dir'))) {
+            temporaryUserDataDir = await mkdtempAsync(profilePath);
+            chromeArguments.push(`--user-data-dir=${temporaryUserDataDir}`);
+        }
+        let chromeExecutable = executablePath;
+        if (os.arch() === 'arm64') {
+            chromeExecutable = '/usr/bin/chromium-browser';
+        }
+        else if (!executablePath) {
+            const { missingText, executablePath } = resolveExecutablePath(this);
+            if (missingText)
+                throw new Error(missingText);
+            chromeExecutable = executablePath;
+        }
+        const usePipe = chromeArguments.includes('--remote-debugging-pipe');
+        const runner = new BrowserRunner_js_1.BrowserRunner(chromeExecutable, chromeArguments, temporaryUserDataDir);
+        runner.start({
+            handleSIGHUP,
+            handleSIGTERM,
+            handleSIGINT,
+            dumpio,
+            env,
+            pipe: usePipe,
+        });
+        try {
+            const connection = await runner.setupConnection({
+                usePipe,
+                timeout,
+                slowMo,
+                preferredRevision: this._preferredRevision,
+            });
+            const browser = await Browser_js_1.Browser.create(connection, [], ignoreHTTPSErrors, defaultViewport, runner.proc, runner.close.bind(runner));
+            await browser.waitForTarget((t) => t.type() === 'page');
+            return browser;
+        }
+        catch (error) {
+            runner.kill();
+            throw error;
+        }
+    }
+    /**
+     * @param {!Launcher.ChromeArgOptions=} options
+     * @returns {!Array<string>}
+     */
+    defaultArgs(options = {}) {
+        const chromeArguments = [
+            '--disable-background-networking',
+            '--enable-features=NetworkService,NetworkServiceInProcess',
+            '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-breakpad',
+            '--disable-client-side-phishing-detection',
+            '--disable-component-extensions-with-background-pages',
+            '--disable-default-apps',
+            '--disable-dev-shm-usage',
+            '--disable-extensions',
+            '--disable-features=TranslateUI',
+            '--disable-hang-monitor',
+            '--disable-ipc-flooding-protection',
+            '--disable-popup-blocking',
+            '--disable-prompt-on-repost',
+            '--disable-renderer-backgrounding',
+            '--disable-sync',
+            '--force-color-profile=srgb',
+            '--metrics-recording-only',
+            '--no-first-run',
+            '--enable-automation',
+            '--password-store=basic',
+            '--use-mock-keychain',
+            // TODO(sadym): remove '--enable-blink-features=IdleDetection'
+            // once IdleDetection is turned on by default.
+            '--enable-blink-features=IdleDetection',
+        ];
+        const { devtools = false, headless = !devtools, args = [], userDataDir = null, } = options;
+        if (userDataDir)
+            chromeArguments.push(`--user-data-dir=${userDataDir}`);
+        if (devtools)
+            chromeArguments.push('--auto-open-devtools-for-tabs');
+        if (headless) {
+            chromeArguments.push('--headless', '--hide-scrollbars', '--mute-audio');
+        }
+        if (args.every((arg) => arg.startsWith('-')))
+            chromeArguments.push('about:blank');
+        chromeArguments.push(...args);
+        return chromeArguments;
+    }
+    executablePath() {
+        return resolveExecutablePath(this).executablePath;
+    }
+    get product() {
+        return 'chrome';
+    }
+    async connect(options) {
+        const { browserWSEndpoint, browserURL, ignoreHTTPSErrors = false, defaultViewport = { width: 800, height: 600 }, transport, slowMo = 0, } = options;
+        assert_js_1.assert(Number(!!browserWSEndpoint) +
+            Number(!!browserURL) +
+            Number(!!transport) ===
+            1, 'Exactly one of browserWSEndpoint, browserURL or transport must be passed to puppeteer.connect');
+        let connection = null;
+        if (transport) {
+            connection = new Connection_js_1.Connection('', transport, slowMo);
+        }
+        else if (browserWSEndpoint) {
+            const connectionTransport = await WebSocketTransport_js_1.WebSocketTransport.create(browserWSEndpoint);
+            connection = new Connection_js_1.Connection(browserWSEndpoint, connectionTransport, slowMo);
+        }
+        else if (browserURL) {
+            const connectionURL = await getWSEndpoint(browserURL);
+            const connectionTransport = await WebSocketTransport_js_1.WebSocketTransport.create(connectionURL);
+            connection = new Connection_js_1.Connection(connectionURL, connectionTransport, slowMo);
+        }
+        const { browserContextIds } = await connection.send('Target.getBrowserContexts');
+        return Browser_js_1.Browser.create(connection, browserContextIds, ignoreHTTPSErrors, defaultViewport, null, () => connection.send('Browser.close').catch(helper_js_1.debugError));
+    }
+}
+/**
+ * @internal
+ */
+class FirefoxLauncher {
+    constructor(projectRoot, preferredRevision, isPuppeteerCore) {
+        this._projectRoot = projectRoot;
+        this._preferredRevision = preferredRevision;
+        this._isPuppeteerCore = isPuppeteerCore;
+    }
+    async launch(options = {}) {
+        const { ignoreDefaultArgs = false, args = [], dumpio = false, executablePath = null, pipe = false, env = process.env, handleSIGINT = true, handleSIGTERM = true, handleSIGHUP = true, ignoreHTTPSErrors = false, defaultViewport = { width: 800, height: 600 }, slowMo = 0, timeout = 30000, extraPrefsFirefox = {}, } = options;
+        const firefoxArguments = [];
+        if (!ignoreDefaultArgs)
+            firefoxArguments.push(...this.defaultArgs(options));
+        else if (Array.isArray(ignoreDefaultArgs))
+            firefoxArguments.push(...this.defaultArgs(options).filter((arg) => !ignoreDefaultArgs.includes(arg)));
+        else
+            firefoxArguments.push(...args);
+        if (!firefoxArguments.some((argument) => argument.startsWith('--remote-debugging-')))
+            firefoxArguments.push('--remote-debugging-port=0');
+        let temporaryUserDataDir = null;
+        if (!firefoxArguments.includes('-profile') &&
+            !firefoxArguments.includes('--profile')) {
+            temporaryUserDataDir = await this._createProfile(extraPrefsFirefox);
+            firefoxArguments.push('--profile');
+            firefoxArguments.push(temporaryUserDataDir);
+        }
+        await this._updateRevision();
+        let firefoxExecutable = executablePath;
+        if (!executablePath) {
+            const { missingText, executablePath } = resolveExecutablePath(this);
+            if (missingText)
+                throw new Error(missingText);
+            firefoxExecutable = executablePath;
+        }
+        const runner = new BrowserRunner_js_1.BrowserRunner(firefoxExecutable, firefoxArguments, temporaryUserDataDir);
+        runner.start({
+            handleSIGHUP,
+            handleSIGTERM,
+            handleSIGINT,
+            dumpio,
+            env,
+            pipe,
+        });
+        try {
+            const connection = await runner.setupConnection({
+                usePipe: pipe,
+                timeout,
+                slowMo,
+                preferredRevision: this._preferredRevision,
+            });
+            const browser = await Browser_js_1.Browser.create(connection, [], ignoreHTTPSErrors, defaultViewport, runner.proc, runner.close.bind(runner));
+            await browser.waitForTarget((t) => t.type() === 'page');
+            return browser;
+        }
+        catch (error) {
+            runner.kill();
+            throw error;
+        }
+    }
+    async connect(options) {
+        const { browserWSEndpoint, browserURL, ignoreHTTPSErrors = false, defaultViewport = { width: 800, height: 600 }, transport, slowMo = 0, } = options;
+        assert_js_1.assert(Number(!!browserWSEndpoint) +
+            Number(!!browserURL) +
+            Number(!!transport) ===
+            1, 'Exactly one of browserWSEndpoint, browserURL or transport must be passed to puppeteer.connect');
+        let connection = null;
+        if (transport) {
+            connection = new Connection_js_1.Connection('', transport, slowMo);
+        }
+        else if (browserWSEndpoint) {
+            const connectionTransport = await WebSocketTransport_js_1.WebSocketTransport.create(browserWSEndpoint);
+            connection = new Connection_js_1.Connection(browserWSEndpoint, connectionTransport, slowMo);
+        }
+        else if (browserURL) {
+            const connectionURL = await getWSEndpoint(browserURL);
+            const connectionTransport = await WebSocketTransport_js_1.WebSocketTransport.create(connectionURL);
+            connection = new Connection_js_1.Connection(connectionURL, connectionTransport, slowMo);
+        }
+        const { browserContextIds } = await connection.send('Target.getBrowserContexts');
+        return Browser_js_1.Browser.create(connection, browserContextIds, ignoreHTTPSErrors, defaultViewport, null, () => connection.send('Browser.close').catch(helper_js_1.debugError));
+    }
+    executablePath() {
+        return resolveExecutablePath(this).executablePath;
+    }
+    async _updateRevision() {
+        // replace 'latest' placeholder with actual downloaded revision
+        if (this._preferredRevision === 'latest') {
+            const browserFetcher = new BrowserFetcher_js_1.BrowserFetcher(this._projectRoot, {
+                product: this.product,
+            });
+            const localRevisions = await browserFetcher.localRevisions();
+            if (localRevisions[0])
+                this._preferredRevision = localRevisions[0];
+        }
+    }
+    get product() {
+        return 'firefox';
+    }
+    defaultArgs(options = {}) {
+        const firefoxArguments = ['--no-remote', '--foreground'];
+        if (os.platform().startsWith('win')) {
+            firefoxArguments.push('--wait-for-browser');
+        }
+        const { devtools = false, headless = !devtools, args = [], userDataDir = null, } = options;
+        if (userDataDir) {
+            firefoxArguments.push('--profile');
+            firefoxArguments.push(userDataDir);
+        }
+        if (headless)
+            firefoxArguments.push('--headless');
+        if (devtools)
+            firefoxArguments.push('--devtools');
+        if (args.every((arg) => arg.startsWith('-')))
+            firefoxArguments.push('about:blank');
+        firefoxArguments.push(...args);
+        return firefoxArguments;
+    }
+    async _createProfile(extraPrefs) {
+        const profilePath = await mkdtempAsync(path.join(os.tmpdir(), 'puppeteer_dev_firefox_profile-'));
+        const prefsJS = [];
+        const userJS = [];
+        const server = 'dummy.test';
+        const defaultPreferences = {
+            // Make sure Shield doesn't hit the network.
+            'app.normandy.api_url': '',
+            // Disable Firefox old build background check
+            'app.update.checkInstallTime': false,
+            // Disable automatically upgrading Firefox
+            'app.update.disabledForTesting': true,
+            // Increase the APZ content response timeout to 1 minute
+            'apz.content_response_timeout': 60000,
+            // Prevent various error message on the console
+            // jest-puppeteer asserts that no error message is emitted by the console
+            'browser.contentblocking.features.standard': '-tp,tpPrivate,cookieBehavior0,-cm,-fp',
+            // Enable the dump function: which sends messages to the system
+            // console
+            // https://bugzilla.mozilla.org/show_bug.cgi?id=1543115
+            'browser.dom.window.dump.enabled': true,
+            // Disable topstories
+            'browser.newtabpage.activity-stream.feeds.section.topstories': false,
+            // Always display a blank page
+            'browser.newtabpage.enabled': false,
+            // Background thumbnails in particular cause grief: and disabling
+            // thumbnails in general cannot hurt
+            'browser.pagethumbnails.capturing_disabled': true,
+            // Disable safebrowsing components.
+            'browser.safebrowsing.blockedURIs.enabled': false,
+            'browser.safebrowsing.downloads.enabled': false,
+            'browser.safebrowsing.malware.enabled': false,
+            'browser.safebrowsing.passwords.enabled': false,
+            'browser.safebrowsing.phishing.enabled': false,
+            // Disable updates to search engines.
+            'browser.search.update': false,
+            // Do not restore the last open set of tabs if the browser has crashed
+            'browser.sessionstore.resume_from_crash': false,
+            // Skip check for default browser on startup
+            'browser.shell.checkDefaultBrowser': false,
+            // Disable newtabpage
+            'browser.startup.homepage': 'about:blank',
+            // Do not redirect user when a milstone upgrade of Firefox is detected
+            'browser.startup.homepage_override.mstone': 'ignore',
+            // Start with a blank page about:blank
+            'browser.startup.page': 0,
+            // Do not allow background tabs to be zombified on Android: otherwise for
+            // tests that open additional tabs: the test harness tab itself might get
+            // unloaded
+            'browser.tabs.disableBackgroundZombification': false,
+            // Do not warn when closing all other open tabs
+            'browser.tabs.warnOnCloseOtherTabs': false,
+            // Do not warn when multiple tabs will be opened
+            'browser.tabs.warnOnOpen': false,
+            // Disable the UI tour.
+            'browser.uitour.enabled': false,
+            // Turn off search suggestions in the location bar so as not to trigger
+            // network connections.
+            'browser.urlbar.suggest.searches': false,
+            // Disable first run splash page on Windows 10
+            'browser.usedOnWindows10.introURL': '',
+            // Do not warn on quitting Firefox
+            'browser.warnOnQuit': false,
+            // Do not show datareporting policy notifications which can
+            // interfere with tests
+            'datareporting.healthreport.about.reportUrl': `http://${server}/dummy/abouthealthreport/`,
+            'datareporting.healthreport.documentServerURI': `http://${server}/dummy/healthreport/`,
+            'datareporting.healthreport.logging.consoleEnabled': false,
+            'datareporting.healthreport.service.enabled': false,
+            'datareporting.healthreport.service.firstRun': false,
+            'datareporting.healthreport.uploadEnabled': false,
+            'datareporting.policy.dataSubmissionEnabled': false,
+            'datareporting.policy.dataSubmissionPolicyAccepted': false,
+            'datareporting.policy.dataSubmissionPolicyBypassNotification': true,
+            // DevTools JSONViewer sometimes fails to load dependencies with its require.js.
+            // This doesn't affect Puppeteer but spams console (Bug 1424372)
+            'devtools.jsonview.enabled': false,
+            // Disable popup-blocker
+            'dom.disable_open_during_load': false,
+            // Enable the support for File object creation in the content process
+            // Required for |Page.setFileInputFiles| protocol method.
+            'dom.file.createInChild': true,
+            // Disable the ProcessHangMonitor
+            'dom.ipc.reportProcessHangs': false,
+            // Disable slow script dialogues
+            'dom.max_chrome_script_run_time': 0,
+            'dom.max_script_run_time': 0,
+            // Only load extensions from the application and user profile
+            // AddonManager.SCOPE_PROFILE + AddonManager.SCOPE_APPLICATION
+            'extensions.autoDisableScopes': 0,
+            'extensions.enabledScopes': 5,
+            // Disable metadata caching for installed add-ons by default
+            'extensions.getAddons.cache.enabled': false,
+            // Disable installing any distribution extensions or add-ons.
+            'extensions.installDistroAddons': false,
+            // Disabled screenshots extension
+            'extensions.screenshots.disabled': true,
+            // Turn off extension updates so they do not bother tests
+            'extensions.update.enabled': false,
+            // Turn off extension updates so they do not bother tests
+            'extensions.update.notifyUser': false,
+            // Make sure opening about:addons will not hit the network
+            'extensions.webservice.discoverURL': `http://${server}/dummy/discoveryURL`,
+            // Allow the application to have focus even it runs in the background
+            'focusmanager.testmode': true,
+            // Disable useragent updates
+            'general.useragent.updates.enabled': false,
+            // Always use network provider for geolocation tests so we bypass the
+            // macOS dialog raised by the corelocation provider
+            'geo.provider.testing': true,
+            // Do not scan Wifi
+            'geo.wifi.scan': false,
+            // No hang monitor
+            'hangmonitor.timeout': 0,
+            // Show chrome errors and warnings in the error console
+            'javascript.options.showInConsole': true,
+            // Disable download and usage of OpenH264: and Widevine plugins
+            'media.gmp-manager.updateEnabled': false,
+            // Prevent various error message on the console
+            // jest-puppeteer asserts that no error message is emitted by the console
+            'network.cookie.cookieBehavior': 0,
+            // Do not prompt for temporary redirects
+            'network.http.prompt-temp-redirect': false,
+            // Disable speculative connections so they are not reported as leaking
+            // when they are hanging around
+            'network.http.speculative-parallel-limit': 0,
+            // Do not automatically switch between offline and online
+            'network.manage-offline-status': false,
+            // Make sure SNTP requests do not hit the network
+            'network.sntp.pools': server,
+            // Disable Flash.
+            'plugin.state.flash': 0,
+            'privacy.trackingprotection.enabled': false,
+            // Enable Remote Agent
+            // https://bugzilla.mozilla.org/show_bug.cgi?id=1544393
+            'remote.enabled': true,
+            // Don't do network connections for mitm priming
+            'security.certerrors.mitm.priming.enabled': false,
+            // Local documents have access to all other local documents,
+            // including directory listings
+            'security.fileuri.strict_origin_policy': false,
+            // Do not wait for the notification button security delay
+            'security.notification_enable_delay': 0,
+            // Ensure blocklist updates do not hit the network
+            'services.settings.server': `http://${server}/dummy/blocklist/`,
+            // Do not automatically fill sign-in forms with known usernames and
+            // passwords
+            'signon.autofillForms': false,
+            // Disable password capture, so that tests that include forms are not
+            // influenced by the presence of the persistent doorhanger notification
+            'signon.rememberSignons': false,
+            // Disable first-run welcome page
+            'startup.homepage_welcome_url': 'about:blank',
+            // Disable first-run welcome page
+            'startup.homepage_welcome_url.additional': '',
+            // Disable browser animations (tabs, fullscreen, sliding alerts)
+            'toolkit.cosmeticAnimations.enabled': false,
+            // We want to collect telemetry, but we don't want to send in the results
+            'toolkit.telemetry.server': `https://${server}/dummy/telemetry/`,
+            // Prevent starting into safe mode after application crashes
+            'toolkit.startup.max_resumed_crashes': -1,
+        };
+        Object.assign(defaultPreferences, extraPrefs);
+        for (const [key, value] of Object.entries(defaultPreferences))
+            userJS.push(`user_pref(${JSON.stringify(key)}, ${JSON.stringify(value)});`);
+        await writeFileAsync(path.join(profilePath, 'user.js'), userJS.join('\n'));
+        await writeFileAsync(path.join(profilePath, 'prefs.js'), prefsJS.join('\n'));
+        return profilePath;
+    }
+}
+function getWSEndpoint(browserURL) {
+    let resolve, reject;
+    const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    const endpointURL = URL.resolve(browserURL, '/json/version');
+    const protocol = endpointURL.startsWith('https') ? https : http;
+    const requestOptions = Object.assign(URL.parse(endpointURL), {
+        method: 'GET',
+    });
+    const request = protocol.request(requestOptions, (res) => {
+        let data = '';
+        if (res.statusCode !== 200) {
+            // Consume response data to free up memory.
+            res.resume();
+            reject(new Error('HTTP ' + res.statusCode));
+            return;
+        }
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => resolve(JSON.parse(data).webSocketDebuggerUrl));
+    });
+    request.on('error', reject);
+    request.end();
+    return promise.catch((error) => {
+        error.message =
+            `Failed to fetch browser webSocket url from ${endpointURL}: ` +
+                error.message;
+        throw error;
+    });
+}
+function resolveExecutablePath(launcher) {
+    let downloadPath;
+    // puppeteer-core doesn't take into account PUPPETEER_* env variables.
+    if (!launcher._isPuppeteerCore) {
+        const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH ||
+            process.env.npm_config_puppeteer_executable_path ||
+            process.env.npm_package_config_puppeteer_executable_path;
+        if (executablePath) {
+            const missingText = !fs.existsSync(executablePath)
+                ? 'Tried to use PUPPETEER_EXECUTABLE_PATH env variable to launch browser but did not find any executable at: ' +
+                    executablePath
+                : null;
+            return { executablePath, missingText };
+        }
+        downloadPath =
+            process.env.PUPPETEER_DOWNLOAD_PATH ||
+                process.env.npm_config_puppeteer_download_path ||
+                process.env.npm_package_config_puppeteer_download_path;
+    }
+    const browserFetcher = new BrowserFetcher_js_1.BrowserFetcher(launcher._projectRoot, {
+        product: launcher.product,
+        path: downloadPath,
+    });
+    if (!launcher._isPuppeteerCore && launcher.product === 'chrome') {
+        const revision = process.env['PUPPETEER_CHROMIUM_REVISION'];
+        if (revision) {
+            const revisionInfo = browserFetcher.revisionInfo(revision);
+            const missingText = !revisionInfo.local
+                ? 'Tried to use PUPPETEER_CHROMIUM_REVISION env variable to launch browser but did not find executable at: ' +
+                    revisionInfo.executablePath
+                : null;
+            return { executablePath: revisionInfo.executablePath, missingText };
+        }
+    }
+    const revisionInfo = browserFetcher.revisionInfo(launcher._preferredRevision);
+    const missingText = !revisionInfo.local
+        ? `Could not find browser revision ${launcher._preferredRevision}. Run "PUPPETEER_PRODUCT=firefox npm install" or "PUPPETEER_PRODUCT=firefox yarn install" to download a supported Firefox browser binary.`
+        : null;
+    return { executablePath: revisionInfo.executablePath, missingText };
+}
+/**
+ * @internal
+ */
+function Launcher(projectRoot, preferredRevision, isPuppeteerCore, product) {
+    // puppeteer-core doesn't take into account PUPPETEER_* env variables.
+    if (!product && !isPuppeteerCore)
+        product =
+            process.env.PUPPETEER_PRODUCT ||
+                process.env.npm_config_puppeteer_product ||
+                process.env.npm_package_config_puppeteer_product;
+    switch (product) {
+        case 'firefox':
+            return new FirefoxLauncher(projectRoot, preferredRevision, isPuppeteerCore);
+        case 'chrome':
+        default:
+            if (typeof product !== 'undefined' && product !== 'chrome') {
+                /* The user gave us an incorrect product name
+                 * we'll default to launching Chrome, but log to the console
+                 * to let the user know (they've probably typoed).
+                 */
+                console.warn(`Warning: unknown product name ${product}. Falling back to chrome.`);
+            }
+            return new ChromeLauncher(projectRoot, preferredRevision, isPuppeteerCore);
+    }
+}
+exports.default = Launcher;
+
+
+/***/ }),
+/* 285 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Puppeteer = void 0;
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const Launcher_js_1 = __importDefault(__webpack_require__(284));
+const BrowserFetcher_js_1 = __webpack_require__(157);
+const Errors_js_1 = __webpack_require__(422);
+const DeviceDescriptors_js_1 = __webpack_require__(206);
+const QueryHandler_js_1 = __webpack_require__(647);
+const revisions_js_1 = __webpack_require__(88);
+/**
+ * The main Puppeteer class. Provides the {@link Puppeteer.launch | launch}
+ * method to launch a browser.
+ *
+ * When you `require` or `import` the Puppeteer npm package you get back an
+ * instance of this class.
+ *
+ * @remarks
+ *
+ * @example
+ * The following is a typical example of using Puppeteer to drive automation:
+ * ```js
+ * const puppeteer = require('puppeteer');
+ *
+ * (async () => {
+ *   const browser = await puppeteer.launch();
+ *   const page = await browser.newPage();
+ *   await page.goto('https://www.google.com');
+ *   // other actions...
+ *   await browser.close();
+ * })();
+ * ```
+ *
+ * Once you have created a `page` you have access to a large API to interact
+ * with the page, navigate, or find certain elements in that page.
+ * The {@link Page | `page` documentation} lists all the available methods.
+ *
+ * @public
+ */
+class Puppeteer {
+    /**
+     * @internal
+     */
+    constructor(projectRoot, preferredRevision, isPuppeteerCore, productName) {
+        this._changedProduct = false;
+        this._projectRoot = projectRoot;
+        this._preferredRevision = preferredRevision;
+        this._isPuppeteerCore = isPuppeteerCore;
+        // track changes to Launcher configuration via options or environment variables
+        this.__productName = productName;
+    }
+    /**
+     * Launches puppeteer and launches a browser instance with given arguments
+     * and options when specified.
+     *
+     * @remarks
+     *
+     * @example
+     * You can use `ignoreDefaultArgs` to filter out `--mute-audio` from default arguments:
+     * ```js
+     * const browser = await puppeteer.launch({
+     *   ignoreDefaultArgs: ['--mute-audio']
+     * });
+     * ```
+     *
+     * **NOTE** Puppeteer can also be used to control the Chrome browser,
+     * but it works best with the version of Chromium it is bundled with.
+     * There is no guarantee it will work with any other version.
+     * Use `executablePath` option with extreme caution.
+     * If Google Chrome (rather than Chromium) is preferred, a {@link https://www.google.com/chrome/browser/canary.html | Chrome Canary} or {@link https://www.chromium.org/getting-involved/dev-channel | Dev Channel} build is suggested.
+     * In `puppeteer.launch([options])`, any mention of Chromium also applies to Chrome.
+     * See {@link https://www.howtogeek.com/202825/what%E2%80%99s-the-difference-between-chromium-and-chrome/ | this article} for a description of the differences between Chromium and Chrome. {@link https://chromium.googlesource.com/chromium/src/+/lkgr/docs/chromium_browser_vs_google_chrome.md | This article} describes some differences for Linux users.
+     *
+     * @param options - Set of configurable options to set on the browser.
+     * @returns Promise which resolves to browser instance.
+     */
+    launch(options = {}) {
+        if (options.product)
+            this._productName = options.product;
+        return this._launcher.launch(options);
+    }
+    /**
+     * This method attaches Puppeteer to an existing browser instance.
+     *
+     * @remarks
+     *
+     * @param options - Set of configurable options to set on the browser.
+     * @returns Promise which resolves to browser instance.
+     */
+    connect(options) {
+        if (options.product)
+            this._productName = options.product;
+        return this._launcher.connect(options);
+    }
+    /**
+     * @internal
+     */
+    get _productName() {
+        return this.__productName;
+    }
+    // don't need any TSDoc here - because the getter is internal the setter is too.
+    set _productName(name) {
+        if (this.__productName !== name)
+            this._changedProduct = true;
+        this.__productName = name;
+    }
+    /**
+     * @remarks
+     *
+     * **NOTE** `puppeteer.executablePath()` is affected by the `PUPPETEER_EXECUTABLE_PATH`
+     * and `PUPPETEER_CHROMIUM_REVISION` environment variables.
+     *
+     * @returns A path where Puppeteer expects to find the bundled browser.
+     * The browser binary might not be there if the download was skipped with
+     * the `PUPPETEER_SKIP_DOWNLOAD` environment variable.
+     */
+    executablePath() {
+        return this._launcher.executablePath();
+    }
+    /**
+     * @internal
+     */
+    get _launcher() {
+        if (!this._lazyLauncher ||
+            this._lazyLauncher.product !== this._productName ||
+            this._changedProduct) {
+            switch (this._productName) {
+                case 'firefox':
+                    this._preferredRevision = revisions_js_1.PUPPETEER_REVISIONS.firefox;
+                    break;
+                case 'chrome':
+                default:
+                    this._preferredRevision = revisions_js_1.PUPPETEER_REVISIONS.chromium;
+            }
+            this._changedProduct = false;
+            this._lazyLauncher = Launcher_js_1.default(this._projectRoot, this._preferredRevision, this._isPuppeteerCore, this._productName);
+        }
+        return this._lazyLauncher;
+    }
+    /**
+     * The name of the browser that is under automation (`"chrome"` or `"firefox"`)
+     *
+     * @remarks
+     * The product is set by the `PUPPETEER_PRODUCT` environment variable or the `product`
+     * option in `puppeteer.launch([options])` and defaults to `chrome`.
+     * Firefox support is experimental.
+     */
+    get product() {
+        return this._launcher.product;
+    }
+    /**
+     * @remarks
+     * A list of devices to be used with `page.emulate(options)`. Actual list of devices can be found in {@link https://github.com/puppeteer/puppeteer/blob/main/src/common/DeviceDescriptors.ts | src/common/DeviceDescriptors.ts}.
+     *
+     * @example
+     *
+     * ```js
+     * const puppeteer = require('puppeteer');
+     * const iPhone = puppeteer.devices['iPhone 6'];
+     *
+     * (async () => {
+     *   const browser = await puppeteer.launch();
+     *   const page = await browser.newPage();
+     *   await page.emulate(iPhone);
+     *   await page.goto('https://www.google.com');
+     *   // other actions...
+     *   await browser.close();
+     * })();
+     * ```
+     *
+     */
+    get devices() {
+        return DeviceDescriptors_js_1.devicesMap;
+    }
+    /**
+     * @remarks
+     *
+     * Puppeteer methods might throw errors if they are unable to fulfill a request.
+     * For example, `page.waitForSelector(selector[, options])` might fail if
+     * the selector doesn't match any nodes during the given timeframe.
+     *
+     * For certain types of errors Puppeteer uses specific error classes.
+     * These classes are available via `puppeteer.errors`.
+     *
+     * @example
+     * An example of handling a timeout error:
+     * ```js
+     * try {
+     *   await page.waitForSelector('.foo');
+     * } catch (e) {
+     *   if (e instanceof puppeteer.errors.TimeoutError) {
+     *     // Do something if this is a timeout.
+     *   }
+     * }
+     * ```
+     */
+    get errors() {
+        return Errors_js_1.puppeteerErrors;
+    }
+    /**
+     *
+     * @param options - Set of configurable options to set on the browser.
+     * @returns The default flags that Chromium will be launched with.
+     */
+    defaultArgs(options = {}) {
+        return this._launcher.defaultArgs(options);
+    }
+    /**
+     * @param options - Set of configurable options to specify the settings
+     * of the BrowserFetcher.
+     * @returns A new BrowserFetcher instance.
+     */
+    createBrowserFetcher(options) {
+        return new BrowserFetcher_js_1.BrowserFetcher(this._projectRoot, options);
+    }
+    /**
+     * @internal
+     */
+    // eslint-disable-next-line @typescript-eslint/camelcase
+    __experimental_registerCustomQueryHandler(name, queryHandler) {
+        QueryHandler_js_1.registerCustomQueryHandler(name, queryHandler);
+    }
+    /**
+     * @internal
+     */
+    // eslint-disable-next-line @typescript-eslint/camelcase
+    __experimental_unregisterCustomQueryHandler(name) {
+        QueryHandler_js_1.unregisterCustomQueryHandler(name);
+    }
+    /**
+     * @internal
+     */
+    // eslint-disable-next-line @typescript-eslint/camelcase
+    __experimental_customQueryHandlers() {
+        return QueryHandler_js_1.customQueryHandlers();
+    }
+    /**
+     * @internal
+     */
+    // eslint-disable-next-line @typescript-eslint/camelcase
+    __experimental_clearQueryHandlers() {
+        QueryHandler_js_1.clearQueryHandlers();
+    }
+}
+exports.Puppeteer = Puppeteer;
+
+
+/***/ }),
 /* 286 */,
 /* 287 */,
-/* 288 */,
+/* 288 */
+/***/ (function(module) {
+
+"use strict";
+
+
+//
+// Allowed token characters:
+//
+// '!', '#', '$', '%', '&', ''', '*', '+', '-',
+// '.', 0-9, A-Z, '^', '_', '`', a-z, '|', '~'
+//
+// tokenChars[32] === 0 // ' '
+// tokenChars[33] === 1 // '!'
+// tokenChars[34] === 0 // '"'
+// ...
+//
+// prettier-ignore
+const tokenChars = [
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15
+  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31
+  0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 1, 0, // 32 - 47
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48 - 63
+  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 64 - 79
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, // 80 - 95
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 96 - 111
+  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0 // 112 - 127
+];
+
+/**
+ * Adds an offer to the map of extension offers or a parameter to the map of
+ * parameters.
+ *
+ * @param {Object} dest The map of extension offers or parameters
+ * @param {String} name The extension or parameter name
+ * @param {(Object|Boolean|String)} elem The extension parameters or the
+ *     parameter value
+ * @private
+ */
+function push(dest, name, elem) {
+  if (dest[name] === undefined) dest[name] = [elem];
+  else dest[name].push(elem);
+}
+
+/**
+ * Parses the `Sec-WebSocket-Extensions` header into an object.
+ *
+ * @param {String} header The field value of the header
+ * @return {Object} The parsed object
+ * @public
+ */
+function parse(header) {
+  const offers = Object.create(null);
+
+  if (header === undefined || header === '') return offers;
+
+  let params = Object.create(null);
+  let mustUnescape = false;
+  let isEscaping = false;
+  let inQuotes = false;
+  let extensionName;
+  let paramName;
+  let start = -1;
+  let end = -1;
+  let i = 0;
+
+  for (; i < header.length; i++) {
+    const code = header.charCodeAt(i);
+
+    if (extensionName === undefined) {
+      if (end === -1 && tokenChars[code] === 1) {
+        if (start === -1) start = i;
+      } else if (code === 0x20 /* ' ' */ || code === 0x09 /* '\t' */) {
+        if (end === -1 && start !== -1) end = i;
+      } else if (code === 0x3b /* ';' */ || code === 0x2c /* ',' */) {
+        if (start === -1) {
+          throw new SyntaxError(`Unexpected character at index ${i}`);
+        }
+
+        if (end === -1) end = i;
+        const name = header.slice(start, end);
+        if (code === 0x2c) {
+          push(offers, name, params);
+          params = Object.create(null);
+        } else {
+          extensionName = name;
+        }
+
+        start = end = -1;
+      } else {
+        throw new SyntaxError(`Unexpected character at index ${i}`);
+      }
+    } else if (paramName === undefined) {
+      if (end === -1 && tokenChars[code] === 1) {
+        if (start === -1) start = i;
+      } else if (code === 0x20 || code === 0x09) {
+        if (end === -1 && start !== -1) end = i;
+      } else if (code === 0x3b || code === 0x2c) {
+        if (start === -1) {
+          throw new SyntaxError(`Unexpected character at index ${i}`);
+        }
+
+        if (end === -1) end = i;
+        push(params, header.slice(start, end), true);
+        if (code === 0x2c) {
+          push(offers, extensionName, params);
+          params = Object.create(null);
+          extensionName = undefined;
+        }
+
+        start = end = -1;
+      } else if (code === 0x3d /* '=' */ && start !== -1 && end === -1) {
+        paramName = header.slice(start, i);
+        start = end = -1;
+      } else {
+        throw new SyntaxError(`Unexpected character at index ${i}`);
+      }
+    } else {
+      //
+      // The value of a quoted-string after unescaping must conform to the
+      // token ABNF, so only token characters are valid.
+      // Ref: https://tools.ietf.org/html/rfc6455#section-9.1
+      //
+      if (isEscaping) {
+        if (tokenChars[code] !== 1) {
+          throw new SyntaxError(`Unexpected character at index ${i}`);
+        }
+        if (start === -1) start = i;
+        else if (!mustUnescape) mustUnescape = true;
+        isEscaping = false;
+      } else if (inQuotes) {
+        if (tokenChars[code] === 1) {
+          if (start === -1) start = i;
+        } else if (code === 0x22 /* '"' */ && start !== -1) {
+          inQuotes = false;
+          end = i;
+        } else if (code === 0x5c /* '\' */) {
+          isEscaping = true;
+        } else {
+          throw new SyntaxError(`Unexpected character at index ${i}`);
+        }
+      } else if (code === 0x22 && header.charCodeAt(i - 1) === 0x3d) {
+        inQuotes = true;
+      } else if (end === -1 && tokenChars[code] === 1) {
+        if (start === -1) start = i;
+      } else if (start !== -1 && (code === 0x20 || code === 0x09)) {
+        if (end === -1) end = i;
+      } else if (code === 0x3b || code === 0x2c) {
+        if (start === -1) {
+          throw new SyntaxError(`Unexpected character at index ${i}`);
+        }
+
+        if (end === -1) end = i;
+        let value = header.slice(start, end);
+        if (mustUnescape) {
+          value = value.replace(/\\/g, '');
+          mustUnescape = false;
+        }
+        push(params, paramName, value);
+        if (code === 0x2c) {
+          push(offers, extensionName, params);
+          params = Object.create(null);
+          extensionName = undefined;
+        }
+
+        paramName = undefined;
+        start = end = -1;
+      } else {
+        throw new SyntaxError(`Unexpected character at index ${i}`);
+      }
+    }
+  }
+
+  if (start === -1 || inQuotes) {
+    throw new SyntaxError('Unexpected end of input');
+  }
+
+  if (end === -1) end = i;
+  const token = header.slice(start, end);
+  if (extensionName === undefined) {
+    push(offers, token, params);
+  } else {
+    if (paramName === undefined) {
+      push(params, token, true);
+    } else if (mustUnescape) {
+      push(params, paramName, token.replace(/\\/g, ''));
+    } else {
+      push(params, paramName, token);
+    }
+    push(offers, extensionName, params);
+  }
+
+  return offers;
+}
+
+/**
+ * Builds the `Sec-WebSocket-Extensions` header field value.
+ *
+ * @param {Object} extensions The map of extensions and parameters to format
+ * @return {String} A string representing the given object
+ * @public
+ */
+function format(extensions) {
+  return Object.keys(extensions)
+    .map((extension) => {
+      let configurations = extensions[extension];
+      if (!Array.isArray(configurations)) configurations = [configurations];
+      return configurations
+        .map((params) => {
+          return [extension]
+            .concat(
+              Object.keys(params).map((k) => {
+                let values = params[k];
+                if (!Array.isArray(values)) values = [values];
+                return values
+                  .map((v) => (v === true ? k : `${k}=${v}`))
+                  .join('; ');
+              })
+            )
+            .join('; ');
+        })
+        .join(', ');
+    })
+    .join(', ');
+}
+
+module.exports = { format, parse };
+
+
+/***/ }),
 /* 289 */,
 /* 290 */,
 /* 291 */,
@@ -12375,139 +14785,50 @@ module.exports = function(fn) {
 
 /***/ }),
 /* 299 */
-/***/ (function(__unusedmodule, exports) {
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
-
-Object.defineProperty(exports, '__esModule', { value: true });
-
-const VERSION = "2.2.3";
-
-/**
- * Some “list” response that can be paginated have a different response structure
- *
- * They have a `total_count` key in the response (search also has `incomplete_results`,
- * /installation/repositories also has `repository_selection`), as well as a key with
- * the list of the items which name varies from endpoint to endpoint.
- *
- * Octokit normalizes these responses so that paginated results are always returned following
- * the same structure. One challenge is that if the list response has only one page, no Link
- * header is provided, so this header alone is not sufficient to check wether a response is
- * paginated or not.
- *
- * We check if a "total_count" key is present in the response data, but also make sure that
- * a "url" property is not, as the "Get the combined status for a specific ref" endpoint would
- * otherwise match: https://developer.github.com/v3/repos/statuses/#get-the-combined-status-for-a-specific-ref
- */
-function normalizePaginatedListResponse(response) {
-  const responseNeedsNormalization = "total_count" in response.data && !("url" in response.data);
-  if (!responseNeedsNormalization) return response; // keep the additional properties intact as there is currently no other way
-  // to retrieve the same information.
-
-  const incompleteResults = response.data.incomplete_results;
-  const repositorySelection = response.data.repository_selection;
-  const totalCount = response.data.total_count;
-  delete response.data.incomplete_results;
-  delete response.data.repository_selection;
-  delete response.data.total_count;
-  const namespaceKey = Object.keys(response.data)[0];
-  const data = response.data[namespaceKey];
-  response.data = data;
-
-  if (typeof incompleteResults !== "undefined") {
-    response.data.incomplete_results = incompleteResults;
-  }
-
-  if (typeof repositorySelection !== "undefined") {
-    response.data.repository_selection = repositorySelection;
-  }
-
-  response.data.total_count = totalCount;
-  return response;
-}
-
-function iterator(octokit, route, parameters) {
-  const options = typeof route === "function" ? route.endpoint(parameters) : octokit.request.endpoint(route, parameters);
-  const requestMethod = typeof route === "function" ? route : octokit.request;
-  const method = options.method;
-  const headers = options.headers;
-  let url = options.url;
-  return {
-    [Symbol.asyncIterator]: () => ({
-      next() {
-        if (!url) {
-          return Promise.resolve({
-            done: true
-          });
-        }
-
-        return requestMethod({
-          method,
-          url,
-          headers
-        }).then(normalizePaginatedListResponse).then(response => {
-          // `response.headers.link` format:
-          // '<https://api.github.com/users/aseemk/followers?page=2>; rel="next", <https://api.github.com/users/aseemk/followers?page=2>; rel="last"'
-          // sets `url` to undefined if "next" URL is not present or `link` header is not set
-          url = ((response.headers.link || "").match(/<([^>]+)>;\s*rel="next"/) || [])[1];
-          return {
-            value: response
-          };
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.WebSocketTransport = void 0;
+const ws_1 = __importDefault(__webpack_require__(237));
+class WebSocketTransport {
+    constructor(ws) {
+        this._ws = ws;
+        this._ws.addEventListener('message', (event) => {
+            if (this.onmessage)
+                this.onmessage.call(null, event.data);
         });
-      }
-
-    })
-  };
-}
-
-function paginate(octokit, route, parameters, mapFn) {
-  if (typeof parameters === "function") {
-    mapFn = parameters;
-    parameters = undefined;
-  }
-
-  return gather(octokit, [], iterator(octokit, route, parameters)[Symbol.asyncIterator](), mapFn);
-}
-
-function gather(octokit, results, iterator, mapFn) {
-  return iterator.next().then(result => {
-    if (result.done) {
-      return results;
+        this._ws.addEventListener('close', () => {
+            if (this.onclose)
+                this.onclose.call(null);
+        });
+        // Silently ignore all errors - we don't know what to do with them.
+        this._ws.addEventListener('error', () => { });
+        this.onmessage = null;
+        this.onclose = null;
     }
-
-    let earlyExit = false;
-
-    function done() {
-      earlyExit = true;
+    static create(url) {
+        return new Promise((resolve, reject) => {
+            const ws = new ws_1.default(url, [], {
+                perMessageDeflate: false,
+                maxPayload: 256 * 1024 * 1024,
+            });
+            ws.addEventListener('open', () => resolve(new WebSocketTransport(ws)));
+            ws.addEventListener('error', reject);
+        });
     }
-
-    results = results.concat(mapFn ? mapFn(result.value, done) : result.value.data);
-
-    if (earlyExit) {
-      return results;
+    send(message) {
+        this._ws.send(message);
     }
-
-    return gather(octokit, results, iterator, mapFn);
-  });
+    close() {
+        this._ws.close();
+    }
 }
-
-/**
- * @param octokit Octokit instance
- * @param options Options passed to Octokit constructor
- */
-
-function paginateRest(octokit) {
-  return {
-    paginate: Object.assign(paginate.bind(null, octokit), {
-      iterator: iterator.bind(null, octokit)
-    })
-  };
-}
-paginateRest.VERSION = VERSION;
-
-exports.paginateRest = paginateRest;
-//# sourceMappingURL=index.js.map
+exports.WebSocketTransport = WebSocketTransport;
 
 
 /***/ }),
@@ -13103,128 +15424,171 @@ function unmonkeypatch () {
 
 
 /***/ }),
-/* 303 */,
-/* 304 */
+/* 303 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.EventEmitter = void 0;
-const mitt_1 = __importDefault(__webpack_require__(427));
+exports.HTTPResponse = void 0;
+const SecurityDetails_js_1 = __webpack_require__(350);
 /**
- * The EventEmitter class that many Puppeteer classes extend.
- *
- * @remarks
- *
- * This allows you to listen to events that Puppeteer classes fire and act
- * accordingly. Therefore you'll mostly use {@link EventEmitter.on | on} and
- * {@link EventEmitter.off | off} to bind
- * and unbind to event listeners.
+ * The HTTPResponse class represents responses which are received by the
+ * {@link Page} class.
  *
  * @public
  */
-class EventEmitter {
+class HTTPResponse {
     /**
      * @internal
      */
-    constructor() {
-        this.eventsMap = new Map();
-        this.emitter = mitt_1.default(this.eventsMap);
-    }
-    /**
-     * Bind an event listener to fire when an event occurs.
-     * @param event - the event type you'd like to listen to. Can be a string or symbol.
-     * @param handler  - the function to be called when the event occurs.
-     * @returns `this` to enable you to chain calls.
-     */
-    on(event, handler) {
-        this.emitter.on(event, handler);
-        return this;
-    }
-    /**
-     * Remove an event listener from firing.
-     * @param event - the event type you'd like to stop listening to.
-     * @param handler  - the function that should be removed.
-     * @returns `this` to enable you to chain calls.
-     */
-    off(event, handler) {
-        this.emitter.off(event, handler);
-        return this;
-    }
-    /**
-     * Remove an event listener.
-     * @deprecated please use `off` instead.
-     */
-    removeListener(event, handler) {
-        this.off(event, handler);
-        return this;
-    }
-    /**
-     * Add an event listener.
-     * @deprecated please use `on` instead.
-     */
-    addListener(event, handler) {
-        this.on(event, handler);
-        return this;
-    }
-    /**
-     * Emit an event and call any associated listeners.
-     *
-     * @param event - the event you'd like to emit
-     * @param eventData - any data you'd like to emit with the event
-     * @returns `true` if there are any listeners, `false` if there are not.
-     */
-    emit(event, eventData) {
-        this.emitter.emit(event, eventData);
-        return this.eventListenersCount(event) > 0;
-    }
-    /**
-     * Like `on` but the listener will only be fired once and then it will be removed.
-     * @param event - the event you'd like to listen to
-     * @param handler - the handler function to run when the event occurs
-     * @returns `this` to enable you to chain calls.
-     */
-    once(event, handler) {
-        const onceHandler = (eventData) => {
-            handler(eventData);
-            this.off(event, onceHandler);
+    constructor(client, request, responsePayload) {
+        this._contentPromise = null;
+        this._headers = {};
+        this._client = client;
+        this._request = request;
+        this._bodyLoadedPromise = new Promise((fulfill) => {
+            this._bodyLoadedPromiseFulfill = fulfill;
+        });
+        this._remoteAddress = {
+            ip: responsePayload.remoteIPAddress,
+            port: responsePayload.remotePort,
         };
-        return this.on(event, onceHandler);
+        this._status = responsePayload.status;
+        this._statusText = responsePayload.statusText;
+        this._url = request.url();
+        this._fromDiskCache = !!responsePayload.fromDiskCache;
+        this._fromServiceWorker = !!responsePayload.fromServiceWorker;
+        for (const key of Object.keys(responsePayload.headers))
+            this._headers[key.toLowerCase()] = responsePayload.headers[key];
+        this._securityDetails = responsePayload.securityDetails
+            ? new SecurityDetails_js_1.SecurityDetails(responsePayload.securityDetails)
+            : null;
     }
     /**
-     * Gets the number of listeners for a given event.
+     * @internal
+     */
+    _resolveBody(err) {
+        return this._bodyLoadedPromiseFulfill(err);
+    }
+    /**
+     * @returns The IP address and port number used to connect to the remote
+     * server.
+     */
+    remoteAddress() {
+        return this._remoteAddress;
+    }
+    /**
+     * @returns The URL of the response.
+     */
+    url() {
+        return this._url;
+    }
+    /**
+     * @returns True if the response was successful (status in the range 200-299).
+     */
+    ok() {
+        // TODO: document === 0 case?
+        return this._status === 0 || (this._status >= 200 && this._status <= 299);
+    }
+    /**
+     * @returns The status code of the response (e.g., 200 for a success).
+     */
+    status() {
+        return this._status;
+    }
+    /**
+     * @returns  The status text of the response (e.g. usually an "OK" for a
+     * success).
+     */
+    statusText() {
+        return this._statusText;
+    }
+    /**
+     * @returns An object with HTTP headers associated with the response. All
+     * header names are lower-case.
+     */
+    headers() {
+        return this._headers;
+    }
+    /**
+     * @returns {@link SecurityDetails} if the response was received over the
+     * secure connection, or `null` otherwise.
+     */
+    securityDetails() {
+        return this._securityDetails;
+    }
+    /**
+     * @returns Promise which resolves to a buffer with response body.
+     */
+    buffer() {
+        if (!this._contentPromise) {
+            this._contentPromise = this._bodyLoadedPromise.then(async (error) => {
+                if (error)
+                    throw error;
+                const response = await this._client.send('Network.getResponseBody', {
+                    requestId: this._request._requestId,
+                });
+                return Buffer.from(response.body, response.base64Encoded ? 'base64' : 'utf8');
+            });
+        }
+        return this._contentPromise;
+    }
+    /**
+     * @returns Promise which resolves to a text representation of response body.
+     */
+    async text() {
+        const content = await this.buffer();
+        return content.toString('utf8');
+    }
+    /**
      *
-     * @param event - the event to get the listener count for
-     * @returns the number of listeners bound to the given event
+     * @returns Promise which resolves to a JSON representation of response body.
+     *
+     * @remarks
+     *
+     * This method will throw if the response body is not parsable via
+     * `JSON.parse`.
      */
-    listenerCount(event) {
-        return this.eventListenersCount(event);
+    async json() {
+        const content = await this.text();
+        return JSON.parse(content);
     }
     /**
-     * Removes all listeners. If given an event argument, it will remove only
-     * listeners for that event.
-     * @param event - the event to remove listeners for.
-     * @returns `this` to enable you to chain calls.
+     * @returns A matching {@link HTTPRequest} object.
      */
-    removeAllListeners(event) {
-        if (event) {
-            this.eventsMap.delete(event);
-        }
-        else {
-            this.eventsMap.clear();
-        }
-        return this;
+    request() {
+        return this._request;
     }
-    eventListenersCount(event) {
-        return this.eventsMap.has(event) ? this.eventsMap.get(event).length : 0;
+    /**
+     * @returns True if the response was served from either the browser's disk
+     * cache or memory cache.
+     */
+    fromCache() {
+        return this._fromDiskCache || this._request._fromMemoryCache;
+    }
+    /**
+     * @returns True if the response was served by a service worker.
+     */
+    fromServiceWorker() {
+        return this._fromServiceWorker;
+    }
+    /**
+     * @returns A {@link Frame} that initiated this response, or `null` if
+     * navigating to error pages.
+     */
+    frame() {
+        return this._request.frame();
     }
 }
-exports.EventEmitter = EventEmitter;
+exports.HTTPResponse = HTTPResponse;
 
+
+/***/ }),
+/* 304 */
+/***/ (function(module) {
+
+module.exports = require("string_decoder");
 
 /***/ }),
 /* 305 */,
@@ -13446,7 +15810,7 @@ function expand(str, isTop) {
 "use strict";
 
 
-const { Writable } = __webpack_require__(418);
+const { Writable } = __webpack_require__(413);
 
 const PerMessageDeflate = __webpack_require__(301);
 const {
@@ -13990,333 +16354,440 @@ if (typeof Object.create === 'function') {
 
 /***/ }),
 /* 316 */,
-/* 317 */
+/* 317 */,
+/* 318 */,
+/* 319 */,
+/* 320 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ExecutionContext = exports.EVALUATION_SCRIPT_URL = void 0;
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const JSHandle_1 = __webpack_require__(661);
-exports.EVALUATION_SCRIPT_URL = '__puppeteer_evaluation_script__';
-const SOURCE_URL_REGEX = /^[\040\t]*\/\/[@#] sourceURL=\s*(\S*?)\s*$/m;
+exports.HTTPRequest = void 0;
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
 /**
- * This class represents a context for JavaScript execution. A [Page] might have
- * many execution contexts:
- * - each
- *   {@link https://developer.mozilla.org/en-US/docs/Web/HTML/Element/iframe |
- *   frame } has "default" execution context that is always created after frame is
- *   attached to DOM. This context is returned by the
- *   {@link frame.executionContext()} method.
- * - {@link https://developer.chrome.com/extensions | Extension}'s content scripts
- *   create additional execution contexts.
  *
- * Besides pages, execution contexts can be found in
- * {@link https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API |
- * workers }.
+ * Represents an HTTP request sent by a page.
+ * @remarks
+ *
+ * Whenever the page sends a request, such as for a network resource, the
+ * following events are emitted by Puppeteer's `page`:
+ *
+ * - `request`:  emitted when the request is issued by the page.
+ * - `requestfinished` - emitted when the response body is downloaded and the
+ *   request is complete.
+ *
+ * If request fails at some point, then instead of `requestfinished` event the
+ * `requestfailed` event is emitted.
+ *
+ * All of these events provide an instance of `HTTPRequest` representing the
+ * request that occurred:
+ *
+ * ```
+ * page.on('request', request => ...)
+ * ```
+ *
+ * NOTE: HTTP Error responses, such as 404 or 503, are still successful
+ * responses from HTTP standpoint, so request will complete with
+ * `requestfinished` event.
+ *
+ * If request gets a 'redirect' response, the request is successfully finished
+ * with the `requestfinished` event, and a new request is issued to a
+ * redirected url.
  *
  * @public
  */
-class ExecutionContext {
+class HTTPRequest {
     /**
      * @internal
      */
-    constructor(client, contextPayload, world) {
+    constructor(client, frame, interceptionId, allowInterception, event, redirectChain) {
+        /**
+         * @internal
+         */
+        this._failureText = null;
+        /**
+         * @internal
+         */
+        this._response = null;
+        /**
+         * @internal
+         */
+        this._fromMemoryCache = false;
+        this._interceptionHandled = false;
+        this._headers = {};
         this._client = client;
-        this._world = world;
-        this._contextId = contextPayload.id;
+        this._requestId = event.requestId;
+        this._isNavigationRequest =
+            event.requestId === event.loaderId && event.type === 'Document';
+        this._interceptionId = interceptionId;
+        this._allowInterception = allowInterception;
+        this._url = event.request.url;
+        this._resourceType = event.type.toLowerCase();
+        this._method = event.request.method;
+        this._postData = event.request.postData;
+        this._frame = frame;
+        this._redirectChain = redirectChain;
+        for (const key of Object.keys(event.request.headers))
+            this._headers[key.toLowerCase()] = event.request.headers[key];
     }
     /**
+     * @returns the URL of the request
+     */
+    url() {
+        return this._url;
+    }
+    /**
+     * Contains the request's resource type as it was perceived by the rendering
+     * engine.
      * @remarks
-     *
-     * Not every execution context is associated with a frame. For
-     * example, workers and extensions have execution contexts that are not
-     * associated with frames.
-     *
-     * @returns The frame associated with this execution context.
+     * @returns one of the following: `document`, `stylesheet`, `image`, `media`,
+     * `font`, `script`, `texttrack`, `xhr`, `fetch`, `eventsource`, `websocket`,
+     * `manifest`, `other`.
+     */
+    resourceType() {
+        // TODO (@jackfranklin): protocol.d.ts has a type for this, but all the
+        // string values are uppercase. The Puppeteer docs explicitly say the
+        // potential values are all lower case, and the constructor takes the event
+        // type and calls toLowerCase() on it, so we can't reuse the type from the
+        // protocol.d.ts. Why do we lower case?
+        return this._resourceType;
+    }
+    /**
+     * @returns the method used (`GET`, `POST`, etc.)
+     */
+    method() {
+        return this._method;
+    }
+    /**
+     * @returns the request's post body, if any.
+     */
+    postData() {
+        return this._postData;
+    }
+    /**
+     * @returns an object with HTTP headers associated with the request. All
+     * header names are lower-case.
+     */
+    headers() {
+        return this._headers;
+    }
+    /**
+     * @returns the response for this request, if a response has been received.
+     */
+    response() {
+        return this._response;
+    }
+    /**
+     * @returns the frame that initiated the request.
      */
     frame() {
-        return this._world ? this._world.frame() : null;
+        return this._frame;
+    }
+    /**
+     * @returns true if the request is the driver of the current frame's navigation.
+     */
+    isNavigationRequest() {
+        return this._isNavigationRequest;
     }
     /**
      * @remarks
-     * If the function passed to the `executionContext.evaluate` returns a
-     * Promise, then `executionContext.evaluate` would wait for the promise to
-     * resolve and return its value. If the function passed to the
-     * `executionContext.evaluate` returns a non-serializable value, then
-     * `executionContext.evaluate` resolves to `undefined`. DevTools Protocol also
-     * supports transferring some additional values that are not serializable by
-     * `JSON`: `-0`, `NaN`, `Infinity`, `-Infinity`, and bigint literals.
      *
+     * `redirectChain` is shared between all the requests of the same chain.
      *
-     * @example
-     * ```js
-     * const executionContext = await page.mainFrame().executionContext();
-     * const result = await executionContext.evaluate(() => Promise.resolve(8 * 7))* ;
-     * console.log(result); // prints "56"
-     * ```
-     *
-     * @example
-     * A string can also be passed in instead of a function.
+     * For example, if the website `http://example.com` has a single redirect to
+     * `https://example.com`, then the chain will contain one request:
      *
      * ```js
-     * console.log(await executionContext.evaluate('1 + 2')); // prints "3"
+     * const response = await page.goto('http://example.com');
+     * const chain = response.request().redirectChain();
+     * console.log(chain.length); // 1
+     * console.log(chain[0].url()); // 'http://example.com'
      * ```
      *
-     * @example
-     * {@link JSHandle} instances can be passed as arguments to the
-     * `executionContext.* evaluate`:
+     * If the website `https://google.com` has no redirects, then the chain will be empty:
+     *
      * ```js
-     * const oneHandle = await executionContext.evaluateHandle(() => 1);
-     * const twoHandle = await executionContext.evaluateHandle(() => 2);
-     * const result = await executionContext.evaluate(
-     *    (a, b) => a + b, oneHandle, * twoHandle
-     * );
-     * await oneHandle.dispose();
-     * await twoHandle.dispose();
-     * console.log(result); // prints '3'.
+     * const response = await page.goto('https://google.com');
+     * const chain = response.request().redirectChain();
+     * console.log(chain.length); // 0
      * ```
-     * @param pageFunction a function to be evaluated in the `executionContext`
-     * @param args argument to pass to the page function
      *
-     * @returns A promise that resolves to the return value of the given function.
+     * @returns the chain of requests - if a server responds with at least a
+     * single redirect, this chain will contain all requests that were redirected.
      */
-    async evaluate(pageFunction, ...args) {
-        return await this._evaluateInternal(true, pageFunction, ...args);
+    redirectChain() {
+        return this._redirectChain.slice();
     }
     /**
+     * Access information about the request's failure.
+     *
      * @remarks
-     * The only difference between `executionContext.evaluate` and
-     * `executionContext.evaluateHandle` is that `executionContext.evaluateHandle`
-     * returns an in-page object (a {@link JSHandle}).
-     * If the function passed to the `executionContext.evaluateHandle` returns a
-     * Promise, then `executionContext.evaluateHandle` would wait for the
-     * promise to resolve and return its value.
      *
      * @example
-     * ```js
-     * const context = await page.mainFrame().executionContext();
-     * const aHandle = await context.evaluateHandle(() => Promise.resolve(self));
-     * aHandle; // Handle for the global object.
-     * ```
      *
-     * @example
-     * A string can also be passed in instead of a function.
+     * Example of logging all failed requests:
      *
      * ```js
-     * // Handle for the '3' * object.
-     * const aHandle = await context.evaluateHandle('1 + 2');
+     * page.on('requestfailed', request => {
+     *   console.log(request.url() + ' ' + request.failure().errorText);
+     * });
      * ```
      *
-     * @example
-     * JSHandle instances can be passed as arguments
-     * to the `executionContext.* evaluateHandle`:
-     *
-     * ```js
-     * const aHandle = await context.evaluateHandle(() => document.body);
-     * const resultHandle = await context.evaluateHandle(body => body.innerHTML, * aHandle);
-     * console.log(await resultHandle.jsonValue()); // prints body's innerHTML
-     * await aHandle.dispose();
-     * await resultHandle.dispose();
-     * ```
-     *
-     * @param pageFunction a function to be evaluated in the `executionContext`
-     * @param args argument to pass to the page function
-     *
-     * @returns A promise that resolves to the return value of the given function
-     * as an in-page object (a {@link JSHandle}).
+     * @returns `null` unless the request failed. If the request fails this can
+     * return an object with `errorText` containing a human-readable error
+     * message, e.g. `net::ERR_FAILED`. It is not guaranteeded that there will be
+     * failure text if the request fails.
      */
-    async evaluateHandle(pageFunction, ...args) {
-        return this._evaluateInternal(false, pageFunction, ...args);
-    }
-    async _evaluateInternal(returnByValue, pageFunction, ...args) {
-        const suffix = `//# sourceURL=${exports.EVALUATION_SCRIPT_URL}`;
-        if (helper_1.helper.isString(pageFunction)) {
-            const contextId = this._contextId;
-            const expression = pageFunction;
-            const expressionWithSourceUrl = SOURCE_URL_REGEX.test(expression)
-                ? expression
-                : expression + '\n' + suffix;
-            const { exceptionDetails, result: remoteObject } = await this._client
-                .send('Runtime.evaluate', {
-                expression: expressionWithSourceUrl,
-                contextId,
-                returnByValue,
-                awaitPromise: true,
-                userGesture: true,
-            })
-                .catch(rewriteError);
-            if (exceptionDetails)
-                throw new Error('Evaluation failed: ' + helper_1.helper.getExceptionMessage(exceptionDetails));
-            return returnByValue
-                ? helper_1.helper.valueFromRemoteObject(remoteObject)
-                : JSHandle_1.createJSHandle(this, remoteObject);
-        }
-        if (typeof pageFunction !== 'function')
-            throw new Error(`Expected to get |string| or |function| as the first argument, but got "${pageFunction}" instead.`);
-        let functionText = pageFunction.toString();
-        try {
-            new Function('(' + functionText + ')');
-        }
-        catch (error) {
-            // This means we might have a function shorthand. Try another
-            // time prefixing 'function '.
-            if (functionText.startsWith('async '))
-                functionText =
-                    'async function ' + functionText.substring('async '.length);
-            else
-                functionText = 'function ' + functionText;
-            try {
-                new Function('(' + functionText + ')');
-            }
-            catch (error) {
-                // We tried hard to serialize, but there's a weird beast here.
-                throw new Error('Passed function is not well-serializable!');
-            }
-        }
-        let callFunctionOnPromise;
-        try {
-            callFunctionOnPromise = this._client.send('Runtime.callFunctionOn', {
-                functionDeclaration: functionText + '\n' + suffix + '\n',
-                executionContextId: this._contextId,
-                arguments: args.map(convertArgument.bind(this)),
-                returnByValue,
-                awaitPromise: true,
-                userGesture: true,
-            });
-        }
-        catch (error) {
-            if (error instanceof TypeError &&
-                error.message.startsWith('Converting circular structure to JSON'))
-                error.message += ' Are you passing a nested JSHandle?';
-            throw error;
-        }
-        const { exceptionDetails, result: remoteObject, } = await callFunctionOnPromise.catch(rewriteError);
-        if (exceptionDetails)
-            throw new Error('Evaluation failed: ' + helper_1.helper.getExceptionMessage(exceptionDetails));
-        return returnByValue
-            ? helper_1.helper.valueFromRemoteObject(remoteObject)
-            : JSHandle_1.createJSHandle(this, remoteObject);
-        /**
-         * @param {*} arg
-         * @returns {*}
-         * @this {ExecutionContext}
-         */
-        function convertArgument(arg) {
-            if (typeof arg === 'bigint')
-                // eslint-disable-line valid-typeof
-                return { unserializableValue: `${arg.toString()}n` };
-            if (Object.is(arg, -0))
-                return { unserializableValue: '-0' };
-            if (Object.is(arg, Infinity))
-                return { unserializableValue: 'Infinity' };
-            if (Object.is(arg, -Infinity))
-                return { unserializableValue: '-Infinity' };
-            if (Object.is(arg, NaN))
-                return { unserializableValue: 'NaN' };
-            const objectHandle = arg && arg instanceof JSHandle_1.JSHandle ? arg : null;
-            if (objectHandle) {
-                if (objectHandle._context !== this)
-                    throw new Error('JSHandles can be evaluated only in the context they were created!');
-                if (objectHandle._disposed)
-                    throw new Error('JSHandle is disposed!');
-                if (objectHandle._remoteObject.unserializableValue)
-                    return {
-                        unserializableValue: objectHandle._remoteObject.unserializableValue,
-                    };
-                if (!objectHandle._remoteObject.objectId)
-                    return { value: objectHandle._remoteObject.value };
-                return { objectId: objectHandle._remoteObject.objectId };
-            }
-            return { value: arg };
-        }
-        function rewriteError(error) {
-            if (error.message.includes('Object reference chain is too long'))
-                return { result: { type: 'undefined' } };
-            if (error.message.includes("Object couldn't be returned by value"))
-                return { result: { type: 'undefined' } };
-            if (error.message.endsWith('Cannot find context with specified id') ||
-                error.message.endsWith('Inspected target navigated or closed'))
-                throw new Error('Execution context was destroyed, most likely because of a navigation.');
-            throw error;
-        }
+    failure() {
+        if (!this._failureText)
+            return null;
+        return {
+            errorText: this._failureText,
+        };
     }
     /**
-     * This method iterates the JavaScript heap and finds all the objects with the
-     * given prototype.
+     * Continues request with optional request overrides.
+     *
      * @remarks
+     *
+     * To use this, request
+     * interception should be enabled with {@link Page.setRequestInterception}.
+     *
+     * Exception is immediately thrown if the request interception is not enabled.
+     *
      * @example
      * ```js
-     * // Create a Map object
-     * await page.evaluate(() => window.map = new Map());
-     * // Get a handle to the Map object prototype
-     * const mapPrototype = await page.evaluateHandle(() => Map.prototype);
-     * // Query all map instances into an array
-     * const mapInstances = await page.queryObjects(mapPrototype);
-     * // Count amount of map objects in heap
-     * const count = await page.evaluate(maps => maps.length, mapInstances);
-     * await mapInstances.dispose();
-     * await mapPrototype.dispose();
+     * await page.setRequestInterception(true);
+     * page.on('request', request => {
+     *   // Override headers
+     *   const headers = Object.assign({}, request.headers(), {
+     *     foo: 'bar', // set "foo" header
+     *     origin: undefined, // remove "origin" header
+     *   });
+     *   request.continue({headers});
+     * });
      * ```
      *
-     * @param prototypeHandle a handle to the object prototype
+     * @param overrides - optional overrides to apply to the request.
+     */
+    async continue(overrides = {}) {
+        // Request interception is not supported for data: urls.
+        if (this._url.startsWith('data:'))
+            return;
+        assert_js_1.assert(this._allowInterception, 'Request Interception is not enabled!');
+        assert_js_1.assert(!this._interceptionHandled, 'Request is already handled!');
+        const { url, method, postData, headers } = overrides;
+        this._interceptionHandled = true;
+        const postDataBinaryBase64 = postData
+            ? Buffer.from(postData).toString('base64')
+            : undefined;
+        await this._client
+            .send('Fetch.continueRequest', {
+            requestId: this._interceptionId,
+            url,
+            method,
+            postData: postDataBinaryBase64,
+            headers: headers ? headersArray(headers) : undefined,
+        })
+            .catch((error) => {
+            // In certain cases, protocol will return error if the request was
+            // already canceled or the page was closed. We should tolerate these
+            // errors.
+            helper_js_1.debugError(error);
+        });
+    }
+    /**
+     * Fulfills a request with the given response.
      *
-     * @returns A handle to an array of objects with the given prototype.
+     * @remarks
+     *
+     * To use this, request
+     * interception should be enabled with {@link Page.setRequestInterception}.
+     *
+     * Exception is immediately thrown if the request interception is not enabled.
+     *
+     * @example
+     * An example of fulfilling all requests with 404 responses:
+     * ```js
+     * await page.setRequestInterception(true);
+     * page.on('request', request => {
+     *   request.respond({
+     *     status: 404,
+     *     contentType: 'text/plain',
+     *     body: 'Not Found!'
+     *   });
+     * });
+     * ```
+     *
+     * NOTE: Mocking responses for dataURL requests is not supported.
+     * Calling `request.respond` for a dataURL request is a noop.
+     *
+     * @param response - the response to fulfill the request with.
      */
-    async queryObjects(prototypeHandle) {
-        assert_1.assert(!prototypeHandle._disposed, 'Prototype JSHandle is disposed!');
-        assert_1.assert(prototypeHandle._remoteObject.objectId, 'Prototype JSHandle must not be referencing primitive value');
-        const response = await this._client.send('Runtime.queryObjects', {
-            prototypeObjectId: prototypeHandle._remoteObject.objectId,
+    async respond(response) {
+        // Mocking responses for dataURL requests is not currently supported.
+        if (this._url.startsWith('data:'))
+            return;
+        assert_js_1.assert(this._allowInterception, 'Request Interception is not enabled!');
+        assert_js_1.assert(!this._interceptionHandled, 'Request is already handled!');
+        this._interceptionHandled = true;
+        const responseBody = response.body && helper_js_1.helper.isString(response.body)
+            ? Buffer.from(response.body)
+            : response.body || null;
+        const responseHeaders = {};
+        if (response.headers) {
+            for (const header of Object.keys(response.headers))
+                responseHeaders[header.toLowerCase()] = response.headers[header];
+        }
+        if (response.contentType)
+            responseHeaders['content-type'] = response.contentType;
+        if (responseBody && !('content-length' in responseHeaders))
+            responseHeaders['content-length'] = String(Buffer.byteLength(responseBody));
+        await this._client
+            .send('Fetch.fulfillRequest', {
+            requestId: this._interceptionId,
+            responseCode: response.status || 200,
+            responsePhrase: STATUS_TEXTS[response.status || 200],
+            responseHeaders: headersArray(responseHeaders),
+            body: responseBody ? responseBody.toString('base64') : undefined,
+        })
+            .catch((error) => {
+            // In certain cases, protocol will return error if the request was
+            // already canceled or the page was closed. We should tolerate these
+            // errors.
+            helper_js_1.debugError(error);
         });
-        return JSHandle_1.createJSHandle(this, response.objects);
     }
     /**
-     * @internal
+     * Aborts a request.
+     *
+     * @remarks
+     * To use this, request interception should be enabled with
+     * {@link Page.setRequestInterception}. If it is not enabled, this method will
+     * throw an exception immediately.
+     *
+     * @param errorCode - optional error code to provide.
      */
-    async _adoptBackendNodeId(backendNodeId) {
-        const { object } = await this._client.send('DOM.resolveNode', {
-            backendNodeId: backendNodeId,
-            executionContextId: this._contextId,
+    async abort(errorCode = 'failed') {
+        // Request interception is not supported for data: urls.
+        if (this._url.startsWith('data:'))
+            return;
+        const errorReason = errorReasons[errorCode];
+        assert_js_1.assert(errorReason, 'Unknown error code: ' + errorCode);
+        assert_js_1.assert(this._allowInterception, 'Request Interception is not enabled!');
+        assert_js_1.assert(!this._interceptionHandled, 'Request is already handled!');
+        this._interceptionHandled = true;
+        await this._client
+            .send('Fetch.failRequest', {
+            requestId: this._interceptionId,
+            errorReason,
+        })
+            .catch((error) => {
+            // In certain cases, protocol will return error if the request was
+            // already canceled or the page was closed. We should tolerate these
+            // errors.
+            helper_js_1.debugError(error);
         });
-        return JSHandle_1.createJSHandle(this, object);
-    }
-    /**
-     * @internal
-     */
-    async _adoptElementHandle(elementHandle) {
-        assert_1.assert(elementHandle.executionContext() !== this, 'Cannot adopt handle that already belongs to this execution context');
-        assert_1.assert(this._world, 'Cannot adopt handle without DOMWorld');
-        const nodeInfo = await this._client.send('DOM.describeNode', {
-            objectId: elementHandle._remoteObject.objectId,
-        });
-        return this._adoptBackendNodeId(nodeInfo.node.backendNodeId);
     }
 }
-exports.ExecutionContext = ExecutionContext;
+exports.HTTPRequest = HTTPRequest;
+const errorReasons = {
+    aborted: 'Aborted',
+    accessdenied: 'AccessDenied',
+    addressunreachable: 'AddressUnreachable',
+    blockedbyclient: 'BlockedByClient',
+    blockedbyresponse: 'BlockedByResponse',
+    connectionaborted: 'ConnectionAborted',
+    connectionclosed: 'ConnectionClosed',
+    connectionfailed: 'ConnectionFailed',
+    connectionrefused: 'ConnectionRefused',
+    connectionreset: 'ConnectionReset',
+    internetdisconnected: 'InternetDisconnected',
+    namenotresolved: 'NameNotResolved',
+    timedout: 'TimedOut',
+    failed: 'Failed',
+};
+function headersArray(headers) {
+    const result = [];
+    for (const name in headers) {
+        if (!Object.is(headers[name], undefined))
+            result.push({ name, value: headers[name] + '' });
+    }
+    return result;
+}
+// List taken from
+// https://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml
+// with extra 306 and 418 codes.
+const STATUS_TEXTS = {
+    '100': 'Continue',
+    '101': 'Switching Protocols',
+    '102': 'Processing',
+    '103': 'Early Hints',
+    '200': 'OK',
+    '201': 'Created',
+    '202': 'Accepted',
+    '203': 'Non-Authoritative Information',
+    '204': 'No Content',
+    '205': 'Reset Content',
+    '206': 'Partial Content',
+    '207': 'Multi-Status',
+    '208': 'Already Reported',
+    '226': 'IM Used',
+    '300': 'Multiple Choices',
+    '301': 'Moved Permanently',
+    '302': 'Found',
+    '303': 'See Other',
+    '304': 'Not Modified',
+    '305': 'Use Proxy',
+    '306': 'Switch Proxy',
+    '307': 'Temporary Redirect',
+    '308': 'Permanent Redirect',
+    '400': 'Bad Request',
+    '401': 'Unauthorized',
+    '402': 'Payment Required',
+    '403': 'Forbidden',
+    '404': 'Not Found',
+    '405': 'Method Not Allowed',
+    '406': 'Not Acceptable',
+    '407': 'Proxy Authentication Required',
+    '408': 'Request Timeout',
+    '409': 'Conflict',
+    '410': 'Gone',
+    '411': 'Length Required',
+    '412': 'Precondition Failed',
+    '413': 'Payload Too Large',
+    '414': 'URI Too Long',
+    '415': 'Unsupported Media Type',
+    '416': 'Range Not Satisfiable',
+    '417': 'Expectation Failed',
+    '418': "I'm a teapot",
+    '421': 'Misdirected Request',
+    '422': 'Unprocessable Entity',
+    '423': 'Locked',
+    '424': 'Failed Dependency',
+    '425': 'Too Early',
+    '426': 'Upgrade Required',
+    '428': 'Precondition Required',
+    '429': 'Too Many Requests',
+    '431': 'Request Header Fields Too Large',
+    '451': 'Unavailable For Legal Reasons',
+    '500': 'Internal Server Error',
+    '501': 'Not Implemented',
+    '502': 'Bad Gateway',
+    '503': 'Service Unavailable',
+    '504': 'Gateway Timeout',
+    '505': 'HTTP Version Not Supported',
+    '506': 'Variant Also Negotiates',
+    '507': 'Insufficient Storage',
+    '508': 'Loop Detected',
+    '510': 'Not Extended',
+    '511': 'Network Authentication Required',
+};
 
 
 /***/ }),
-/* 318 */,
-/* 319 */,
-/* 320 */,
 /* 321 */,
 /* 322 */,
 /* 323 */
@@ -14352,7 +16823,7 @@ isStream.transform = function (stream) {
 
 var fs = __webpack_require__(747);
 var util = __webpack_require__(669);
-var stream = __webpack_require__(418);
+var stream = __webpack_require__(413);
 var Readable = stream.Readable;
 var Writable = stream.Writable;
 var PassThrough = stream.PassThrough;
@@ -14651,48 +17122,16 @@ function createFromFd(fd, options) {
 /***/ }),
 /* 325 */,
 /* 326 */,
-/* 327 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-/**
- * Copyright 2020 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.assert = void 0;
-/**
- * Asserts that the given value is truthy.
- * @param value
- * @param message - the error message to throw if the value is not truthy.
- */
-exports.assert = (value, message) => {
-    if (!value)
-        throw new Error(message);
-};
-
-
-/***/ }),
+/* 327 */,
 /* 328 */,
-/* 329 */
+/* 329 */,
+/* 330 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Tracing = void 0;
+exports.CDPSession = exports.CDPSessionEmittedEvents = exports.Connection = exports.ConnectionEmittedEvents = void 0;
 /**
  * Copyright 2017 Google Inc. All rights reserved.
  *
@@ -14708,312 +17147,259 @@ exports.Tracing = void 0;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
+const assert_js_1 = __webpack_require__(716);
+const Debug_js_1 = __webpack_require__(459);
+const debugProtocolSend = Debug_js_1.debug('puppeteer:protocol:SEND ►');
+const debugProtocolReceive = Debug_js_1.debug('puppeteer:protocol:RECV ◀');
+const EventEmitter_js_1 = __webpack_require__(258);
 /**
- * The Tracing class exposes the tracing audit interface.
+ * Internal events that the Connection class emits.
+ *
+ * @internal
+ */
+exports.ConnectionEmittedEvents = {
+    Disconnected: Symbol('Connection.Disconnected'),
+};
+/**
+ * @internal
+ */
+class Connection extends EventEmitter_js_1.EventEmitter {
+    constructor(url, transport, delay = 0) {
+        super();
+        this._lastId = 0;
+        this._sessions = new Map();
+        this._closed = false;
+        this._callbacks = new Map();
+        this._url = url;
+        this._delay = delay;
+        this._transport = transport;
+        this._transport.onmessage = this._onMessage.bind(this);
+        this._transport.onclose = this._onClose.bind(this);
+    }
+    static fromSession(session) {
+        return session._connection;
+    }
+    /**
+     * @param {string} sessionId
+     * @returns {?CDPSession}
+     */
+    session(sessionId) {
+        return this._sessions.get(sessionId) || null;
+    }
+    url() {
+        return this._url;
+    }
+    send(method, ...paramArgs) {
+        // There is only ever 1 param arg passed, but the Protocol defines it as an
+        // array of 0 or 1 items See this comment:
+        // https://github.com/ChromeDevTools/devtools-protocol/pull/113#issuecomment-412603285
+        // which explains why the protocol defines the params this way for better
+        // type-inference.
+        // So now we check if there are any params or not and deal with them accordingly.
+        const params = paramArgs.length ? paramArgs[0] : undefined;
+        const id = this._rawSend({ method, params });
+        return new Promise((resolve, reject) => {
+            this._callbacks.set(id, { resolve, reject, error: new Error(), method });
+        });
+    }
+    _rawSend(message) {
+        const id = ++this._lastId;
+        message = JSON.stringify(Object.assign({}, message, { id }));
+        debugProtocolSend(message);
+        this._transport.send(message);
+        return id;
+    }
+    async _onMessage(message) {
+        if (this._delay)
+            await new Promise((f) => setTimeout(f, this._delay));
+        debugProtocolReceive(message);
+        const object = JSON.parse(message);
+        if (object.method === 'Target.attachedToTarget') {
+            const sessionId = object.params.sessionId;
+            const session = new CDPSession(this, object.params.targetInfo.type, sessionId);
+            this._sessions.set(sessionId, session);
+        }
+        else if (object.method === 'Target.detachedFromTarget') {
+            const session = this._sessions.get(object.params.sessionId);
+            if (session) {
+                session._onClosed();
+                this._sessions.delete(object.params.sessionId);
+            }
+        }
+        if (object.sessionId) {
+            const session = this._sessions.get(object.sessionId);
+            if (session)
+                session._onMessage(object);
+        }
+        else if (object.id) {
+            const callback = this._callbacks.get(object.id);
+            // Callbacks could be all rejected if someone has called `.dispose()`.
+            if (callback) {
+                this._callbacks.delete(object.id);
+                if (object.error)
+                    callback.reject(createProtocolError(callback.error, callback.method, object));
+                else
+                    callback.resolve(object.result);
+            }
+        }
+        else {
+            this.emit(object.method, object.params);
+        }
+    }
+    _onClose() {
+        if (this._closed)
+            return;
+        this._closed = true;
+        this._transport.onmessage = null;
+        this._transport.onclose = null;
+        for (const callback of this._callbacks.values())
+            callback.reject(rewriteError(callback.error, `Protocol error (${callback.method}): Target closed.`));
+        this._callbacks.clear();
+        for (const session of this._sessions.values())
+            session._onClosed();
+        this._sessions.clear();
+        this.emit(exports.ConnectionEmittedEvents.Disconnected);
+    }
+    dispose() {
+        this._onClose();
+        this._transport.close();
+    }
+    /**
+     * @param {Protocol.Target.TargetInfo} targetInfo
+     * @returns {!Promise<!CDPSession>}
+     */
+    async createSession(targetInfo) {
+        const { sessionId } = await this.send('Target.attachToTarget', {
+            targetId: targetInfo.targetId,
+            flatten: true,
+        });
+        return this._sessions.get(sessionId);
+    }
+}
+exports.Connection = Connection;
+/**
+ * Internal events that the CDPSession class emits.
+ *
+ * @internal
+ */
+exports.CDPSessionEmittedEvents = {
+    Disconnected: Symbol('CDPSession.Disconnected'),
+};
+/**
+ * The `CDPSession` instances are used to talk raw Chrome Devtools Protocol.
+ *
  * @remarks
- * You can use `tracing.start` and `tracing.stop` to create a trace file
- * which can be opened in Chrome DevTools or {@link https://chromedevtools.github.io/timeline-viewer/ | timeline viewer}.
+ *
+ * Protocol methods can be called with {@link CDPSession.send} method and protocol
+ * events can be subscribed to with `CDPSession.on` method.
+ *
+ * Useful links: {@link https://chromedevtools.github.io/devtools-protocol/ | DevTools Protocol Viewer}
+ * and {@link https://github.com/aslushnikov/getting-started-with-cdp/blob/master/README.md | Getting Started with DevTools Protocol}.
  *
  * @example
  * ```js
- * await page.tracing.start({path: 'trace.json'});
- * await page.goto('https://www.google.com');
- * await page.tracing.stop();
+ * const client = await page.target().createCDPSession();
+ * await client.send('Animation.enable');
+ * client.on('Animation.animationCreated', () => console.log('Animation created!'));
+ * const response = await client.send('Animation.getPlaybackRate');
+ * console.log('playback rate is ' + response.playbackRate);
+ * await client.send('Animation.setPlaybackRate', {
+ *   playbackRate: response.playbackRate / 2
+ * });
  * ```
  *
  * @public
  */
-class Tracing {
+class CDPSession extends EventEmitter_js_1.EventEmitter {
     /**
      * @internal
      */
-    constructor(client) {
-        this._recording = false;
-        this._path = '';
-        this._client = client;
+    constructor(connection, targetType, sessionId) {
+        super();
+        this._callbacks = new Map();
+        this._connection = connection;
+        this._targetType = targetType;
+        this._sessionId = sessionId;
     }
-    /**
-     * Starts a trace for the current page.
-     * @remarks
-     * Only one trace can be active at a time per browser.
-     * @param options - Optional `TracingOptions`.
-     */
-    async start(options = {}) {
-        assert_1.assert(!this._recording, 'Cannot start recording trace while already recording trace.');
-        const defaultCategories = [
-            '-*',
-            'devtools.timeline',
-            'v8.execute',
-            'disabled-by-default-devtools.timeline',
-            'disabled-by-default-devtools.timeline.frame',
-            'toplevel',
-            'blink.console',
-            'blink.user_timing',
-            'latencyInfo',
-            'disabled-by-default-devtools.timeline.stack',
-            'disabled-by-default-v8.cpu_profiler',
-            'disabled-by-default-v8.cpu_profiler.hires',
-        ];
-        const { path = null, screenshots = false, categories = defaultCategories, } = options;
-        if (screenshots)
-            categories.push('disabled-by-default-devtools.screenshot');
-        this._path = path;
-        this._recording = true;
-        await this._client.send('Tracing.start', {
-            transferMode: 'ReturnAsStream',
-            categories: categories.join(','),
+    send(method, ...paramArgs) {
+        if (!this._connection)
+            return Promise.reject(new Error(`Protocol error (${method}): Session closed. Most likely the ${this._targetType} has been closed.`));
+        // See the comment in Connection#send explaining why we do this.
+        const params = paramArgs.length ? paramArgs[0] : undefined;
+        const id = this._connection._rawSend({
+            sessionId: this._sessionId,
+            method,
+            /* TODO(jacktfranklin@): once this Firefox bug is solved
+             * we no longer need the `|| {}` check
+             * https://bugzilla.mozilla.org/show_bug.cgi?id=1631570
+             */
+            params: params || {},
+        });
+        return new Promise((resolve, reject) => {
+            this._callbacks.set(id, { resolve, reject, error: new Error(), method });
         });
     }
     /**
-     * Stops a trace started with the `start` method.
-     * @returns Promise which resolves to buffer with trace data.
+     * @internal
      */
-    async stop() {
-        let fulfill;
-        const contentPromise = new Promise((x) => (fulfill = x));
-        this._client.once('Tracing.tracingComplete', (event) => {
-            helper_1.helper
-                .readProtocolStream(this._client, event.stream, this._path)
-                .then(fulfill);
+    _onMessage(object) {
+        if (object.id && this._callbacks.has(object.id)) {
+            const callback = this._callbacks.get(object.id);
+            this._callbacks.delete(object.id);
+            if (object.error)
+                callback.reject(createProtocolError(callback.error, callback.method, object));
+            else
+                callback.resolve(object.result);
+        }
+        else {
+            assert_js_1.assert(!object.id);
+            this.emit(object.method, object.params);
+        }
+    }
+    /**
+     * Detaches the cdpSession from the target. Once detached, the cdpSession object
+     * won't emit any events and can't be used to send messages.
+     */
+    async detach() {
+        if (!this._connection)
+            throw new Error(`Session already detached. Most likely the ${this._targetType} has been closed.`);
+        await this._connection.send('Target.detachFromTarget', {
+            sessionId: this._sessionId,
         });
-        await this._client.send('Tracing.end');
-        this._recording = false;
-        return contentPromise;
+    }
+    /**
+     * @internal
+     */
+    _onClosed() {
+        for (const callback of this._callbacks.values())
+            callback.reject(rewriteError(callback.error, `Protocol error (${callback.method}): Target closed.`));
+        this._callbacks.clear();
+        this._connection = null;
+        this.emit(exports.CDPSessionEmittedEvents.Disconnected);
     }
 }
-exports.Tracing = Tracing;
-
-
-/***/ }),
-/* 330 */
-/***/ (function(module) {
-
-"use strict";
-
-
-//
-// Allowed token characters:
-//
-// '!', '#', '$', '%', '&', ''', '*', '+', '-',
-// '.', 0-9, A-Z, '^', '_', '`', a-z, '|', '~'
-//
-// tokenChars[32] === 0 // ' '
-// tokenChars[33] === 1 // '!'
-// tokenChars[34] === 0 // '"'
-// ...
-//
-// prettier-ignore
-const tokenChars = [
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0 - 15
-  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 16 - 31
-  0, 1, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 1, 1, 0, // 32 - 47
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, // 48 - 63
-  0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 64 - 79
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, // 80 - 95
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, // 96 - 111
-  1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 0, 1, 0 // 112 - 127
-];
-
+exports.CDPSession = CDPSession;
 /**
- * Adds an offer to the map of extension offers or a parameter to the map of
- * parameters.
- *
- * @param {Object} dest The map of extension offers or parameters
- * @param {String} name The extension or parameter name
- * @param {(Object|Boolean|String)} elem The extension parameters or the
- *     parameter value
- * @private
+ * @param {!Error} error
+ * @param {string} method
+ * @param {{error: {message: string, data: any}}} object
+ * @returns {!Error}
  */
-function push(dest, name, elem) {
-  if (dest[name] === undefined) dest[name] = [elem];
-  else dest[name].push(elem);
+function createProtocolError(error, method, object) {
+    let message = `Protocol error (${method}): ${object.error.message}`;
+    if ('data' in object.error)
+        message += ` ${object.error.data}`;
+    return rewriteError(error, message);
 }
-
 /**
- * Parses the `Sec-WebSocket-Extensions` header into an object.
- *
- * @param {String} header The field value of the header
- * @return {Object} The parsed object
- * @public
+ * @param {!Error} error
+ * @param {string} message
+ * @returns {!Error}
  */
-function parse(header) {
-  const offers = Object.create(null);
-
-  if (header === undefined || header === '') return offers;
-
-  let params = Object.create(null);
-  let mustUnescape = false;
-  let isEscaping = false;
-  let inQuotes = false;
-  let extensionName;
-  let paramName;
-  let start = -1;
-  let end = -1;
-  let i = 0;
-
-  for (; i < header.length; i++) {
-    const code = header.charCodeAt(i);
-
-    if (extensionName === undefined) {
-      if (end === -1 && tokenChars[code] === 1) {
-        if (start === -1) start = i;
-      } else if (code === 0x20 /* ' ' */ || code === 0x09 /* '\t' */) {
-        if (end === -1 && start !== -1) end = i;
-      } else if (code === 0x3b /* ';' */ || code === 0x2c /* ',' */) {
-        if (start === -1) {
-          throw new SyntaxError(`Unexpected character at index ${i}`);
-        }
-
-        if (end === -1) end = i;
-        const name = header.slice(start, end);
-        if (code === 0x2c) {
-          push(offers, name, params);
-          params = Object.create(null);
-        } else {
-          extensionName = name;
-        }
-
-        start = end = -1;
-      } else {
-        throw new SyntaxError(`Unexpected character at index ${i}`);
-      }
-    } else if (paramName === undefined) {
-      if (end === -1 && tokenChars[code] === 1) {
-        if (start === -1) start = i;
-      } else if (code === 0x20 || code === 0x09) {
-        if (end === -1 && start !== -1) end = i;
-      } else if (code === 0x3b || code === 0x2c) {
-        if (start === -1) {
-          throw new SyntaxError(`Unexpected character at index ${i}`);
-        }
-
-        if (end === -1) end = i;
-        push(params, header.slice(start, end), true);
-        if (code === 0x2c) {
-          push(offers, extensionName, params);
-          params = Object.create(null);
-          extensionName = undefined;
-        }
-
-        start = end = -1;
-      } else if (code === 0x3d /* '=' */ && start !== -1 && end === -1) {
-        paramName = header.slice(start, i);
-        start = end = -1;
-      } else {
-        throw new SyntaxError(`Unexpected character at index ${i}`);
-      }
-    } else {
-      //
-      // The value of a quoted-string after unescaping must conform to the
-      // token ABNF, so only token characters are valid.
-      // Ref: https://tools.ietf.org/html/rfc6455#section-9.1
-      //
-      if (isEscaping) {
-        if (tokenChars[code] !== 1) {
-          throw new SyntaxError(`Unexpected character at index ${i}`);
-        }
-        if (start === -1) start = i;
-        else if (!mustUnescape) mustUnescape = true;
-        isEscaping = false;
-      } else if (inQuotes) {
-        if (tokenChars[code] === 1) {
-          if (start === -1) start = i;
-        } else if (code === 0x22 /* '"' */ && start !== -1) {
-          inQuotes = false;
-          end = i;
-        } else if (code === 0x5c /* '\' */) {
-          isEscaping = true;
-        } else {
-          throw new SyntaxError(`Unexpected character at index ${i}`);
-        }
-      } else if (code === 0x22 && header.charCodeAt(i - 1) === 0x3d) {
-        inQuotes = true;
-      } else if (end === -1 && tokenChars[code] === 1) {
-        if (start === -1) start = i;
-      } else if (start !== -1 && (code === 0x20 || code === 0x09)) {
-        if (end === -1) end = i;
-      } else if (code === 0x3b || code === 0x2c) {
-        if (start === -1) {
-          throw new SyntaxError(`Unexpected character at index ${i}`);
-        }
-
-        if (end === -1) end = i;
-        let value = header.slice(start, end);
-        if (mustUnescape) {
-          value = value.replace(/\\/g, '');
-          mustUnescape = false;
-        }
-        push(params, paramName, value);
-        if (code === 0x2c) {
-          push(offers, extensionName, params);
-          params = Object.create(null);
-          extensionName = undefined;
-        }
-
-        paramName = undefined;
-        start = end = -1;
-      } else {
-        throw new SyntaxError(`Unexpected character at index ${i}`);
-      }
-    }
-  }
-
-  if (start === -1 || inQuotes) {
-    throw new SyntaxError('Unexpected end of input');
-  }
-
-  if (end === -1) end = i;
-  const token = header.slice(start, end);
-  if (extensionName === undefined) {
-    push(offers, token, params);
-  } else {
-    if (paramName === undefined) {
-      push(params, token, true);
-    } else if (mustUnescape) {
-      push(params, paramName, token.replace(/\\/g, ''));
-    } else {
-      push(params, paramName, token);
-    }
-    push(offers, extensionName, params);
-  }
-
-  return offers;
+function rewriteError(error, message) {
+    error.message = message;
+    return error;
 }
-
-/**
- * Builds the `Sec-WebSocket-Extensions` header field value.
- *
- * @param {Object} extensions The map of extensions and parameters to format
- * @return {String} A string representing the given object
- * @public
- */
-function format(extensions) {
-  return Object.keys(extensions)
-    .map((extension) => {
-      let configurations = extensions[extension];
-      if (!Array.isArray(configurations)) configurations = [configurations];
-      return configurations
-        .map((params) => {
-          return [extension]
-            .concat(
-              Object.keys(params).map((k) => {
-                let values = params[k];
-                if (!Array.isArray(values)) values = [values];
-                return values
-                  .map((v) => (v === true ? k : `${k}=${v}`))
-                  .join('; ');
-              })
-            )
-            .join('; ');
-        })
-        .join(', ');
-    })
-    .join(', ');
-}
-
-module.exports = { format, parse };
 
 
 /***/ }),
@@ -15026,7 +17412,489 @@ module.exports = { format, parse };
 /* 337 */,
 /* 338 */,
 /* 339 */,
-/* 340 */,
+/* 340 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the 'License');
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an 'AS IS' BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Touchscreen = exports.Mouse = exports.Keyboard = void 0;
+const assert_js_1 = __webpack_require__(716);
+const USKeyboardLayout_js_1 = __webpack_require__(347);
+/**
+ * Keyboard provides an api for managing a virtual keyboard.
+ * The high level api is {@link Keyboard."type"},
+ * which takes raw characters and generates proper keydown, keypress/input,
+ * and keyup events on your page.
+ *
+ * @remarks
+ * For finer control, you can use {@link Keyboard.down},
+ * {@link Keyboard.up}, and {@link Keyboard.sendCharacter}
+ * to manually fire events as if they were generated from a real keyboard.
+ *
+ * On MacOS, keyboard shortcuts like `⌘ A` -\> Select All do not work.
+ * See {@link https://github.com/puppeteer/puppeteer/issues/1313 | #1313}.
+ *
+ * @example
+ * An example of holding down `Shift` in order to select and delete some text:
+ * ```js
+ * await page.keyboard.type('Hello World!');
+ * await page.keyboard.press('ArrowLeft');
+ *
+ * await page.keyboard.down('Shift');
+ * for (let i = 0; i < ' World'.length; i++)
+ *   await page.keyboard.press('ArrowLeft');
+ * await page.keyboard.up('Shift');
+ *
+ * await page.keyboard.press('Backspace');
+ * // Result text will end up saying 'Hello!'
+ * ```
+ *
+ * @example
+ * An example of pressing `A`
+ * ```js
+ * await page.keyboard.down('Shift');
+ * await page.keyboard.press('KeyA');
+ * await page.keyboard.up('Shift');
+ * ```
+ *
+ * @public
+ */
+class Keyboard {
+    /** @internal */
+    constructor(client) {
+        /** @internal */
+        this._modifiers = 0;
+        this._pressedKeys = new Set();
+        this._client = client;
+    }
+    /**
+     * Dispatches a `keydown` event.
+     *
+     * @remarks
+     * If `key` is a single character and no modifier keys besides `Shift`
+     * are being held down, a `keypress`/`input` event will also generated.
+     * The `text` option can be specified to force an input event to be generated.
+     * If `key` is a modifier key, `Shift`, `Meta`, `Control`, or `Alt`,
+     * subsequent key presses will be sent with that modifier active.
+     * To release the modifier key, use {@link Keyboard.up}.
+     *
+     * After the key is pressed once, subsequent calls to
+     * {@link Keyboard.down} will have
+     * {@link https://developer.mozilla.org/en-US/docs/Web/API/KeyboardEvent/repeat | repeat}
+     * set to true. To release the key, use {@link Keyboard.up}.
+     *
+     * Modifier keys DO influence {@link Keyboard.down}.
+     * Holding down `Shift` will type the text in upper case.
+     *
+     * @param key - Name of key to press, such as `ArrowLeft`.
+     * See {@link KeyInput} for a list of all key names.
+     *
+     * @param options - An object of options. Accepts text which, if specified,
+     * generates an input event with this text.
+     */
+    async down(key, options = { text: undefined }) {
+        const description = this._keyDescriptionForString(key);
+        const autoRepeat = this._pressedKeys.has(description.code);
+        this._pressedKeys.add(description.code);
+        this._modifiers |= this._modifierBit(description.key);
+        const text = options.text === undefined ? description.text : options.text;
+        await this._client.send('Input.dispatchKeyEvent', {
+            type: text ? 'keyDown' : 'rawKeyDown',
+            modifiers: this._modifiers,
+            windowsVirtualKeyCode: description.keyCode,
+            code: description.code,
+            key: description.key,
+            text: text,
+            unmodifiedText: text,
+            autoRepeat,
+            location: description.location,
+            isKeypad: description.location === 3,
+        });
+    }
+    _modifierBit(key) {
+        if (key === 'Alt')
+            return 1;
+        if (key === 'Control')
+            return 2;
+        if (key === 'Meta')
+            return 4;
+        if (key === 'Shift')
+            return 8;
+        return 0;
+    }
+    _keyDescriptionForString(keyString) {
+        const shift = this._modifiers & 8;
+        const description = {
+            key: '',
+            keyCode: 0,
+            code: '',
+            text: '',
+            location: 0,
+        };
+        const definition = USKeyboardLayout_js_1.keyDefinitions[keyString];
+        assert_js_1.assert(definition, `Unknown key: "${keyString}"`);
+        if (definition.key)
+            description.key = definition.key;
+        if (shift && definition.shiftKey)
+            description.key = definition.shiftKey;
+        if (definition.keyCode)
+            description.keyCode = definition.keyCode;
+        if (shift && definition.shiftKeyCode)
+            description.keyCode = definition.shiftKeyCode;
+        if (definition.code)
+            description.code = definition.code;
+        if (definition.location)
+            description.location = definition.location;
+        if (description.key.length === 1)
+            description.text = description.key;
+        if (definition.text)
+            description.text = definition.text;
+        if (shift && definition.shiftText)
+            description.text = definition.shiftText;
+        // if any modifiers besides shift are pressed, no text should be sent
+        if (this._modifiers & ~8)
+            description.text = '';
+        return description;
+    }
+    /**
+     * Dispatches a `keyup` event.
+     *
+     * @param key - Name of key to release, such as `ArrowLeft`.
+     * See {@link KeyInput | KeyInput}
+     * for a list of all key names.
+     */
+    async up(key) {
+        const description = this._keyDescriptionForString(key);
+        this._modifiers &= ~this._modifierBit(description.key);
+        this._pressedKeys.delete(description.code);
+        await this._client.send('Input.dispatchKeyEvent', {
+            type: 'keyUp',
+            modifiers: this._modifiers,
+            key: description.key,
+            windowsVirtualKeyCode: description.keyCode,
+            code: description.code,
+            location: description.location,
+        });
+    }
+    /**
+     * Dispatches a `keypress` and `input` event.
+     * This does not send a `keydown` or `keyup` event.
+     *
+     * @remarks
+     * Modifier keys DO NOT effect {@link Keyboard.sendCharacter | Keyboard.sendCharacter}.
+     * Holding down `Shift` will not type the text in upper case.
+     *
+     * @example
+     * ```js
+     * page.keyboard.sendCharacter('嗨');
+     * ```
+     *
+     * @param char - Character to send into the page.
+     */
+    async sendCharacter(char) {
+        await this._client.send('Input.insertText', { text: char });
+    }
+    charIsKey(char) {
+        return !!USKeyboardLayout_js_1.keyDefinitions[char];
+    }
+    /**
+     * Sends a `keydown`, `keypress`/`input`,
+     * and `keyup` event for each character in the text.
+     *
+     * @remarks
+     * To press a special key, like `Control` or `ArrowDown`,
+     * use {@link Keyboard.press}.
+     *
+     * Modifier keys DO NOT effect `keyboard.type`.
+     * Holding down `Shift` will not type the text in upper case.
+     *
+     * @example
+     * ```js
+     * await page.keyboard.type('Hello'); // Types instantly
+     * await page.keyboard.type('World', {delay: 100}); // Types slower, like a user
+     * ```
+     *
+     * @param text - A text to type into a focused element.
+     * @param options - An object of options. Accepts delay which,
+     * if specified, is the time to wait between `keydown` and `keyup` in milliseconds.
+     * Defaults to 0.
+     */
+    async type(text, options = {}) {
+        const delay = options.delay || null;
+        for (const char of text) {
+            if (this.charIsKey(char)) {
+                await this.press(char, { delay });
+            }
+            else {
+                if (delay)
+                    await new Promise((f) => setTimeout(f, delay));
+                await this.sendCharacter(char);
+            }
+        }
+    }
+    /**
+     * Shortcut for {@link Keyboard.down}
+     * and {@link Keyboard.up}.
+     *
+     * @remarks
+     * If `key` is a single character and no modifier keys besides `Shift`
+     * are being held down, a `keypress`/`input` event will also generated.
+     * The `text` option can be specified to force an input event to be generated.
+     *
+     * Modifier keys DO effect {@link Keyboard.press}.
+     * Holding down `Shift` will type the text in upper case.
+     *
+     * @param key - Name of key to press, such as `ArrowLeft`.
+     * See {@link KeyInput} for a list of all key names.
+     *
+     * @param options - An object of options. Accepts text which, if specified,
+     * generates an input event with this text. Accepts delay which,
+     * if specified, is the time to wait between `keydown` and `keyup` in milliseconds.
+     * Defaults to 0.
+     */
+    async press(key, options = {}) {
+        const { delay = null } = options;
+        await this.down(key, options);
+        if (delay)
+            await new Promise((f) => setTimeout(f, options.delay));
+        await this.up(key);
+    }
+}
+exports.Keyboard = Keyboard;
+/**
+ * The Mouse class operates in main-frame CSS pixels
+ * relative to the top-left corner of the viewport.
+ * @remarks
+ * Every `page` object has its own Mouse, accessible with [`page.mouse`](#pagemouse).
+ *
+ * @example
+ * ```js
+ * // Using ‘page.mouse’ to trace a 100x100 square.
+ * await page.mouse.move(0, 0);
+ * await page.mouse.down();
+ * await page.mouse.move(0, 100);
+ * await page.mouse.move(100, 100);
+ * await page.mouse.move(100, 0);
+ * await page.mouse.move(0, 0);
+ * await page.mouse.up();
+ * ```
+ *
+ * **Note**: The mouse events trigger synthetic `MouseEvent`s.
+ * This means that it does not fully replicate the functionality of what a normal user
+ * would be able to do with their mouse.
+ *
+ * For example, dragging and selecting text is not possible using `page.mouse`.
+ * Instead, you can use the {@link https://developer.mozilla.org/en-US/docs/Web/API/DocumentOrShadowRoot/getSelection | `DocumentOrShadowRoot.getSelection()`} functionality implemented in the platform.
+ *
+ * @example
+ * For example, if you want to select all content between nodes:
+ * ```js
+ * await page.evaluate((from, to) => {
+ *   const selection = from.getRootNode().getSelection();
+ *   const range = document.createRange();
+ *   range.setStartBefore(from);
+ *   range.setEndAfter(to);
+ *   selection.removeAllRanges();
+ *   selection.addRange(range);
+ * }, fromJSHandle, toJSHandle);
+ * ```
+ * If you then would want to copy-paste your selection, you can use the clipboard api:
+ * ```js
+ * // The clipboard api does not allow you to copy, unless the tab is focused.
+ * await page.bringToFront();
+ * await page.evaluate(() => {
+ *   // Copy the selected content to the clipboard
+ *   document.execCommand('copy');
+ *   // Obtain the content of the clipboard as a string
+ *   return navigator.clipboard.readText();
+ * });
+ * ```
+ * **Note**: If you want access to the clipboard API,
+ * you have to give it permission to do so:
+ * ```js
+ * await browser.defaultBrowserContext().overridePermissions(
+ *   '<your origin>', ['clipboard-read', 'clipboard-write']
+ * );
+ * ```
+ * @public
+ */
+class Mouse {
+    /**
+     * @internal
+     */
+    constructor(client, keyboard) {
+        this._x = 0;
+        this._y = 0;
+        this._button = 'none';
+        this._client = client;
+        this._keyboard = keyboard;
+    }
+    /**
+     * Dispatches a `mousemove` event.
+     * @param x - Horizontal position of the mouse.
+     * @param y - Vertical position of the mouse.
+     * @param options - Optional object. If specified, the `steps` property
+     * sends intermediate `mousemove` events when set to `1` (default).
+     */
+    async move(x, y, options = {}) {
+        const { steps = 1 } = options;
+        const fromX = this._x, fromY = this._y;
+        this._x = x;
+        this._y = y;
+        for (let i = 1; i <= steps; i++) {
+            await this._client.send('Input.dispatchMouseEvent', {
+                type: 'mouseMoved',
+                button: this._button,
+                x: fromX + (this._x - fromX) * (i / steps),
+                y: fromY + (this._y - fromY) * (i / steps),
+                modifiers: this._keyboard._modifiers,
+            });
+        }
+    }
+    /**
+     * Shortcut for `mouse.move`, `mouse.down` and `mouse.up`.
+     * @param x - Horizontal position of the mouse.
+     * @param y - Vertical position of the mouse.
+     * @param options - Optional `MouseOptions`.
+     */
+    async click(x, y, options = {}) {
+        const { delay = null } = options;
+        if (delay !== null) {
+            await Promise.all([this.move(x, y), this.down(options)]);
+            await new Promise((f) => setTimeout(f, delay));
+            await this.up(options);
+        }
+        else {
+            await Promise.all([
+                this.move(x, y),
+                this.down(options),
+                this.up(options),
+            ]);
+        }
+    }
+    /**
+     * Dispatches a `mousedown` event.
+     * @param options - Optional `MouseOptions`.
+     */
+    async down(options = {}) {
+        const { button = 'left', clickCount = 1 } = options;
+        this._button = button;
+        await this._client.send('Input.dispatchMouseEvent', {
+            type: 'mousePressed',
+            button,
+            x: this._x,
+            y: this._y,
+            modifiers: this._keyboard._modifiers,
+            clickCount,
+        });
+    }
+    /**
+     * Dispatches a `mouseup` event.
+     * @param options - Optional `MouseOptions`.
+     */
+    async up(options = {}) {
+        const { button = 'left', clickCount = 1 } = options;
+        this._button = 'none';
+        await this._client.send('Input.dispatchMouseEvent', {
+            type: 'mouseReleased',
+            button,
+            x: this._x,
+            y: this._y,
+            modifiers: this._keyboard._modifiers,
+            clickCount,
+        });
+    }
+    /**
+     * Dispatches a `mousewheel` event.
+     * @param options - Optional: `MouseWheelOptions`.
+     *
+     * @example
+     * An example of zooming into an element:
+     * ```js
+     * await page.goto('https://mdn.mozillademos.org/en-US/docs/Web/API/Element/wheel_event$samples/Scaling_an_element_via_the_wheel?revision=1587366');
+     *
+     * const elem = await page.$('div');
+     * const boundingBox = await elem.boundingBox();
+     * await page.mouse.move(
+     *   boundingBox.x + boundingBox.width / 2,
+     *   boundingBox.y + boundingBox.height / 2
+     * );
+     *
+     * await page.mouse.wheel({ deltaY: -100 })
+     * ```
+     */
+    async wheel(options = {}) {
+        const { deltaX = 0, deltaY = 0 } = options;
+        await this._client.send('Input.dispatchMouseEvent', {
+            type: 'mouseWheel',
+            x: this._x,
+            y: this._y,
+            deltaX,
+            deltaY,
+            modifiers: this._keyboard._modifiers,
+            pointerType: 'mouse',
+        });
+    }
+}
+exports.Mouse = Mouse;
+/**
+ * The Touchscreen class exposes touchscreen events.
+ * @public
+ */
+class Touchscreen {
+    /**
+     * @internal
+     */
+    constructor(client, keyboard) {
+        this._client = client;
+        this._keyboard = keyboard;
+    }
+    /**
+     * Dispatches a `touchstart` and `touchend` event.
+     * @param x - Horizontal position of the tap.
+     * @param y - Vertical position of the tap.
+     */
+    async tap(x, y) {
+        // Touches appear to be lost during the first frame after navigation.
+        // This waits a frame before sending the tap.
+        // @see https://crbug.com/613219
+        await this._client.send('Runtime.evaluate', {
+            expression: 'new Promise(x => requestAnimationFrame(() => requestAnimationFrame(x)))',
+            awaitPromise: true,
+        });
+        const touchPoints = [{ x: Math.round(x), y: Math.round(y) }];
+        await this._client.send('Input.dispatchTouchEvent', {
+            type: 'touchStart',
+            touchPoints,
+            modifiers: this._keyboard._modifiers,
+        });
+        await this._client.send('Input.dispatchTouchEvent', {
+            type: 'touchEnd',
+            touchPoints: [],
+            modifiers: this._keyboard._modifiers,
+        });
+    }
+}
+exports.Touchscreen = Touchscreen;
+
+
+/***/ }),
 /* 341 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -15128,7 +17996,419 @@ module.exports.stop = stop;
 /* 344 */,
 /* 345 */,
 /* 346 */,
-/* 347 */,
+/* 347 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the 'License');
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an 'AS IS' BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.keyDefinitions = void 0;
+/**
+ * @internal
+ */
+exports.keyDefinitions = {
+    '0': { keyCode: 48, key: '0', code: 'Digit0' },
+    '1': { keyCode: 49, key: '1', code: 'Digit1' },
+    '2': { keyCode: 50, key: '2', code: 'Digit2' },
+    '3': { keyCode: 51, key: '3', code: 'Digit3' },
+    '4': { keyCode: 52, key: '4', code: 'Digit4' },
+    '5': { keyCode: 53, key: '5', code: 'Digit5' },
+    '6': { keyCode: 54, key: '6', code: 'Digit6' },
+    '7': { keyCode: 55, key: '7', code: 'Digit7' },
+    '8': { keyCode: 56, key: '8', code: 'Digit8' },
+    '9': { keyCode: 57, key: '9', code: 'Digit9' },
+    Power: { key: 'Power', code: 'Power' },
+    Eject: { key: 'Eject', code: 'Eject' },
+    Abort: { keyCode: 3, code: 'Abort', key: 'Cancel' },
+    Help: { keyCode: 6, code: 'Help', key: 'Help' },
+    Backspace: { keyCode: 8, code: 'Backspace', key: 'Backspace' },
+    Tab: { keyCode: 9, code: 'Tab', key: 'Tab' },
+    Numpad5: {
+        keyCode: 12,
+        shiftKeyCode: 101,
+        key: 'Clear',
+        code: 'Numpad5',
+        shiftKey: '5',
+        location: 3,
+    },
+    NumpadEnter: {
+        keyCode: 13,
+        code: 'NumpadEnter',
+        key: 'Enter',
+        text: '\r',
+        location: 3,
+    },
+    Enter: { keyCode: 13, code: 'Enter', key: 'Enter', text: '\r' },
+    '\r': { keyCode: 13, code: 'Enter', key: 'Enter', text: '\r' },
+    '\n': { keyCode: 13, code: 'Enter', key: 'Enter', text: '\r' },
+    ShiftLeft: { keyCode: 16, code: 'ShiftLeft', key: 'Shift', location: 1 },
+    ShiftRight: { keyCode: 16, code: 'ShiftRight', key: 'Shift', location: 2 },
+    ControlLeft: {
+        keyCode: 17,
+        code: 'ControlLeft',
+        key: 'Control',
+        location: 1,
+    },
+    ControlRight: {
+        keyCode: 17,
+        code: 'ControlRight',
+        key: 'Control',
+        location: 2,
+    },
+    AltLeft: { keyCode: 18, code: 'AltLeft', key: 'Alt', location: 1 },
+    AltRight: { keyCode: 18, code: 'AltRight', key: 'Alt', location: 2 },
+    Pause: { keyCode: 19, code: 'Pause', key: 'Pause' },
+    CapsLock: { keyCode: 20, code: 'CapsLock', key: 'CapsLock' },
+    Escape: { keyCode: 27, code: 'Escape', key: 'Escape' },
+    Convert: { keyCode: 28, code: 'Convert', key: 'Convert' },
+    NonConvert: { keyCode: 29, code: 'NonConvert', key: 'NonConvert' },
+    Space: { keyCode: 32, code: 'Space', key: ' ' },
+    Numpad9: {
+        keyCode: 33,
+        shiftKeyCode: 105,
+        key: 'PageUp',
+        code: 'Numpad9',
+        shiftKey: '9',
+        location: 3,
+    },
+    PageUp: { keyCode: 33, code: 'PageUp', key: 'PageUp' },
+    Numpad3: {
+        keyCode: 34,
+        shiftKeyCode: 99,
+        key: 'PageDown',
+        code: 'Numpad3',
+        shiftKey: '3',
+        location: 3,
+    },
+    PageDown: { keyCode: 34, code: 'PageDown', key: 'PageDown' },
+    End: { keyCode: 35, code: 'End', key: 'End' },
+    Numpad1: {
+        keyCode: 35,
+        shiftKeyCode: 97,
+        key: 'End',
+        code: 'Numpad1',
+        shiftKey: '1',
+        location: 3,
+    },
+    Home: { keyCode: 36, code: 'Home', key: 'Home' },
+    Numpad7: {
+        keyCode: 36,
+        shiftKeyCode: 103,
+        key: 'Home',
+        code: 'Numpad7',
+        shiftKey: '7',
+        location: 3,
+    },
+    ArrowLeft: { keyCode: 37, code: 'ArrowLeft', key: 'ArrowLeft' },
+    Numpad4: {
+        keyCode: 37,
+        shiftKeyCode: 100,
+        key: 'ArrowLeft',
+        code: 'Numpad4',
+        shiftKey: '4',
+        location: 3,
+    },
+    Numpad8: {
+        keyCode: 38,
+        shiftKeyCode: 104,
+        key: 'ArrowUp',
+        code: 'Numpad8',
+        shiftKey: '8',
+        location: 3,
+    },
+    ArrowUp: { keyCode: 38, code: 'ArrowUp', key: 'ArrowUp' },
+    ArrowRight: { keyCode: 39, code: 'ArrowRight', key: 'ArrowRight' },
+    Numpad6: {
+        keyCode: 39,
+        shiftKeyCode: 102,
+        key: 'ArrowRight',
+        code: 'Numpad6',
+        shiftKey: '6',
+        location: 3,
+    },
+    Numpad2: {
+        keyCode: 40,
+        shiftKeyCode: 98,
+        key: 'ArrowDown',
+        code: 'Numpad2',
+        shiftKey: '2',
+        location: 3,
+    },
+    ArrowDown: { keyCode: 40, code: 'ArrowDown', key: 'ArrowDown' },
+    Select: { keyCode: 41, code: 'Select', key: 'Select' },
+    Open: { keyCode: 43, code: 'Open', key: 'Execute' },
+    PrintScreen: { keyCode: 44, code: 'PrintScreen', key: 'PrintScreen' },
+    Insert: { keyCode: 45, code: 'Insert', key: 'Insert' },
+    Numpad0: {
+        keyCode: 45,
+        shiftKeyCode: 96,
+        key: 'Insert',
+        code: 'Numpad0',
+        shiftKey: '0',
+        location: 3,
+    },
+    Delete: { keyCode: 46, code: 'Delete', key: 'Delete' },
+    NumpadDecimal: {
+        keyCode: 46,
+        shiftKeyCode: 110,
+        code: 'NumpadDecimal',
+        key: '\u0000',
+        shiftKey: '.',
+        location: 3,
+    },
+    Digit0: { keyCode: 48, code: 'Digit0', shiftKey: ')', key: '0' },
+    Digit1: { keyCode: 49, code: 'Digit1', shiftKey: '!', key: '1' },
+    Digit2: { keyCode: 50, code: 'Digit2', shiftKey: '@', key: '2' },
+    Digit3: { keyCode: 51, code: 'Digit3', shiftKey: '#', key: '3' },
+    Digit4: { keyCode: 52, code: 'Digit4', shiftKey: '$', key: '4' },
+    Digit5: { keyCode: 53, code: 'Digit5', shiftKey: '%', key: '5' },
+    Digit6: { keyCode: 54, code: 'Digit6', shiftKey: '^', key: '6' },
+    Digit7: { keyCode: 55, code: 'Digit7', shiftKey: '&', key: '7' },
+    Digit8: { keyCode: 56, code: 'Digit8', shiftKey: '*', key: '8' },
+    Digit9: { keyCode: 57, code: 'Digit9', shiftKey: '(', key: '9' },
+    KeyA: { keyCode: 65, code: 'KeyA', shiftKey: 'A', key: 'a' },
+    KeyB: { keyCode: 66, code: 'KeyB', shiftKey: 'B', key: 'b' },
+    KeyC: { keyCode: 67, code: 'KeyC', shiftKey: 'C', key: 'c' },
+    KeyD: { keyCode: 68, code: 'KeyD', shiftKey: 'D', key: 'd' },
+    KeyE: { keyCode: 69, code: 'KeyE', shiftKey: 'E', key: 'e' },
+    KeyF: { keyCode: 70, code: 'KeyF', shiftKey: 'F', key: 'f' },
+    KeyG: { keyCode: 71, code: 'KeyG', shiftKey: 'G', key: 'g' },
+    KeyH: { keyCode: 72, code: 'KeyH', shiftKey: 'H', key: 'h' },
+    KeyI: { keyCode: 73, code: 'KeyI', shiftKey: 'I', key: 'i' },
+    KeyJ: { keyCode: 74, code: 'KeyJ', shiftKey: 'J', key: 'j' },
+    KeyK: { keyCode: 75, code: 'KeyK', shiftKey: 'K', key: 'k' },
+    KeyL: { keyCode: 76, code: 'KeyL', shiftKey: 'L', key: 'l' },
+    KeyM: { keyCode: 77, code: 'KeyM', shiftKey: 'M', key: 'm' },
+    KeyN: { keyCode: 78, code: 'KeyN', shiftKey: 'N', key: 'n' },
+    KeyO: { keyCode: 79, code: 'KeyO', shiftKey: 'O', key: 'o' },
+    KeyP: { keyCode: 80, code: 'KeyP', shiftKey: 'P', key: 'p' },
+    KeyQ: { keyCode: 81, code: 'KeyQ', shiftKey: 'Q', key: 'q' },
+    KeyR: { keyCode: 82, code: 'KeyR', shiftKey: 'R', key: 'r' },
+    KeyS: { keyCode: 83, code: 'KeyS', shiftKey: 'S', key: 's' },
+    KeyT: { keyCode: 84, code: 'KeyT', shiftKey: 'T', key: 't' },
+    KeyU: { keyCode: 85, code: 'KeyU', shiftKey: 'U', key: 'u' },
+    KeyV: { keyCode: 86, code: 'KeyV', shiftKey: 'V', key: 'v' },
+    KeyW: { keyCode: 87, code: 'KeyW', shiftKey: 'W', key: 'w' },
+    KeyX: { keyCode: 88, code: 'KeyX', shiftKey: 'X', key: 'x' },
+    KeyY: { keyCode: 89, code: 'KeyY', shiftKey: 'Y', key: 'y' },
+    KeyZ: { keyCode: 90, code: 'KeyZ', shiftKey: 'Z', key: 'z' },
+    MetaLeft: { keyCode: 91, code: 'MetaLeft', key: 'Meta', location: 1 },
+    MetaRight: { keyCode: 92, code: 'MetaRight', key: 'Meta', location: 2 },
+    ContextMenu: { keyCode: 93, code: 'ContextMenu', key: 'ContextMenu' },
+    NumpadMultiply: {
+        keyCode: 106,
+        code: 'NumpadMultiply',
+        key: '*',
+        location: 3,
+    },
+    NumpadAdd: { keyCode: 107, code: 'NumpadAdd', key: '+', location: 3 },
+    NumpadSubtract: {
+        keyCode: 109,
+        code: 'NumpadSubtract',
+        key: '-',
+        location: 3,
+    },
+    NumpadDivide: { keyCode: 111, code: 'NumpadDivide', key: '/', location: 3 },
+    F1: { keyCode: 112, code: 'F1', key: 'F1' },
+    F2: { keyCode: 113, code: 'F2', key: 'F2' },
+    F3: { keyCode: 114, code: 'F3', key: 'F3' },
+    F4: { keyCode: 115, code: 'F4', key: 'F4' },
+    F5: { keyCode: 116, code: 'F5', key: 'F5' },
+    F6: { keyCode: 117, code: 'F6', key: 'F6' },
+    F7: { keyCode: 118, code: 'F7', key: 'F7' },
+    F8: { keyCode: 119, code: 'F8', key: 'F8' },
+    F9: { keyCode: 120, code: 'F9', key: 'F9' },
+    F10: { keyCode: 121, code: 'F10', key: 'F10' },
+    F11: { keyCode: 122, code: 'F11', key: 'F11' },
+    F12: { keyCode: 123, code: 'F12', key: 'F12' },
+    F13: { keyCode: 124, code: 'F13', key: 'F13' },
+    F14: { keyCode: 125, code: 'F14', key: 'F14' },
+    F15: { keyCode: 126, code: 'F15', key: 'F15' },
+    F16: { keyCode: 127, code: 'F16', key: 'F16' },
+    F17: { keyCode: 128, code: 'F17', key: 'F17' },
+    F18: { keyCode: 129, code: 'F18', key: 'F18' },
+    F19: { keyCode: 130, code: 'F19', key: 'F19' },
+    F20: { keyCode: 131, code: 'F20', key: 'F20' },
+    F21: { keyCode: 132, code: 'F21', key: 'F21' },
+    F22: { keyCode: 133, code: 'F22', key: 'F22' },
+    F23: { keyCode: 134, code: 'F23', key: 'F23' },
+    F24: { keyCode: 135, code: 'F24', key: 'F24' },
+    NumLock: { keyCode: 144, code: 'NumLock', key: 'NumLock' },
+    ScrollLock: { keyCode: 145, code: 'ScrollLock', key: 'ScrollLock' },
+    AudioVolumeMute: {
+        keyCode: 173,
+        code: 'AudioVolumeMute',
+        key: 'AudioVolumeMute',
+    },
+    AudioVolumeDown: {
+        keyCode: 174,
+        code: 'AudioVolumeDown',
+        key: 'AudioVolumeDown',
+    },
+    AudioVolumeUp: { keyCode: 175, code: 'AudioVolumeUp', key: 'AudioVolumeUp' },
+    MediaTrackNext: {
+        keyCode: 176,
+        code: 'MediaTrackNext',
+        key: 'MediaTrackNext',
+    },
+    MediaTrackPrevious: {
+        keyCode: 177,
+        code: 'MediaTrackPrevious',
+        key: 'MediaTrackPrevious',
+    },
+    MediaStop: { keyCode: 178, code: 'MediaStop', key: 'MediaStop' },
+    MediaPlayPause: {
+        keyCode: 179,
+        code: 'MediaPlayPause',
+        key: 'MediaPlayPause',
+    },
+    Semicolon: { keyCode: 186, code: 'Semicolon', shiftKey: ':', key: ';' },
+    Equal: { keyCode: 187, code: 'Equal', shiftKey: '+', key: '=' },
+    NumpadEqual: { keyCode: 187, code: 'NumpadEqual', key: '=', location: 3 },
+    Comma: { keyCode: 188, code: 'Comma', shiftKey: '<', key: ',' },
+    Minus: { keyCode: 189, code: 'Minus', shiftKey: '_', key: '-' },
+    Period: { keyCode: 190, code: 'Period', shiftKey: '>', key: '.' },
+    Slash: { keyCode: 191, code: 'Slash', shiftKey: '?', key: '/' },
+    Backquote: { keyCode: 192, code: 'Backquote', shiftKey: '~', key: '`' },
+    BracketLeft: { keyCode: 219, code: 'BracketLeft', shiftKey: '{', key: '[' },
+    Backslash: { keyCode: 220, code: 'Backslash', shiftKey: '|', key: '\\' },
+    BracketRight: { keyCode: 221, code: 'BracketRight', shiftKey: '}', key: ']' },
+    Quote: { keyCode: 222, code: 'Quote', shiftKey: '"', key: "'" },
+    AltGraph: { keyCode: 225, code: 'AltGraph', key: 'AltGraph' },
+    Props: { keyCode: 247, code: 'Props', key: 'CrSel' },
+    Cancel: { keyCode: 3, key: 'Cancel', code: 'Abort' },
+    Clear: { keyCode: 12, key: 'Clear', code: 'Numpad5', location: 3 },
+    Shift: { keyCode: 16, key: 'Shift', code: 'ShiftLeft', location: 1 },
+    Control: { keyCode: 17, key: 'Control', code: 'ControlLeft', location: 1 },
+    Alt: { keyCode: 18, key: 'Alt', code: 'AltLeft', location: 1 },
+    Accept: { keyCode: 30, key: 'Accept' },
+    ModeChange: { keyCode: 31, key: 'ModeChange' },
+    ' ': { keyCode: 32, key: ' ', code: 'Space' },
+    Print: { keyCode: 42, key: 'Print' },
+    Execute: { keyCode: 43, key: 'Execute', code: 'Open' },
+    '\u0000': { keyCode: 46, key: '\u0000', code: 'NumpadDecimal', location: 3 },
+    a: { keyCode: 65, key: 'a', code: 'KeyA' },
+    b: { keyCode: 66, key: 'b', code: 'KeyB' },
+    c: { keyCode: 67, key: 'c', code: 'KeyC' },
+    d: { keyCode: 68, key: 'd', code: 'KeyD' },
+    e: { keyCode: 69, key: 'e', code: 'KeyE' },
+    f: { keyCode: 70, key: 'f', code: 'KeyF' },
+    g: { keyCode: 71, key: 'g', code: 'KeyG' },
+    h: { keyCode: 72, key: 'h', code: 'KeyH' },
+    i: { keyCode: 73, key: 'i', code: 'KeyI' },
+    j: { keyCode: 74, key: 'j', code: 'KeyJ' },
+    k: { keyCode: 75, key: 'k', code: 'KeyK' },
+    l: { keyCode: 76, key: 'l', code: 'KeyL' },
+    m: { keyCode: 77, key: 'm', code: 'KeyM' },
+    n: { keyCode: 78, key: 'n', code: 'KeyN' },
+    o: { keyCode: 79, key: 'o', code: 'KeyO' },
+    p: { keyCode: 80, key: 'p', code: 'KeyP' },
+    q: { keyCode: 81, key: 'q', code: 'KeyQ' },
+    r: { keyCode: 82, key: 'r', code: 'KeyR' },
+    s: { keyCode: 83, key: 's', code: 'KeyS' },
+    t: { keyCode: 84, key: 't', code: 'KeyT' },
+    u: { keyCode: 85, key: 'u', code: 'KeyU' },
+    v: { keyCode: 86, key: 'v', code: 'KeyV' },
+    w: { keyCode: 87, key: 'w', code: 'KeyW' },
+    x: { keyCode: 88, key: 'x', code: 'KeyX' },
+    y: { keyCode: 89, key: 'y', code: 'KeyY' },
+    z: { keyCode: 90, key: 'z', code: 'KeyZ' },
+    Meta: { keyCode: 91, key: 'Meta', code: 'MetaLeft', location: 1 },
+    '*': { keyCode: 106, key: '*', code: 'NumpadMultiply', location: 3 },
+    '+': { keyCode: 107, key: '+', code: 'NumpadAdd', location: 3 },
+    '-': { keyCode: 109, key: '-', code: 'NumpadSubtract', location: 3 },
+    '/': { keyCode: 111, key: '/', code: 'NumpadDivide', location: 3 },
+    ';': { keyCode: 186, key: ';', code: 'Semicolon' },
+    '=': { keyCode: 187, key: '=', code: 'Equal' },
+    ',': { keyCode: 188, key: ',', code: 'Comma' },
+    '.': { keyCode: 190, key: '.', code: 'Period' },
+    '`': { keyCode: 192, key: '`', code: 'Backquote' },
+    '[': { keyCode: 219, key: '[', code: 'BracketLeft' },
+    '\\': { keyCode: 220, key: '\\', code: 'Backslash' },
+    ']': { keyCode: 221, key: ']', code: 'BracketRight' },
+    "'": { keyCode: 222, key: "'", code: 'Quote' },
+    Attn: { keyCode: 246, key: 'Attn' },
+    CrSel: { keyCode: 247, key: 'CrSel', code: 'Props' },
+    ExSel: { keyCode: 248, key: 'ExSel' },
+    EraseEof: { keyCode: 249, key: 'EraseEof' },
+    Play: { keyCode: 250, key: 'Play' },
+    ZoomOut: { keyCode: 251, key: 'ZoomOut' },
+    ')': { keyCode: 48, key: ')', code: 'Digit0' },
+    '!': { keyCode: 49, key: '!', code: 'Digit1' },
+    '@': { keyCode: 50, key: '@', code: 'Digit2' },
+    '#': { keyCode: 51, key: '#', code: 'Digit3' },
+    $: { keyCode: 52, key: '$', code: 'Digit4' },
+    '%': { keyCode: 53, key: '%', code: 'Digit5' },
+    '^': { keyCode: 54, key: '^', code: 'Digit6' },
+    '&': { keyCode: 55, key: '&', code: 'Digit7' },
+    '(': { keyCode: 57, key: '(', code: 'Digit9' },
+    A: { keyCode: 65, key: 'A', code: 'KeyA' },
+    B: { keyCode: 66, key: 'B', code: 'KeyB' },
+    C: { keyCode: 67, key: 'C', code: 'KeyC' },
+    D: { keyCode: 68, key: 'D', code: 'KeyD' },
+    E: { keyCode: 69, key: 'E', code: 'KeyE' },
+    F: { keyCode: 70, key: 'F', code: 'KeyF' },
+    G: { keyCode: 71, key: 'G', code: 'KeyG' },
+    H: { keyCode: 72, key: 'H', code: 'KeyH' },
+    I: { keyCode: 73, key: 'I', code: 'KeyI' },
+    J: { keyCode: 74, key: 'J', code: 'KeyJ' },
+    K: { keyCode: 75, key: 'K', code: 'KeyK' },
+    L: { keyCode: 76, key: 'L', code: 'KeyL' },
+    M: { keyCode: 77, key: 'M', code: 'KeyM' },
+    N: { keyCode: 78, key: 'N', code: 'KeyN' },
+    O: { keyCode: 79, key: 'O', code: 'KeyO' },
+    P: { keyCode: 80, key: 'P', code: 'KeyP' },
+    Q: { keyCode: 81, key: 'Q', code: 'KeyQ' },
+    R: { keyCode: 82, key: 'R', code: 'KeyR' },
+    S: { keyCode: 83, key: 'S', code: 'KeyS' },
+    T: { keyCode: 84, key: 'T', code: 'KeyT' },
+    U: { keyCode: 85, key: 'U', code: 'KeyU' },
+    V: { keyCode: 86, key: 'V', code: 'KeyV' },
+    W: { keyCode: 87, key: 'W', code: 'KeyW' },
+    X: { keyCode: 88, key: 'X', code: 'KeyX' },
+    Y: { keyCode: 89, key: 'Y', code: 'KeyY' },
+    Z: { keyCode: 90, key: 'Z', code: 'KeyZ' },
+    ':': { keyCode: 186, key: ':', code: 'Semicolon' },
+    '<': { keyCode: 188, key: '<', code: 'Comma' },
+    _: { keyCode: 189, key: '_', code: 'Minus' },
+    '>': { keyCode: 190, key: '>', code: 'Period' },
+    '?': { keyCode: 191, key: '?', code: 'Slash' },
+    '~': { keyCode: 192, key: '~', code: 'Backquote' },
+    '{': { keyCode: 219, key: '{', code: 'BracketLeft' },
+    '|': { keyCode: 220, key: '|', code: 'Backslash' },
+    '}': { keyCode: 221, key: '}', code: 'BracketRight' },
+    '"': { keyCode: 222, key: '"', code: 'Quote' },
+    SoftLeft: { key: 'SoftLeft', code: 'SoftLeft', location: 4 },
+    SoftRight: { key: 'SoftRight', code: 'SoftRight', location: 4 },
+    Camera: { keyCode: 44, key: 'Camera', code: 'Camera', location: 4 },
+    Call: { key: 'Call', code: 'Call', location: 4 },
+    EndCall: { keyCode: 95, key: 'EndCall', code: 'EndCall', location: 4 },
+    VolumeDown: {
+        keyCode: 182,
+        key: 'VolumeDown',
+        code: 'VolumeDown',
+        location: 4,
+    },
+    VolumeUp: { keyCode: 183, key: 'VolumeUp', code: 'VolumeUp', location: 4 },
+};
+
+
+/***/ }),
 /* 348 */,
 /* 349 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
@@ -15238,7 +18518,7 @@ function toBuffer(data) {
 }
 
 try {
-  const bufferUtil = __webpack_require__(459);
+  const bufferUtil = __webpack_require__(24);
   const bu = bufferUtil.BufferUtil || bufferUtil;
 
   module.exports = {
@@ -15266,7 +18546,89 @@ try {
 
 
 /***/ }),
-/* 350 */,
+/* 350 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+/**
+ * Copyright 2020 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.SecurityDetails = void 0;
+/**
+ * The SecurityDetails class represents the security details of a
+ * response that was received over a secure connection.
+ *
+ * @public
+ */
+class SecurityDetails {
+    /**
+     * @internal
+     */
+    constructor(securityPayload) {
+        this._subjectName = securityPayload.subjectName;
+        this._issuer = securityPayload.issuer;
+        this._validFrom = securityPayload.validFrom;
+        this._validTo = securityPayload.validTo;
+        this._protocol = securityPayload.protocol;
+        this._sanList = securityPayload.sanList;
+    }
+    /**
+     * @returns The name of the issuer of the certificate.
+     */
+    issuer() {
+        return this._issuer;
+    }
+    /**
+     * @returns {@link https://en.wikipedia.org/wiki/Unix_time | Unix timestamp}
+     * marking the start of the certificate's validity.
+     */
+    validFrom() {
+        return this._validFrom;
+    }
+    /**
+     * @returns {@link https://en.wikipedia.org/wiki/Unix_time | Unix timestamp}
+     * marking the end of the certificate's validity.
+     */
+    validTo() {
+        return this._validTo;
+    }
+    /**
+     * @returns The security protocol being used, e.g. "TLS 1.2".
+     */
+    protocol() {
+        return this._protocol;
+    }
+    /**
+     * @returns The name of the subject to which the certificate was issued.
+     */
+    subjectName() {
+        return this._subjectName;
+    }
+    /**
+     * @returns The list of {@link https://en.wikipedia.org/wiki/Subject_Alternative_Name | subject alternative names (SANs)} of the certificate.
+     */
+    subjectAlternativeNames() {
+        return this._sanList;
+    }
+}
+exports.SecurityDetails = SecurityDetails;
+
+
+/***/ }),
 /* 351 */,
 /* 352 */,
 /* 353 */,
@@ -15962,13 +19324,17 @@ module.exports = bzip2;
 /* 373 */,
 /* 374 */,
 /* 375 */,
-/* 376 */
+/* 376 */,
+/* 377 */,
+/* 378 */,
+/* 379 */,
+/* 380 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
 /**
- * Copyright 2017 Google Inc. All rights reserved.
+ * Copyright 2020 Google Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15982,316 +19348,31 @@ module.exports = bzip2;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.Coverage = void 0;
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const ExecutionContext_1 = __webpack_require__(317);
-/**
- * The Coverage class provides methods to gathers information about parts of
- * JavaScript and CSS that were used by the page.
- *
- * @remarks
- * To output coverage in a form consumable by {@link https://github.com/istanbuljs | Istanbul},
- * see {@link https://github.com/istanbuljs/puppeteer-to-istanbul | puppeteer-to-istanbul}.
- *
- * @example
- * An example of using JavaScript and CSS coverage to get percentage of initially
- * executed code:
- * ```js
- * // Enable both JavaScript and CSS coverage
- * await Promise.all([
- *   page.coverage.startJSCoverage(),
- *   page.coverage.startCSSCoverage()
- * ]);
- * // Navigate to page
- * await page.goto('https://example.com');
- * // Disable both JavaScript and CSS coverage
- * const [jsCoverage, cssCoverage] = await Promise.all([
- *   page.coverage.stopJSCoverage(),
- *   page.coverage.stopCSSCoverage(),
- * ]);
- * let totalBytes = 0;
- * let usedBytes = 0;
- * const coverage = [...jsCoverage, ...cssCoverage];
- * for (const entry of coverage) {
- *   totalBytes += entry.text.length;
- *   for (const range of entry.ranges)
- *     usedBytes += range.end - range.start - 1;
- * }
- * console.log(`Bytes used: ${usedBytes / totalBytes * 100}%`);
- * ```
- * @public
- */
-class Coverage {
-    constructor(client) {
-        this._jsCoverage = new JSCoverage(client);
-        this._cssCoverage = new CSSCoverage(client);
-    }
-    /**
-     * @param options - defaults to
-     * `{ resetOnNavigation : true, reportAnonymousScripts : false }`
-     * @returns Promise that resolves when coverage is started.
-     *
-     * @remarks
-     * Anonymous scripts are ones that don't have an associated url. These are
-     * scripts that are dynamically created on the page using `eval` or
-     * `new Function`. If `reportAnonymousScripts` is set to `true`, anonymous
-     * scripts will have `__puppeteer_evaluation_script__` as their URL.
-     */
-    async startJSCoverage(options = {}) {
-        return await this._jsCoverage.start(options);
-    }
-    /**
-     * @returns Promise that resolves to the array of coverage reports for
-     * all scripts.
-     *
-     * @remarks
-     * JavaScript Coverage doesn't include anonymous scripts by default.
-     * However, scripts with sourceURLs are reported.
-     */
-    async stopJSCoverage() {
-        return await this._jsCoverage.stop();
-    }
-    /**
-     * @param options - defaults to `{ resetOnNavigation : true }`
-     * @returns Promise that resolves when coverage is started.
-     */
-    async startCSSCoverage(options = {}) {
-        return await this._cssCoverage.start(options);
-    }
-    /**
-     * @returns Promise that resolves to the array of coverage reports
-     * for all stylesheets.
-     * @remarks
-     * CSS Coverage doesn't include dynamically injected style tags
-     * without sourceURLs.
-     */
-    async stopCSSCoverage() {
-        return await this._cssCoverage.stop();
-    }
-}
-exports.Coverage = Coverage;
-class JSCoverage {
-    constructor(client) {
-        this._enabled = false;
-        this._scriptURLs = new Map();
-        this._scriptSources = new Map();
-        this._eventListeners = [];
-        this._resetOnNavigation = false;
-        this._reportAnonymousScripts = false;
-        this._client = client;
-    }
-    async start(options = {}) {
-        assert_1.assert(!this._enabled, 'JSCoverage is already enabled');
-        const { resetOnNavigation = true, reportAnonymousScripts = false, } = options;
-        this._resetOnNavigation = resetOnNavigation;
-        this._reportAnonymousScripts = reportAnonymousScripts;
-        this._enabled = true;
-        this._scriptURLs.clear();
-        this._scriptSources.clear();
-        this._eventListeners = [
-            helper_1.helper.addEventListener(this._client, 'Debugger.scriptParsed', this._onScriptParsed.bind(this)),
-            helper_1.helper.addEventListener(this._client, 'Runtime.executionContextsCleared', this._onExecutionContextsCleared.bind(this)),
-        ];
-        await Promise.all([
-            this._client.send('Profiler.enable'),
-            this._client.send('Profiler.startPreciseCoverage', {
-                callCount: false,
-                detailed: true,
-            }),
-            this._client.send('Debugger.enable'),
-            this._client.send('Debugger.setSkipAllPauses', { skip: true }),
-        ]);
-    }
-    _onExecutionContextsCleared() {
-        if (!this._resetOnNavigation)
-            return;
-        this._scriptURLs.clear();
-        this._scriptSources.clear();
-    }
-    async _onScriptParsed(event) {
-        // Ignore puppeteer-injected scripts
-        if (event.url === ExecutionContext_1.EVALUATION_SCRIPT_URL)
-            return;
-        // Ignore other anonymous scripts unless the reportAnonymousScripts option is true.
-        if (!event.url && !this._reportAnonymousScripts)
-            return;
-        try {
-            const response = await this._client.send('Debugger.getScriptSource', {
-                scriptId: event.scriptId,
-            });
-            this._scriptURLs.set(event.scriptId, event.url);
-            this._scriptSources.set(event.scriptId, response.scriptSource);
-        }
-        catch (error) {
-            // This might happen if the page has already navigated away.
-            helper_1.debugError(error);
-        }
-    }
-    async stop() {
-        assert_1.assert(this._enabled, 'JSCoverage is not enabled');
-        this._enabled = false;
-        const result = await Promise.all([
-            this._client.send('Profiler.takePreciseCoverage'),
-            this._client.send('Profiler.stopPreciseCoverage'),
-            this._client.send('Profiler.disable'),
-            this._client.send('Debugger.disable'),
-        ]);
-        helper_1.helper.removeEventListeners(this._eventListeners);
-        const coverage = [];
-        const profileResponse = result[0];
-        for (const entry of profileResponse.result) {
-            let url = this._scriptURLs.get(entry.scriptId);
-            if (!url && this._reportAnonymousScripts)
-                url = 'debugger://VM' + entry.scriptId;
-            const text = this._scriptSources.get(entry.scriptId);
-            if (text === undefined || url === undefined)
-                continue;
-            const flattenRanges = [];
-            for (const func of entry.functions)
-                flattenRanges.push(...func.ranges);
-            const ranges = convertToDisjointRanges(flattenRanges);
-            coverage.push({ url, ranges, text });
-        }
-        return coverage;
-    }
-}
-class CSSCoverage {
-    constructor(client) {
-        this._enabled = false;
-        this._stylesheetURLs = new Map();
-        this._stylesheetSources = new Map();
-        this._eventListeners = [];
-        this._resetOnNavigation = false;
-        this._reportAnonymousScripts = false;
-        this._client = client;
-    }
-    async start(options = {}) {
-        assert_1.assert(!this._enabled, 'CSSCoverage is already enabled');
-        const { resetOnNavigation = true } = options;
-        this._resetOnNavigation = resetOnNavigation;
-        this._enabled = true;
-        this._stylesheetURLs.clear();
-        this._stylesheetSources.clear();
-        this._eventListeners = [
-            helper_1.helper.addEventListener(this._client, 'CSS.styleSheetAdded', this._onStyleSheet.bind(this)),
-            helper_1.helper.addEventListener(this._client, 'Runtime.executionContextsCleared', this._onExecutionContextsCleared.bind(this)),
-        ];
-        await Promise.all([
-            this._client.send('DOM.enable'),
-            this._client.send('CSS.enable'),
-            this._client.send('CSS.startRuleUsageTracking'),
-        ]);
-    }
-    _onExecutionContextsCleared() {
-        if (!this._resetOnNavigation)
-            return;
-        this._stylesheetURLs.clear();
-        this._stylesheetSources.clear();
-    }
-    async _onStyleSheet(event) {
-        const header = event.header;
-        // Ignore anonymous scripts
-        if (!header.sourceURL)
-            return;
-        try {
-            const response = await this._client.send('CSS.getStyleSheetText', {
-                styleSheetId: header.styleSheetId,
-            });
-            this._stylesheetURLs.set(header.styleSheetId, header.sourceURL);
-            this._stylesheetSources.set(header.styleSheetId, response.text);
-        }
-        catch (error) {
-            // This might happen if the page has already navigated away.
-            helper_1.debugError(error);
-        }
-    }
-    async stop() {
-        assert_1.assert(this._enabled, 'CSSCoverage is not enabled');
-        this._enabled = false;
-        const ruleTrackingResponse = await this._client.send('CSS.stopRuleUsageTracking');
-        await Promise.all([
-            this._client.send('CSS.disable'),
-            this._client.send('DOM.disable'),
-        ]);
-        helper_1.helper.removeEventListeners(this._eventListeners);
-        // aggregate by styleSheetId
-        const styleSheetIdToCoverage = new Map();
-        for (const entry of ruleTrackingResponse.ruleUsage) {
-            let ranges = styleSheetIdToCoverage.get(entry.styleSheetId);
-            if (!ranges) {
-                ranges = [];
-                styleSheetIdToCoverage.set(entry.styleSheetId, ranges);
-            }
-            ranges.push({
-                startOffset: entry.startOffset,
-                endOffset: entry.endOffset,
-                count: entry.used ? 1 : 0,
-            });
-        }
-        const coverage = [];
-        for (const styleSheetId of this._stylesheetURLs.keys()) {
-            const url = this._stylesheetURLs.get(styleSheetId);
-            const text = this._stylesheetSources.get(styleSheetId);
-            const ranges = convertToDisjointRanges(styleSheetIdToCoverage.get(styleSheetId) || []);
-            coverage.push({ url, ranges, text });
-        }
-        return coverage;
-    }
-}
-function convertToDisjointRanges(nestedRanges) {
-    const points = [];
-    for (const range of nestedRanges) {
-        points.push({ offset: range.startOffset, type: 0, range });
-        points.push({ offset: range.endOffset, type: 1, range });
-    }
-    // Sort points to form a valid parenthesis sequence.
-    points.sort((a, b) => {
-        // Sort with increasing offsets.
-        if (a.offset !== b.offset)
-            return a.offset - b.offset;
-        // All "end" points should go before "start" points.
-        if (a.type !== b.type)
-            return b.type - a.type;
-        const aLength = a.range.endOffset - a.range.startOffset;
-        const bLength = b.range.endOffset - b.range.startOffset;
-        // For two "start" points, the one with longer range goes first.
-        if (a.type === 0)
-            return bLength - aLength;
-        // For two "end" points, the one with shorter range goes first.
-        return aLength - bLength;
-    });
-    const hitCountStack = [];
-    const results = [];
-    let lastOffset = 0;
-    // Run scanning line to intersect all ranges.
-    for (const point of points) {
-        if (hitCountStack.length &&
-            lastOffset < point.offset &&
-            hitCountStack[hitCountStack.length - 1] > 0) {
-            const lastResult = results.length ? results[results.length - 1] : null;
-            if (lastResult && lastResult.end === lastOffset)
-                lastResult.end = point.offset;
-            else
-                results.push({ start: lastOffset, end: point.offset });
-        }
-        lastOffset = point.offset;
-        if (point.type === 0)
-            hitCountStack.push(point.range.count);
-        else
-            hitCountStack.pop();
-    }
-    // Filter out empty ranges.
-    return results.filter((range) => range.end - range.start > 1);
-}
+exports.initializePuppeteer = void 0;
+const Puppeteer_js_1 = __webpack_require__(285);
+const revisions_js_1 = __webpack_require__(88);
+const pkg_dir_1 = __importDefault(__webpack_require__(474));
+exports.initializePuppeteer = (packageName) => {
+    const puppeteerRootDirectory = pkg_dir_1.default.sync(__dirname);
+    let preferredRevision = revisions_js_1.PUPPETEER_REVISIONS.chromium;
+    const isPuppeteerCore = packageName === 'puppeteer-core';
+    // puppeteer-core ignores environment variables
+    const product = isPuppeteerCore
+        ? undefined
+        : process.env.PUPPETEER_PRODUCT ||
+            process.env.npm_config_puppeteer_product ||
+            process.env.npm_package_config_puppeteer_product;
+    if (!isPuppeteerCore && product === 'firefox')
+        preferredRevision = revisions_js_1.PUPPETEER_REVISIONS.firefox;
+    return new Puppeteer_js_1.Puppeteer(puppeteerRootDirectory, preferredRevision, isPuppeteerCore, product);
+};
 
 
 /***/ }),
-/* 377 */,
-/* 378 */,
-/* 379 */,
-/* 380 */,
 /* 381 */,
 /* 382 */,
 /* 383 */
@@ -16304,7 +19385,7 @@ var alloc = Buffer.alloc
 
 var Readable = __webpack_require__(574).Readable
 var Writable = __webpack_require__(574).Writable
-var StringDecoder = __webpack_require__(36).StringDecoder
+var StringDecoder = __webpack_require__(304).StringDecoder
 
 var headers = __webpack_require__(154)
 
@@ -16999,1149 +20080,12 @@ exports.pack = __webpack_require__(383)
 /* 395 */,
 /* 396 */,
 /* 397 */,
-/* 398 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Page = void 0;
-const fs = __importStar(__webpack_require__(747));
-const util_1 = __webpack_require__(669);
-const EventEmitter_1 = __webpack_require__(304);
-const mime = __importStar(__webpack_require__(444));
-const Events_1 = __webpack_require__(872);
-const Connection_1 = __webpack_require__(433);
-const Dialog_1 = __webpack_require__(476);
-const EmulationManager_1 = __webpack_require__(57);
-const FrameManager_1 = __webpack_require__(32);
-const Input_1 = __webpack_require__(966);
-const Tracing_1 = __webpack_require__(329);
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const Coverage_1 = __webpack_require__(376);
-const WebWorker_1 = __webpack_require__(10);
-const JSHandle_1 = __webpack_require__(661);
-const Accessibility_1 = __webpack_require__(662);
-const TimeoutSettings_1 = __webpack_require__(935);
-const FileChooser_1 = __webpack_require__(829);
-const ConsoleMessage_1 = __webpack_require__(976);
-const writeFileAsync = util_1.promisify(fs.writeFile);
-const paperFormats = {
-    letter: { width: 8.5, height: 11 },
-    legal: { width: 8.5, height: 14 },
-    tabloid: { width: 11, height: 17 },
-    ledger: { width: 17, height: 11 },
-    a0: { width: 33.1, height: 46.8 },
-    a1: { width: 23.4, height: 33.1 },
-    a2: { width: 16.54, height: 23.4 },
-    a3: { width: 11.7, height: 16.54 },
-    a4: { width: 8.27, height: 11.7 },
-    a5: { width: 5.83, height: 8.27 },
-    a6: { width: 4.13, height: 5.83 },
-};
-class ScreenshotTaskQueue {
-    constructor() {
-        this._chain = Promise.resolve(undefined);
-    }
-    postTask(task) {
-        const result = this._chain.then(task);
-        this._chain = result.catch(() => { });
-        return result;
-    }
-}
-/**
- * Page provides methods to interact with a single tab or [extension background
- * page](https://developer.chrome.com/extensions/background_pages) in Chromium.
- * One [Browser] instance might have multiple [Page] instances.
- *
- * @remarks
- *
- * @example
- * This example creates a page, navigates it to a URL, and then * saves a screenshot:
- * ```js
- * const puppeteer = require('puppeteer');
- *
- * (async () => {
- *   const browser = await puppeteer.launch();
- *   const page = await browser.newPage();
- *   await page.goto('https://example.com');
- *   await page.screenshot({path: 'screenshot.png'});
- *   await browser.close();
- * })();
- * ```
- *
- * The Page class extends from Puppeteer's {@link EventEmitter } class and will
- * emit various events which are documented in the {@link PageEmittedEvents} enum.
- *
- * @example
- * This example logs a message for a single page `load` event:
- * ```js
- * page.once('load', () => console.log('Page loaded!'));
- * ```
- *
- * To unsubscribe from events use the `off` method:
- *
- * ```js
- * function logRequest(interceptedRequest) {
- *   console.log('A request was made:', interceptedRequest.url());
- * }
- * page.on('request', logRequest);
- * // Sometime later...
- * page.off('request', logRequest);
- * ```
- * @public
- */
-class Page extends EventEmitter_1.EventEmitter {
-    /**
-     * @internal
-     */
-    constructor(client, target, ignoreHTTPSErrors) {
-        super();
-        this._closed = false;
-        this._timeoutSettings = new TimeoutSettings_1.TimeoutSettings();
-        this._pageBindings = new Map();
-        this._javascriptEnabled = true;
-        this._workers = new Map();
-        // TODO: improve this typedef - it's a function that takes a file chooser or
-        // something?
-        this._fileChooserInterceptors = new Set();
-        this._client = client;
-        this._target = target;
-        this._keyboard = new Input_1.Keyboard(client);
-        this._mouse = new Input_1.Mouse(client, this._keyboard);
-        this._touchscreen = new Input_1.Touchscreen(client, this._keyboard);
-        this._accessibility = new Accessibility_1.Accessibility(client);
-        this._frameManager = new FrameManager_1.FrameManager(client, this, ignoreHTTPSErrors, this._timeoutSettings);
-        this._emulationManager = new EmulationManager_1.EmulationManager(client);
-        this._tracing = new Tracing_1.Tracing(client);
-        this._coverage = new Coverage_1.Coverage(client);
-        this._screenshotTaskQueue = new ScreenshotTaskQueue();
-        this._viewport = null;
-        client.on('Target.attachedToTarget', (event) => {
-            if (event.targetInfo.type !== 'worker') {
-                // If we don't detach from service workers, they will never die.
-                client
-                    .send('Target.detachFromTarget', {
-                    sessionId: event.sessionId,
-                })
-                    .catch(helper_1.debugError);
-                return;
-            }
-            const session = Connection_1.Connection.fromSession(client).session(event.sessionId);
-            const worker = new WebWorker_1.WebWorker(session, event.targetInfo.url, this._addConsoleMessage.bind(this), this._handleException.bind(this));
-            this._workers.set(event.sessionId, worker);
-            this.emit("workercreated" /* WorkerCreated */, worker);
-        });
-        client.on('Target.detachedFromTarget', (event) => {
-            const worker = this._workers.get(event.sessionId);
-            if (!worker)
-                return;
-            this.emit(Events_1.Events.Page.WorkerDestroyed, worker);
-            this._workers.delete(event.sessionId);
-        });
-        this._frameManager.on(Events_1.Events.FrameManager.FrameAttached, (event) => this.emit(Events_1.Events.Page.FrameAttached, event));
-        this._frameManager.on(Events_1.Events.FrameManager.FrameDetached, (event) => this.emit(Events_1.Events.Page.FrameDetached, event));
-        this._frameManager.on(Events_1.Events.FrameManager.FrameNavigated, (event) => this.emit(Events_1.Events.Page.FrameNavigated, event));
-        const networkManager = this._frameManager.networkManager();
-        networkManager.on(Events_1.Events.NetworkManager.Request, (event) => this.emit(Events_1.Events.Page.Request, event));
-        networkManager.on(Events_1.Events.NetworkManager.Response, (event) => this.emit(Events_1.Events.Page.Response, event));
-        networkManager.on(Events_1.Events.NetworkManager.RequestFailed, (event) => this.emit(Events_1.Events.Page.RequestFailed, event));
-        networkManager.on(Events_1.Events.NetworkManager.RequestFinished, (event) => this.emit(Events_1.Events.Page.RequestFinished, event));
-        this._fileChooserInterceptors = new Set();
-        client.on('Page.domContentEventFired', () => this.emit(Events_1.Events.Page.DOMContentLoaded));
-        client.on('Page.loadEventFired', () => this.emit(Events_1.Events.Page.Load));
-        client.on('Runtime.consoleAPICalled', (event) => this._onConsoleAPI(event));
-        client.on('Runtime.bindingCalled', (event) => this._onBindingCalled(event));
-        client.on('Page.javascriptDialogOpening', (event) => this._onDialog(event));
-        client.on('Runtime.exceptionThrown', (exception) => this._handleException(exception.exceptionDetails));
-        client.on('Inspector.targetCrashed', () => this._onTargetCrashed());
-        client.on('Performance.metrics', (event) => this._emitMetrics(event));
-        client.on('Log.entryAdded', (event) => this._onLogEntryAdded(event));
-        client.on('Page.fileChooserOpened', (event) => this._onFileChooser(event));
-        this._target._isClosedPromise.then(() => {
-            this.emit(Events_1.Events.Page.Close);
-            this._closed = true;
-        });
-    }
-    /**
-     * @internal
-     */
-    static async create(client, target, ignoreHTTPSErrors, defaultViewport) {
-        const page = new Page(client, target, ignoreHTTPSErrors);
-        await page._initialize();
-        if (defaultViewport)
-            await page.setViewport(defaultViewport);
-        return page;
-    }
-    async _initialize() {
-        await Promise.all([
-            this._frameManager.initialize(),
-            this._client.send('Target.setAutoAttach', {
-                autoAttach: true,
-                waitForDebuggerOnStart: false,
-                flatten: true,
-            }),
-            this._client.send('Performance.enable', {}),
-            this._client.send('Log.enable', {}),
-        ]);
-    }
-    async _onFileChooser(event) {
-        if (!this._fileChooserInterceptors.size)
-            return;
-        const frame = this._frameManager.frame(event.frameId);
-        const context = await frame.executionContext();
-        const element = await context._adoptBackendNodeId(event.backendNodeId);
-        const interceptors = Array.from(this._fileChooserInterceptors);
-        this._fileChooserInterceptors.clear();
-        const fileChooser = new FileChooser_1.FileChooser(element, event);
-        for (const interceptor of interceptors)
-            interceptor.call(null, fileChooser);
-    }
-    /**
-     * @returns `true` if the page has JavaScript enabled, `false` otherwise.
-     */
-    isJavaScriptEnabled() {
-        return this._javascriptEnabled;
-    }
-    /**
-     * @param options - Optional waiting parameters
-     * @returns Resolves after a page requests a file picker.
-     */
-    async waitForFileChooser(options = {}) {
-        if (!this._fileChooserInterceptors.size)
-            await this._client.send('Page.setInterceptFileChooserDialog', {
-                enabled: true,
-            });
-        const { timeout = this._timeoutSettings.timeout() } = options;
-        let callback;
-        const promise = new Promise((x) => (callback = x));
-        this._fileChooserInterceptors.add(callback);
-        return helper_1.helper
-            .waitWithTimeout(promise, 'waiting for file chooser', timeout)
-            .catch((error) => {
-            this._fileChooserInterceptors.delete(callback);
-            throw error;
-        });
-    }
-    /**
-     * Sets the page's geolocation.
-     *
-     * @remarks
-     * Consider using {@link BrowserContext.overridePermissions} to grant
-     * permissions for the page to read its geolocation.
-     *
-     * @example
-     * ```js
-     * await page.setGeolocation({latitude: 59.95, longitude: 30.31667});
-     * ```
-     */
-    async setGeolocation(options) {
-        const { longitude, latitude, accuracy = 0 } = options;
-        if (longitude < -180 || longitude > 180)
-            throw new Error(`Invalid longitude "${longitude}": precondition -180 <= LONGITUDE <= 180 failed.`);
-        if (latitude < -90 || latitude > 90)
-            throw new Error(`Invalid latitude "${latitude}": precondition -90 <= LATITUDE <= 90 failed.`);
-        if (accuracy < 0)
-            throw new Error(`Invalid accuracy "${accuracy}": precondition 0 <= ACCURACY failed.`);
-        await this._client.send('Emulation.setGeolocationOverride', {
-            longitude,
-            latitude,
-            accuracy,
-        });
-    }
-    /**
-     * @returns A target this page was created from.
-     */
-    target() {
-        return this._target;
-    }
-    /**
-     * @returns The browser this page belongs to.
-     */
-    browser() {
-        return this._target.browser();
-    }
-    /**
-     * @returns The browser context that the page belongs to
-     */
-    browserContext() {
-        return this._target.browserContext();
-    }
-    _onTargetCrashed() {
-        this.emit('error', new Error('Page crashed!'));
-    }
-    _onLogEntryAdded(event) {
-        const { level, text, args, source, url, lineNumber } = event.entry;
-        if (args)
-            args.map((arg) => helper_1.helper.releaseObject(this._client, arg));
-        if (source !== 'worker')
-            this.emit(Events_1.Events.Page.Console, new ConsoleMessage_1.ConsoleMessage(level, text, [], { url, lineNumber }));
-    }
-    /**
-     * @returns The page's main frame.
-     */
-    mainFrame() {
-        return this._frameManager.mainFrame();
-    }
-    get keyboard() {
-        return this._keyboard;
-    }
-    get touchscreen() {
-        return this._touchscreen;
-    }
-    get coverage() {
-        return this._coverage;
-    }
-    get tracing() {
-        return this._tracing;
-    }
-    get accessibility() {
-        return this._accessibility;
-    }
-    /**
-     * @returns An array of all frames attached to the page.
-     */
-    frames() {
-        return this._frameManager.frames();
-    }
-    /**
-     * @returns all of the dedicated
-     * {@link https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API | WebWorkers}
-     * associated with the page.
-     */
-    workers() {
-        return Array.from(this._workers.values());
-    }
-    /**
-     * @param value - Whether to enable request interception.
-     *
-     * @remarks
-     * Activating request interception enables {@link HTTPRequest.abort},
-     * {@link HTTPRequest.continue} and {@link HTTPRequest.respond} methods.  This
-     * provides the capability to modify network requests that are made by a page.
-     *
-     * Once request interception is enabled, every request will stall unless it's
-     * continued, responded or aborted.
-     *
-     * **NOTE** Enabling request interception disables page caching.
-     *
-     * @example
-     * An example of a naïve request interceptor that aborts all image requests:
-     * ```js
-     * const puppeteer = require('puppeteer');
-     * (async () => {
-     *   const browser = await puppeteer.launch();
-     *   const page = await browser.newPage();
-     *   await page.setRequestInterception(true);
-     *   page.on('request', interceptedRequest => {
-     *     if (interceptedRequest.url().endsWith('.png') ||
-     *         interceptedRequest.url().endsWith('.jpg'))
-     *       interceptedRequest.abort();
-     *     else
-     *       interceptedRequest.continue();
-     *     });
-     *   await page.goto('https://example.com');
-     *   await browser.close();
-     * })();
-     * ```
-     */
-    async setRequestInterception(value) {
-        return this._frameManager.networkManager().setRequestInterception(value);
-    }
-    /**
-     * @param enabled - When `true`, enables offline mode for the page.
-     */
-    setOfflineMode(enabled) {
-        return this._frameManager.networkManager().setOfflineMode(enabled);
-    }
-    /**
-     * @param timeout - Maximum navigation time in milliseconds.
-     */
-    setDefaultNavigationTimeout(timeout) {
-        this._timeoutSettings.setDefaultNavigationTimeout(timeout);
-    }
-    /**
-     * @param timeout - Maximum time in milliseconds.
-     */
-    setDefaultTimeout(timeout) {
-        this._timeoutSettings.setDefaultTimeout(timeout);
-    }
-    /**
-     * Runs `document.querySelector` within the page. If no element matches the
-     * selector, the return value resolves to `null`.
-     *
-     * @remarks
-     * Shortcut for {@link Frame.$ | Page.mainFrame().$(selector) }.
-     *
-     * @param selector - A
-     * {@link https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_Selectors | selector}
-     * to query page for.
-     */
-    async $(selector) {
-        return this.mainFrame().$(selector);
-    }
-    /**
-     * @remarks
-     *
-     * The only difference between {@link Page.evaluate | page.evaluate} and
-     * `page.evaluateHandle` is that `evaluateHandle` will return the value
-     * wrapped in an in-page object.
-     *
-     * If the function passed to `page.evaluteHandle` returns a Promise, the
-     * function will wait for the promise to resolve and return its value.
-     *
-     * You can pass a string instead of a function (although functions are
-     * recommended as they are easier to debug and use with TypeScript):
-     *
-     * @example
-     * ```
-     * const aHandle = await page.evaluateHandle('document')
-     * ```
-     *
-     * @example
-     * {@link JSHandle} instances can be passed as arguments to the `pageFunction`:
-     * ```
-     * const aHandle = await page.evaluateHandle(() => document.body);
-     * const resultHandle = await page.evaluateHandle(body => body.innerHTML, aHandle);
-     * console.log(await resultHandle.jsonValue());
-     * await resultHandle.dispose();
-     * ```
-     *
-     * Most of the time this function returns a {@link JSHandle},
-     * but if `pageFunction` returns a reference to an element,
-     * you instead get an {@link ElementHandle} back:
-     *
-     * @example
-     * ```
-     * const button = await page.evaluateHandle(() => document.querySelector('button'));
-     * // can call `click` because `button` is an `ElementHandle`
-     * await button.click();
-     * ```
-     *
-     * The TypeScript definitions assume that `evaluateHandle` returns
-     *  a `JSHandle`, but if you know it's going to return an
-     * `ElementHandle`, pass it as the generic argument:
-     *
-     * ```
-     * const button = await page.evaluateHandle<ElementHandle>(...);
-     * ```
-     *
-     * @param pageFunction - a function that is run within the page
-     * @param args - arguments to be passed to the pageFunction
-     */
-    async evaluateHandle(pageFunction, ...args) {
-        const context = await this.mainFrame().executionContext();
-        return context.evaluateHandle(pageFunction, ...args);
-    }
-    async queryObjects(prototypeHandle) {
-        const context = await this.mainFrame().executionContext();
-        return context.queryObjects(prototypeHandle);
-    }
-    /**
-     * This method runs `document.querySelector` within the page and passes the
-     * result as the first argument to the `pageFunction`.
-     *
-     * @remarks
-     *
-     * If no element is found matching `selector`, the method will throw an error.
-     *
-     * If `pageFunction` returns a promise `$eval` will wait for the promise to
-     * resolve and then return its value.
-     *
-     * @example
-     *
-     * ```
-     * const searchValue = await page.$eval('#search', el => el.value);
-     * const preloadHref = await page.$eval('link[rel=preload]', el => el.href);
-     * const html = await page.$eval('.main-container', el => el.outerHTML);
-     * ```
-     *
-     * If you are using TypeScript, you may have to provide an explicit type to the
-     * first argument of the `pageFunction`.
-     * By default it is typed as `Element`, but you may need to provide a more
-     * specific sub-type:
-     *
-     * @example
-     *
-     * ```
-     * // if you don't provide HTMLInputElement here, TS will error
-     * // as `value` is not on `Element`
-     * const searchValue = await page.$eval('#search', (el: HTMLInputElement) => el.value);
-     * ```
-     *
-     * The compiler should be able to infer the return type
-     * from the `pageFunction` you provide. If it is unable to, you can use the generic
-     * type to tell the compiler what return type you expect from `$eval`:
-     *
-     * @example
-     *
-     * ```
-     * // The compiler can infer the return type in this case, but if it can't
-     * // or if you want to be more explicit, provide it as the generic type.
-     * const searchValue = await page.$eval<string>(
-     *  '#search', (el: HTMLInputElement) => el.value
-     * );
-     * ```
-     *
-     * @param selector the
-     * {@link https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_Selectors | selector}
-     * to query for
-     * @param pageFunction the function to be evaluated in the page context. Will
-     * be passed the result of `document.querySelector(selector)` as its first
-     * argument.
-     * @param args any additional arguments to pass through to `pageFunction`.
-     *
-     * @returns The result of calling `pageFunction`. If it returns an element it
-     * is wrapped in an {@link ElementHandle}, else the raw value itself is
-     * returned.
-     */
-    async $eval(selector, pageFunction, ...args) {
-        return this.mainFrame().$eval(selector, pageFunction, ...args);
-    }
-    async $$eval(selector, pageFunction, ...args) {
-        return this.mainFrame().$$eval(selector, pageFunction, ...args);
-    }
-    async $$(selector) {
-        return this.mainFrame().$$(selector);
-    }
-    async $x(expression) {
-        return this.mainFrame().$x(expression);
-    }
-    async cookies(...urls) {
-        const originalCookies = (await this._client.send('Network.getCookies', {
-            urls: urls.length ? urls : [this.url()],
-        })).cookies;
-        const unsupportedCookieAttributes = ['priority'];
-        const filterUnsupportedAttributes = (cookie) => {
-            for (const attr of unsupportedCookieAttributes)
-                delete cookie[attr];
-            return cookie;
-        };
-        return originalCookies.map(filterUnsupportedAttributes);
-    }
-    async deleteCookie(...cookies) {
-        const pageURL = this.url();
-        for (const cookie of cookies) {
-            const item = Object.assign({}, cookie);
-            if (!cookie.url && pageURL.startsWith('http'))
-                item.url = pageURL;
-            await this._client.send('Network.deleteCookies', item);
-        }
-    }
-    async setCookie(...cookies) {
-        const pageURL = this.url();
-        const startsWithHTTP = pageURL.startsWith('http');
-        const items = cookies.map((cookie) => {
-            const item = Object.assign({}, cookie);
-            if (!item.url && startsWithHTTP)
-                item.url = pageURL;
-            assert_1.assert(item.url !== 'about:blank', `Blank page can not have cookie "${item.name}"`);
-            assert_1.assert(!String.prototype.startsWith.call(item.url || '', 'data:'), `Data URL page can not have cookie "${item.name}"`);
-            return item;
-        });
-        await this.deleteCookie(...items);
-        if (items.length)
-            await this._client.send('Network.setCookies', { cookies: items });
-    }
-    async addScriptTag(options) {
-        return this.mainFrame().addScriptTag(options);
-    }
-    async addStyleTag(options) {
-        return this.mainFrame().addStyleTag(options);
-    }
-    async exposeFunction(name, puppeteerFunction) {
-        if (this._pageBindings.has(name))
-            throw new Error(`Failed to add page binding with name ${name}: window['${name}'] already exists!`);
-        this._pageBindings.set(name, puppeteerFunction);
-        const expression = helper_1.helper.evaluationString(addPageBinding, name);
-        await this._client.send('Runtime.addBinding', { name: name });
-        await this._client.send('Page.addScriptToEvaluateOnNewDocument', {
-            source: expression,
-        });
-        await Promise.all(this.frames().map((frame) => frame.evaluate(expression).catch(helper_1.debugError)));
-        function addPageBinding(bindingName) {
-            /* Cast window to any here as we're about to add properties to it
-             * via win[bindingName] which TypeScript doesn't like.
-             */
-            const win = window;
-            const binding = win[bindingName];
-            win[bindingName] = (...args) => {
-                const me = window[bindingName];
-                let callbacks = me['callbacks'];
-                if (!callbacks) {
-                    callbacks = new Map();
-                    me['callbacks'] = callbacks;
-                }
-                const seq = (me['lastSeq'] || 0) + 1;
-                me['lastSeq'] = seq;
-                const promise = new Promise((resolve, reject) => callbacks.set(seq, { resolve, reject }));
-                binding(JSON.stringify({ name: bindingName, seq, args }));
-                return promise;
-            };
-        }
-    }
-    async authenticate(credentials) {
-        return this._frameManager.networkManager().authenticate(credentials);
-    }
-    async setExtraHTTPHeaders(headers) {
-        return this._frameManager.networkManager().setExtraHTTPHeaders(headers);
-    }
-    async setUserAgent(userAgent) {
-        return this._frameManager.networkManager().setUserAgent(userAgent);
-    }
-    async metrics() {
-        const response = await this._client.send('Performance.getMetrics');
-        return this._buildMetricsObject(response.metrics);
-    }
-    _emitMetrics(event) {
-        this.emit(Events_1.Events.Page.Metrics, {
-            title: event.title,
-            metrics: this._buildMetricsObject(event.metrics),
-        });
-    }
-    _buildMetricsObject(metrics) {
-        const result = {};
-        for (const metric of metrics || []) {
-            if (supportedMetrics.has(metric.name))
-                result[metric.name] = metric.value;
-        }
-        return result;
-    }
-    _handleException(exceptionDetails) {
-        const message = helper_1.helper.getExceptionMessage(exceptionDetails);
-        const err = new Error(message);
-        err.stack = ''; // Don't report clientside error with a node stack attached
-        this.emit(Events_1.Events.Page.PageError, err);
-    }
-    async _onConsoleAPI(event) {
-        if (event.executionContextId === 0) {
-            // DevTools protocol stores the last 1000 console messages. These
-            // messages are always reported even for removed execution contexts. In
-            // this case, they are marked with executionContextId = 0 and are
-            // reported upon enabling Runtime agent.
-            //
-            // Ignore these messages since:
-            // - there's no execution context we can use to operate with message
-            //   arguments
-            // - these messages are reported before Puppeteer clients can subscribe
-            //   to the 'console'
-            //   page event.
-            //
-            // @see https://github.com/puppeteer/puppeteer/issues/3865
-            return;
-        }
-        const context = this._frameManager.executionContextById(event.executionContextId);
-        const values = event.args.map((arg) => JSHandle_1.createJSHandle(context, arg));
-        this._addConsoleMessage(event.type, values, event.stackTrace);
-    }
-    async _onBindingCalled(event) {
-        const { name, seq, args } = JSON.parse(event.payload);
-        let expression = null;
-        try {
-            const result = await this._pageBindings.get(name)(...args);
-            expression = helper_1.helper.evaluationString(deliverResult, name, seq, result);
-        }
-        catch (error) {
-            if (error instanceof Error)
-                expression = helper_1.helper.evaluationString(deliverError, name, seq, error.message, error.stack);
-            else
-                expression = helper_1.helper.evaluationString(deliverErrorValue, name, seq, error);
-        }
-        this._client
-            .send('Runtime.evaluate', {
-            expression,
-            contextId: event.executionContextId,
-        })
-            .catch(helper_1.debugError);
-        function deliverResult(name, seq, result) {
-            window[name]['callbacks'].get(seq).resolve(result);
-            window[name]['callbacks'].delete(seq);
-        }
-        function deliverError(name, seq, message, stack) {
-            const error = new Error(message);
-            error.stack = stack;
-            window[name]['callbacks'].get(seq).reject(error);
-            window[name]['callbacks'].delete(seq);
-        }
-        function deliverErrorValue(name, seq, value) {
-            window[name]['callbacks'].get(seq).reject(value);
-            window[name]['callbacks'].delete(seq);
-        }
-    }
-    _addConsoleMessage(type, args, stackTrace) {
-        if (!this.listenerCount(Events_1.Events.Page.Console)) {
-            args.forEach((arg) => arg.dispose());
-            return;
-        }
-        const textTokens = [];
-        for (const arg of args) {
-            const remoteObject = arg._remoteObject;
-            if (remoteObject.objectId)
-                textTokens.push(arg.toString());
-            else
-                textTokens.push(helper_1.helper.valueFromRemoteObject(remoteObject));
-        }
-        const location = stackTrace && stackTrace.callFrames.length
-            ? {
-                url: stackTrace.callFrames[0].url,
-                lineNumber: stackTrace.callFrames[0].lineNumber,
-                columnNumber: stackTrace.callFrames[0].columnNumber,
-            }
-            : {};
-        const message = new ConsoleMessage_1.ConsoleMessage(type, textTokens.join(' '), args, location);
-        this.emit(Events_1.Events.Page.Console, message);
-    }
-    _onDialog(event) {
-        let dialogType = null;
-        const validDialogTypes = new Set([
-            'alert',
-            'confirm',
-            'prompt',
-            'beforeunload',
-        ]);
-        if (validDialogTypes.has(event.type)) {
-            dialogType = event.type;
-        }
-        assert_1.assert(dialogType, 'Unknown javascript dialog type: ' + event.type);
-        const dialog = new Dialog_1.Dialog(this._client, dialogType, event.message, event.defaultPrompt);
-        this.emit(Events_1.Events.Page.Dialog, dialog);
-    }
-    url() {
-        return this.mainFrame().url();
-    }
-    async content() {
-        return await this._frameManager.mainFrame().content();
-    }
-    async setContent(html, options = {}) {
-        await this._frameManager.mainFrame().setContent(html, options);
-    }
-    async goto(url, options = {}) {
-        return await this._frameManager.mainFrame().goto(url, options);
-    }
-    async reload(options) {
-        const result = await Promise.all([this.waitForNavigation(options), this._client.send('Page.reload')]);
-        return result[0];
-    }
-    async waitForNavigation(options = {}) {
-        return await this._frameManager.mainFrame().waitForNavigation(options);
-    }
-    _sessionClosePromise() {
-        if (!this._disconnectPromise)
-            this._disconnectPromise = new Promise((fulfill) => this._client.once(Events_1.Events.CDPSession.Disconnected, () => fulfill(new Error('Target closed'))));
-        return this._disconnectPromise;
-    }
-    async waitForRequest(urlOrPredicate, options = {}) {
-        const { timeout = this._timeoutSettings.timeout() } = options;
-        return helper_1.helper.waitForEvent(this._frameManager.networkManager(), Events_1.Events.NetworkManager.Request, (request) => {
-            if (helper_1.helper.isString(urlOrPredicate))
-                return urlOrPredicate === request.url();
-            if (typeof urlOrPredicate === 'function')
-                return !!urlOrPredicate(request);
-            return false;
-        }, timeout, this._sessionClosePromise());
-    }
-    async waitForResponse(urlOrPredicate, options = {}) {
-        const { timeout = this._timeoutSettings.timeout() } = options;
-        return helper_1.helper.waitForEvent(this._frameManager.networkManager(), Events_1.Events.NetworkManager.Response, (response) => {
-            if (helper_1.helper.isString(urlOrPredicate))
-                return urlOrPredicate === response.url();
-            if (typeof urlOrPredicate === 'function')
-                return !!urlOrPredicate(response);
-            return false;
-        }, timeout, this._sessionClosePromise());
-    }
-    async goBack(options = {}) {
-        return this._go(-1, options);
-    }
-    async goForward(options = {}) {
-        return this._go(+1, options);
-    }
-    async _go(delta, options) {
-        const history = await this._client.send('Page.getNavigationHistory');
-        const entry = history.entries[history.currentIndex + delta];
-        if (!entry)
-            return null;
-        const result = await Promise.all([
-            this.waitForNavigation(options),
-            this._client.send('Page.navigateToHistoryEntry', { entryId: entry.id }),
-        ]);
-        return result[0];
-    }
-    async bringToFront() {
-        await this._client.send('Page.bringToFront');
-    }
-    async emulate(options) {
-        await Promise.all([
-            this.setViewport(options.viewport),
-            this.setUserAgent(options.userAgent),
-        ]);
-    }
-    async setJavaScriptEnabled(enabled) {
-        if (this._javascriptEnabled === enabled)
-            return;
-        this._javascriptEnabled = enabled;
-        await this._client.send('Emulation.setScriptExecutionDisabled', {
-            value: !enabled,
-        });
-    }
-    async setBypassCSP(enabled) {
-        await this._client.send('Page.setBypassCSP', { enabled });
-    }
-    async emulateMediaType(type) {
-        assert_1.assert(type === 'screen' || type === 'print' || type === null, 'Unsupported media type: ' + type);
-        await this._client.send('Emulation.setEmulatedMedia', {
-            media: type || '',
-        });
-    }
-    async emulateMediaFeatures(features) {
-        if (features === null)
-            await this._client.send('Emulation.setEmulatedMedia', { features: null });
-        if (Array.isArray(features)) {
-            features.every((mediaFeature) => {
-                const name = mediaFeature.name;
-                assert_1.assert(/^prefers-(?:color-scheme|reduced-motion)$/.test(name), 'Unsupported media feature: ' + name);
-                return true;
-            });
-            await this._client.send('Emulation.setEmulatedMedia', {
-                features: features,
-            });
-        }
-    }
-    async emulateTimezone(timezoneId) {
-        try {
-            await this._client.send('Emulation.setTimezoneOverride', {
-                timezoneId: timezoneId || '',
-            });
-        }
-        catch (error) {
-            if (error.message.includes('Invalid timezone'))
-                throw new Error(`Invalid timezone ID: ${timezoneId}`);
-            throw error;
-        }
-    }
-    async emulateVisionDeficiency(type) {
-        const visionDeficiencies = new Set([
-            'none',
-            'achromatopsia',
-            'blurredVision',
-            'deuteranopia',
-            'protanopia',
-            'tritanopia',
-        ]);
-        try {
-            assert_1.assert(!type || visionDeficiencies.has(type), `Unsupported vision deficiency: ${type}`);
-            await this._client.send('Emulation.setEmulatedVisionDeficiency', {
-                type: type || 'none',
-            });
-        }
-        catch (error) {
-            throw error;
-        }
-    }
-    async setViewport(viewport) {
-        const needsReload = await this._emulationManager.emulateViewport(viewport);
-        this._viewport = viewport;
-        if (needsReload)
-            await this.reload();
-    }
-    viewport() {
-        return this._viewport;
-    }
-    async evaluate(pageFunction, ...args) {
-        return this._frameManager
-            .mainFrame()
-            .evaluate(pageFunction, ...args);
-    }
-    async evaluateOnNewDocument(pageFunction, ...args) {
-        const source = helper_1.helper.evaluationString(pageFunction, ...args);
-        await this._client.send('Page.addScriptToEvaluateOnNewDocument', {
-            source,
-        });
-    }
-    async setCacheEnabled(enabled = true) {
-        await this._frameManager.networkManager().setCacheEnabled(enabled);
-    }
-    async screenshot(options = {}) {
-        let screenshotType = null;
-        // options.type takes precedence over inferring the type from options.path
-        // because it may be a 0-length file with no extension created beforehand
-        // (i.e. as a temp file).
-        if (options.type) {
-            assert_1.assert(options.type === 'png' || options.type === 'jpeg', 'Unknown options.type value: ' + options.type);
-            screenshotType = options.type;
-        }
-        else if (options.path) {
-            const mimeType = mime.getType(options.path);
-            if (mimeType === 'image/png')
-                screenshotType = 'png';
-            else if (mimeType === 'image/jpeg')
-                screenshotType = 'jpeg';
-            assert_1.assert(screenshotType, 'Unsupported screenshot mime type: ' + mimeType);
-        }
-        if (!screenshotType)
-            screenshotType = 'png';
-        if (options.quality) {
-            assert_1.assert(screenshotType === 'jpeg', 'options.quality is unsupported for the ' +
-                screenshotType +
-                ' screenshots');
-            assert_1.assert(typeof options.quality === 'number', 'Expected options.quality to be a number but found ' +
-                typeof options.quality);
-            assert_1.assert(Number.isInteger(options.quality), 'Expected options.quality to be an integer');
-            assert_1.assert(options.quality >= 0 && options.quality <= 100, 'Expected options.quality to be between 0 and 100 (inclusive), got ' +
-                options.quality);
-        }
-        assert_1.assert(!options.clip || !options.fullPage, 'options.clip and options.fullPage are exclusive');
-        if (options.clip) {
-            assert_1.assert(typeof options.clip.x === 'number', 'Expected options.clip.x to be a number but found ' +
-                typeof options.clip.x);
-            assert_1.assert(typeof options.clip.y === 'number', 'Expected options.clip.y to be a number but found ' +
-                typeof options.clip.y);
-            assert_1.assert(typeof options.clip.width === 'number', 'Expected options.clip.width to be a number but found ' +
-                typeof options.clip.width);
-            assert_1.assert(typeof options.clip.height === 'number', 'Expected options.clip.height to be a number but found ' +
-                typeof options.clip.height);
-            assert_1.assert(options.clip.width !== 0, 'Expected options.clip.width not to be 0.');
-            assert_1.assert(options.clip.height !== 0, 'Expected options.clip.height not to be 0.');
-        }
-        return this._screenshotTaskQueue.postTask(() => this._screenshotTask(screenshotType, options));
-    }
-    async _screenshotTask(format, options) {
-        await this._client.send('Target.activateTarget', {
-            targetId: this._target._targetId,
-        });
-        let clip = options.clip ? processClip(options.clip) : undefined;
-        if (options.fullPage) {
-            const metrics = await this._client.send('Page.getLayoutMetrics');
-            const width = Math.ceil(metrics.contentSize.width);
-            const height = Math.ceil(metrics.contentSize.height);
-            // Overwrite clip for full page at all times.
-            clip = { x: 0, y: 0, width, height, scale: 1 };
-            const { isMobile = false, deviceScaleFactor = 1, isLandscape = false } = this._viewport || {};
-            const screenOrientation = isLandscape
-                ? { angle: 90, type: 'landscapePrimary' }
-                : { angle: 0, type: 'portraitPrimary' };
-            await this._client.send('Emulation.setDeviceMetricsOverride', {
-                mobile: isMobile,
-                width,
-                height,
-                deviceScaleFactor,
-                screenOrientation,
-            });
-        }
-        const shouldSetDefaultBackground = options.omitBackground && format === 'png';
-        if (shouldSetDefaultBackground)
-            await this._client.send('Emulation.setDefaultBackgroundColorOverride', {
-                color: { r: 0, g: 0, b: 0, a: 0 },
-            });
-        const result = await this._client.send('Page.captureScreenshot', {
-            format,
-            quality: options.quality,
-            clip,
-        });
-        if (shouldSetDefaultBackground)
-            await this._client.send('Emulation.setDefaultBackgroundColorOverride');
-        if (options.fullPage && this._viewport)
-            await this.setViewport(this._viewport);
-        const buffer = options.encoding === 'base64'
-            ? result.data
-            : Buffer.from(result.data, 'base64');
-        if (options.path)
-            await writeFileAsync(options.path, buffer);
-        return buffer;
-        function processClip(clip) {
-            const x = Math.round(clip.x);
-            const y = Math.round(clip.y);
-            const width = Math.round(clip.width + clip.x - x);
-            const height = Math.round(clip.height + clip.y - y);
-            return { x, y, width, height, scale: 1 };
-        }
-    }
-    async pdf(options = {}) {
-        const { scale = 1, displayHeaderFooter = false, headerTemplate = '', footerTemplate = '', printBackground = false, landscape = false, pageRanges = '', preferCSSPageSize = false, margin = {}, path = null, } = options;
-        let paperWidth = 8.5;
-        let paperHeight = 11;
-        if (options.format) {
-            const format = paperFormats[options.format.toLowerCase()];
-            assert_1.assert(format, 'Unknown paper format: ' + options.format);
-            paperWidth = format.width;
-            paperHeight = format.height;
-        }
-        else {
-            paperWidth = convertPrintParameterToInches(options.width) || paperWidth;
-            paperHeight =
-                convertPrintParameterToInches(options.height) || paperHeight;
-        }
-        const marginTop = convertPrintParameterToInches(margin.top) || 0;
-        const marginLeft = convertPrintParameterToInches(margin.left) || 0;
-        const marginBottom = convertPrintParameterToInches(margin.bottom) || 0;
-        const marginRight = convertPrintParameterToInches(margin.right) || 0;
-        const result = await this._client.send('Page.printToPDF', {
-            transferMode: 'ReturnAsStream',
-            landscape,
-            displayHeaderFooter,
-            headerTemplate,
-            footerTemplate,
-            printBackground,
-            scale,
-            paperWidth,
-            paperHeight,
-            marginTop,
-            marginBottom,
-            marginLeft,
-            marginRight,
-            pageRanges,
-            preferCSSPageSize,
-        });
-        return await helper_1.helper.readProtocolStream(this._client, result.stream, path);
-    }
-    async title() {
-        return this.mainFrame().title();
-    }
-    async close(options = { runBeforeUnload: undefined }) {
-        assert_1.assert(!!this._client._connection, 'Protocol error: Connection closed. Most likely the page has been closed.');
-        const runBeforeUnload = !!options.runBeforeUnload;
-        if (runBeforeUnload) {
-            await this._client.send('Page.close');
-        }
-        else {
-            await this._client._connection.send('Target.closeTarget', {
-                targetId: this._target._targetId,
-            });
-            await this._target._isClosedPromise;
-        }
-    }
-    isClosed() {
-        return this._closed;
-    }
-    get mouse() {
-        return this._mouse;
-    }
-    click(selector, options = {}) {
-        return this.mainFrame().click(selector, options);
-    }
-    focus(selector) {
-        return this.mainFrame().focus(selector);
-    }
-    hover(selector) {
-        return this.mainFrame().hover(selector);
-    }
-    select(selector, ...values) {
-        return this.mainFrame().select(selector, ...values);
-    }
-    tap(selector) {
-        return this.mainFrame().tap(selector);
-    }
-    type(selector, text, options) {
-        return this.mainFrame().type(selector, text, options);
-    }
-    waitFor(selectorOrFunctionOrTimeout, options = {}, ...args) {
-        return this.mainFrame().waitFor(selectorOrFunctionOrTimeout, options, ...args);
-    }
-    waitForSelector(selector, options = {}) {
-        return this.mainFrame().waitForSelector(selector, options);
-    }
-    waitForXPath(xpath, options = {}) {
-        return this.mainFrame().waitForXPath(xpath, options);
-    }
-    waitForFunction(pageFunction, options = {}, ...args) {
-        return this.mainFrame().waitForFunction(pageFunction, options, ...args);
-    }
-}
-exports.Page = Page;
-const supportedMetrics = new Set([
-    'Timestamp',
-    'Documents',
-    'Frames',
-    'JSEventListeners',
-    'Nodes',
-    'LayoutCount',
-    'RecalcStyleCount',
-    'LayoutDuration',
-    'RecalcStyleDuration',
-    'ScriptDuration',
-    'TaskDuration',
-    'JSHeapUsedSize',
-    'JSHeapTotalSize',
-]);
-const unitToPixels = {
-    px: 1,
-    in: 96,
-    cm: 37.8,
-    mm: 3.78,
-};
-function convertPrintParameterToInches(parameter) {
-    if (typeof parameter === 'undefined')
-        return undefined;
-    let pixels;
-    if (helper_1.helper.isNumber(parameter)) {
-        // Treat numbers as pixel values to be aligned with phantom's paperSize.
-        pixels = /** @type {number} */ parameter;
-    }
-    else if (helper_1.helper.isString(parameter)) {
-        const text = /** @type {string} */ parameter;
-        let unit = text.substring(text.length - 2).toLowerCase();
-        let valueText = '';
-        if (unitToPixels.hasOwnProperty(unit)) {
-            valueText = text.substring(0, text.length - 2);
-        }
-        else {
-            // In case of unknown unit try to parse the whole parameter as number of pixels.
-            // This is consistent with phantom's paperSize behavior.
-            unit = 'px';
-            valueText = text;
-        }
-        const value = Number(valueText);
-        assert_1.assert(!isNaN(value), 'Failed to parse parameter value: ' + text);
-        pixels = value * unitToPixels[unit];
-    }
-    else {
-        throw new Error('page.pdf() Cannot handle parameter type: ' + typeof parameter);
-    }
-    return pixels / 96;
-}
-
-
-/***/ }),
+/* 398 */,
 /* 399 */,
 /* 400 */
 /***/ (function(module, exports, __webpack_require__) {
 
-var Stream = __webpack_require__(418)
+var Stream = __webpack_require__(413)
 
 // through
 //
@@ -18252,249 +20196,7 @@ function through (write, end, opts) {
 
 
 /***/ }),
-/* 401 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.HTTPRequest = void 0;
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-class HTTPRequest {
-    constructor(client, frame, interceptionId, allowInterception, event, redirectChain) {
-        this._failureText = null;
-        this._response = null;
-        this._fromMemoryCache = false;
-        this._interceptionHandled = false;
-        this._headers = {};
-        this._client = client;
-        this._requestId = event.requestId;
-        this._isNavigationRequest =
-            event.requestId === event.loaderId && event.type === 'Document';
-        this._interceptionId = interceptionId;
-        this._allowInterception = allowInterception;
-        this._url = event.request.url;
-        this._resourceType = event.type.toLowerCase();
-        this._method = event.request.method;
-        this._postData = event.request.postData;
-        this._frame = frame;
-        this._redirectChain = redirectChain;
-        for (const key of Object.keys(event.request.headers))
-            this._headers[key.toLowerCase()] = event.request.headers[key];
-    }
-    url() {
-        return this._url;
-    }
-    resourceType() {
-        return this._resourceType;
-    }
-    method() {
-        return this._method;
-    }
-    postData() {
-        return this._postData;
-    }
-    headers() {
-        return this._headers;
-    }
-    response() {
-        return this._response;
-    }
-    frame() {
-        return this._frame;
-    }
-    isNavigationRequest() {
-        return this._isNavigationRequest;
-    }
-    redirectChain() {
-        return this._redirectChain.slice();
-    }
-    /**
-     * @returns {?{errorText: string}}
-     */
-    failure() {
-        if (!this._failureText)
-            return null;
-        return {
-            errorText: this._failureText,
-        };
-    }
-    async continue(overrides = {}) {
-        // Request interception is not supported for data: urls.
-        if (this._url.startsWith('data:'))
-            return;
-        assert_1.assert(this._allowInterception, 'Request Interception is not enabled!');
-        assert_1.assert(!this._interceptionHandled, 'Request is already handled!');
-        const { url, method, postData, headers } = overrides;
-        this._interceptionHandled = true;
-        await this._client
-            .send('Fetch.continueRequest', {
-            requestId: this._interceptionId,
-            url,
-            method,
-            postData,
-            headers: headers ? headersArray(headers) : undefined,
-        })
-            .catch((error) => {
-            // In certain cases, protocol will return error if the request was
-            // already canceled or the page was closed. We should tolerate these
-            // errors.
-            helper_1.debugError(error);
-        });
-    }
-    async respond(response) {
-        // Mocking responses for dataURL requests is not currently supported.
-        if (this._url.startsWith('data:'))
-            return;
-        assert_1.assert(this._allowInterception, 'Request Interception is not enabled!');
-        assert_1.assert(!this._interceptionHandled, 'Request is already handled!');
-        this._interceptionHandled = true;
-        const responseBody = response.body && helper_1.helper.isString(response.body)
-            ? Buffer.from(response.body)
-            : response.body || null;
-        const responseHeaders = {};
-        if (response.headers) {
-            for (const header of Object.keys(response.headers))
-                responseHeaders[header.toLowerCase()] = response.headers[header];
-        }
-        if (response.contentType)
-            responseHeaders['content-type'] = response.contentType;
-        if (responseBody && !('content-length' in responseHeaders))
-            responseHeaders['content-length'] = String(Buffer.byteLength(responseBody));
-        await this._client
-            .send('Fetch.fulfillRequest', {
-            requestId: this._interceptionId,
-            responseCode: response.status || 200,
-            responsePhrase: STATUS_TEXTS[response.status || 200],
-            responseHeaders: headersArray(responseHeaders),
-            body: responseBody ? responseBody.toString('base64') : undefined,
-        })
-            .catch((error) => {
-            // In certain cases, protocol will return error if the request was
-            // already canceled or the page was closed. We should tolerate these
-            // errors.
-            helper_1.debugError(error);
-        });
-    }
-    async abort(errorCode = 'failed') {
-        // Request interception is not supported for data: urls.
-        if (this._url.startsWith('data:'))
-            return;
-        const errorReason = errorReasons[errorCode];
-        assert_1.assert(errorReason, 'Unknown error code: ' + errorCode);
-        assert_1.assert(this._allowInterception, 'Request Interception is not enabled!');
-        assert_1.assert(!this._interceptionHandled, 'Request is already handled!');
-        this._interceptionHandled = true;
-        await this._client
-            .send('Fetch.failRequest', {
-            requestId: this._interceptionId,
-            errorReason,
-        })
-            .catch((error) => {
-            // In certain cases, protocol will return error if the request was
-            // already canceled or the page was closed. We should tolerate these
-            // errors.
-            helper_1.debugError(error);
-        });
-    }
-}
-exports.HTTPRequest = HTTPRequest;
-const errorReasons = {
-    aborted: 'Aborted',
-    accessdenied: 'AccessDenied',
-    addressunreachable: 'AddressUnreachable',
-    blockedbyclient: 'BlockedByClient',
-    blockedbyresponse: 'BlockedByResponse',
-    connectionaborted: 'ConnectionAborted',
-    connectionclosed: 'ConnectionClosed',
-    connectionfailed: 'ConnectionFailed',
-    connectionrefused: 'ConnectionRefused',
-    connectionreset: 'ConnectionReset',
-    internetdisconnected: 'InternetDisconnected',
-    namenotresolved: 'NameNotResolved',
-    timedout: 'TimedOut',
-    failed: 'Failed',
-};
-function headersArray(headers) {
-    const result = [];
-    for (const name in headers) {
-        if (!Object.is(headers[name], undefined))
-            result.push({ name, value: headers[name] + '' });
-    }
-    return result;
-}
-// List taken from
-// https://www.iana.org/assignments/http-status-codes/http-status-codes.xhtml
-// with extra 306 and 418 codes.
-const STATUS_TEXTS = {
-    '100': 'Continue',
-    '101': 'Switching Protocols',
-    '102': 'Processing',
-    '103': 'Early Hints',
-    '200': 'OK',
-    '201': 'Created',
-    '202': 'Accepted',
-    '203': 'Non-Authoritative Information',
-    '204': 'No Content',
-    '205': 'Reset Content',
-    '206': 'Partial Content',
-    '207': 'Multi-Status',
-    '208': 'Already Reported',
-    '226': 'IM Used',
-    '300': 'Multiple Choices',
-    '301': 'Moved Permanently',
-    '302': 'Found',
-    '303': 'See Other',
-    '304': 'Not Modified',
-    '305': 'Use Proxy',
-    '306': 'Switch Proxy',
-    '307': 'Temporary Redirect',
-    '308': 'Permanent Redirect',
-    '400': 'Bad Request',
-    '401': 'Unauthorized',
-    '402': 'Payment Required',
-    '403': 'Forbidden',
-    '404': 'Not Found',
-    '405': 'Method Not Allowed',
-    '406': 'Not Acceptable',
-    '407': 'Proxy Authentication Required',
-    '408': 'Request Timeout',
-    '409': 'Conflict',
-    '410': 'Gone',
-    '411': 'Length Required',
-    '412': 'Precondition Failed',
-    '413': 'Payload Too Large',
-    '414': 'URI Too Long',
-    '415': 'Unsupported Media Type',
-    '416': 'Range Not Satisfiable',
-    '417': 'Expectation Failed',
-    '418': "I'm a teapot",
-    '421': 'Misdirected Request',
-    '422': 'Unprocessable Entity',
-    '423': 'Locked',
-    '424': 'Failed Dependency',
-    '425': 'Too Early',
-    '426': 'Upgrade Required',
-    '428': 'Precondition Required',
-    '429': 'Too Many Requests',
-    '431': 'Request Header Fields Too Large',
-    '451': 'Unavailable For Legal Reasons',
-    '500': 'Internal Server Error',
-    '501': 'Not Implemented',
-    '502': 'Bad Gateway',
-    '503': 'Service Unavailable',
-    '504': 'Gateway Timeout',
-    '505': 'HTTP Version Not Supported',
-    '506': 'Variant Also Negotiates',
-    '507': 'Insufficient Storage',
-    '508': 'Loop Detected',
-    '510': 'Not Extended',
-    '511': 'Network Authentication Required',
-};
-
-
-/***/ }),
+/* 401 */,
 /* 402 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -19293,31 +20995,11 @@ Glob.prototype._stat2 = function (f, abs, er, stat, cb) {
 /***/ }),
 /* 403 */,
 /* 404 */,
-/* 405 */,
-/* 406 */,
-/* 407 */,
-/* 408 */,
-/* 409 */,
-/* 410 */
+/* 405 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
-/**
- * Copyright 2020 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
     if (k2 === undefined) k2 = k;
     Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
@@ -19337,355 +21019,206 @@ var __importStar = (this && this.__importStar) || function (mod) {
     __setModuleDefault(result, mod);
     return result;
 };
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.BrowserRunner = void 0;
-const Debug_1 = __webpack_require__(145);
-const rimraf_1 = __importDefault(__webpack_require__(569));
-const childProcess = __importStar(__webpack_require__(129));
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const Connection_1 = __webpack_require__(433);
-const WebSocketTransport_1 = __webpack_require__(714);
-const PipeTransport_1 = __webpack_require__(729);
-const readline = __importStar(__webpack_require__(58));
-const Errors_1 = __webpack_require__(24);
+exports.helper = exports.debugError = void 0;
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const Errors_js_1 = __webpack_require__(422);
+const Debug_js_1 = __webpack_require__(459);
+const fs = __importStar(__webpack_require__(747));
 const util_1 = __webpack_require__(669);
-const removeFolderAsync = util_1.promisify(rimraf_1.default);
-const debugLauncher = Debug_1.debug('puppeteer:launcher');
-const PROCESS_ERROR_EXPLANATION = `Puppeteer was unable to kill the process which ran the browser binary.
-This means that, on future Puppeteer launches, Puppeteer might not be able to launch the browser.
-Please check your open processes and ensure that the browser processes that Puppeteer launched have been killed.
-If you think this is a bug, please report it on the Puppeteer issue tracker.`;
-class BrowserRunner {
-    constructor(executablePath, processArguments, tempDirectory) {
-        this.proc = null;
-        this.connection = null;
-        this._closed = true;
-        this._listeners = [];
-        this._executablePath = executablePath;
-        this._processArguments = processArguments;
-        this._tempDirectory = tempDirectory;
+const assert_js_1 = __webpack_require__(716);
+const openAsync = util_1.promisify(fs.open);
+const writeAsync = util_1.promisify(fs.write);
+const closeAsync = util_1.promisify(fs.close);
+exports.debugError = Debug_js_1.debug('puppeteer:error');
+function getExceptionMessage(exceptionDetails) {
+    if (exceptionDetails.exception)
+        return (exceptionDetails.exception.description || exceptionDetails.exception.value);
+    let message = exceptionDetails.text;
+    if (exceptionDetails.stackTrace) {
+        for (const callframe of exceptionDetails.stackTrace.callFrames) {
+            const location = callframe.url +
+                ':' +
+                callframe.lineNumber +
+                ':' +
+                callframe.columnNumber;
+            const functionName = callframe.functionName || '<anonymous>';
+            message += `\n    at ${functionName} (${location})`;
+        }
     }
-    start(options) {
-        const { handleSIGINT, handleSIGTERM, handleSIGHUP, dumpio, env, pipe, } = options;
-        let stdio = ['pipe', 'pipe', 'pipe'];
-        if (pipe) {
-            if (dumpio)
-                stdio = ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'];
-            else
-                stdio = ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'];
-        }
-        assert_1.assert(!this.proc, 'This process has previously been started.');
-        debugLauncher(`Calling ${this._executablePath} ${this._processArguments.join(' ')}`);
-        this.proc = childProcess.spawn(this._executablePath, this._processArguments, {
-            // On non-windows platforms, `detached: true` makes child process a
-            // leader of a new process group, making it possible to kill child
-            // process tree with `.kill(-pid)` command. @see
-            // https://nodejs.org/api/child_process.html#child_process_options_detached
-            detached: process.platform !== 'win32',
-            env,
-            stdio,
-        });
-        if (dumpio) {
-            this.proc.stderr.pipe(process.stderr);
-            this.proc.stdout.pipe(process.stdout);
-        }
-        this._closed = false;
-        this._processClosing = new Promise((fulfill) => {
-            this.proc.once('exit', () => {
-                this._closed = true;
-                // Cleanup as processes exit.
-                if (this._tempDirectory) {
-                    removeFolderAsync(this._tempDirectory)
-                        .then(() => fulfill())
-                        .catch((error) => console.error(error));
-                }
-                else {
-                    fulfill();
-                }
-            });
-        });
-        this._listeners = [
-            helper_1.helper.addEventListener(process, 'exit', this.kill.bind(this)),
-        ];
-        if (handleSIGINT)
-            this._listeners.push(helper_1.helper.addEventListener(process, 'SIGINT', () => {
-                this.kill();
-                process.exit(130);
-            }));
-        if (handleSIGTERM)
-            this._listeners.push(helper_1.helper.addEventListener(process, 'SIGTERM', this.close.bind(this)));
-        if (handleSIGHUP)
-            this._listeners.push(helper_1.helper.addEventListener(process, 'SIGHUP', this.close.bind(this)));
-    }
-    close() {
-        if (this._closed)
-            return Promise.resolve();
-        if (this._tempDirectory) {
-            this.kill();
-        }
-        else if (this.connection) {
-            // Attempt to close the browser gracefully
-            this.connection.send('Browser.close').catch((error) => {
-                helper_1.debugError(error);
-                this.kill();
-            });
-        }
-        // Cleanup this listener last, as that makes sure the full callback runs. If we
-        // perform this earlier, then the previous function calls would not happen.
-        helper_1.helper.removeEventListeners(this._listeners);
-        return this._processClosing;
-    }
-    kill() {
-        // Attempt to remove temporary profile directory to avoid littering.
-        try {
-            rimraf_1.default.sync(this._tempDirectory);
-        }
-        catch (error) { }
-        // If the process failed to launch (for example if the browser executable path
-        // is invalid), then the process does not get a pid assigned. A call to
-        // `proc.kill` would error, as the `pid` to-be-killed can not be found.
-        if (this.proc && this.proc.pid && !this.proc.killed) {
-            try {
-                this.proc.kill('SIGKILL');
-            }
-            catch (error) {
-                throw new Error(`${PROCESS_ERROR_EXPLANATION}\nError cause: ${error.stack}`);
-            }
-        }
-        // Cleanup this listener last, as that makes sure the full callback runs. If we
-        // perform this earlier, then the previous function calls would not happen.
-        helper_1.helper.removeEventListeners(this._listeners);
-    }
-    async setupConnection(options) {
-        const { usePipe, timeout, slowMo, preferredRevision } = options;
-        if (!usePipe) {
-            const browserWSEndpoint = await waitForWSEndpoint(this.proc, timeout, preferredRevision);
-            const transport = await WebSocketTransport_1.WebSocketTransport.create(browserWSEndpoint);
-            this.connection = new Connection_1.Connection(browserWSEndpoint, transport, slowMo);
-        }
-        else {
-            // stdio was assigned during start(), and the 'pipe' option there adds the
-            // 4th and 5th items to stdio array
-            const { 3: pipeWrite, 4: pipeRead } = this.proc.stdio;
-            const transport = new PipeTransport_1.PipeTransport(pipeWrite, pipeRead);
-            this.connection = new Connection_1.Connection('', transport, slowMo);
-        }
-        return this.connection;
-    }
+    return message;
 }
-exports.BrowserRunner = BrowserRunner;
-function waitForWSEndpoint(browserProcess, timeout, preferredRevision) {
-    return new Promise((resolve, reject) => {
-        const rl = readline.createInterface({ input: browserProcess.stderr });
-        let stderr = '';
-        const listeners = [
-            helper_1.helper.addEventListener(rl, 'line', onLine),
-            helper_1.helper.addEventListener(rl, 'close', () => onClose()),
-            helper_1.helper.addEventListener(browserProcess, 'exit', () => onClose()),
-            helper_1.helper.addEventListener(browserProcess, 'error', (error) => onClose(error)),
-        ];
-        const timeoutId = timeout ? setTimeout(onTimeout, timeout) : 0;
-        /**
-         * @param {!Error=} error
-         */
-        function onClose(error) {
-            cleanup();
-            reject(new Error([
-                'Failed to launch the browser process!' +
-                    (error ? ' ' + error.message : ''),
-                stderr,
-                '',
-                'TROUBLESHOOTING: https://github.com/puppeteer/puppeteer/blob/main/docs/troubleshooting.md',
-                '',
-            ].join('\n')));
+function valueFromRemoteObject(remoteObject) {
+    assert_js_1.assert(!remoteObject.objectId, 'Cannot extract value when objectId is given');
+    if (remoteObject.unserializableValue) {
+        if (remoteObject.type === 'bigint' && typeof BigInt !== 'undefined')
+            return BigInt(remoteObject.unserializableValue.replace('n', ''));
+        switch (remoteObject.unserializableValue) {
+            case '-0':
+                return -0;
+            case 'NaN':
+                return NaN;
+            case 'Infinity':
+                return Infinity;
+            case '-Infinity':
+                return -Infinity;
+            default:
+                throw new Error('Unsupported unserializable value: ' +
+                    remoteObject.unserializableValue);
         }
-        function onTimeout() {
-            cleanup();
-            reject(new Errors_1.TimeoutError(`Timed out after ${timeout} ms while trying to connect to the browser! Only Chrome at revision r${preferredRevision} is guaranteed to work.`));
-        }
-        function onLine(line) {
-            stderr += line + '\n';
-            const match = line.match(/^DevTools listening on (ws:\/\/.*)$/);
-            if (!match)
-                return;
-            cleanup();
-            resolve(match[1]);
-        }
-        function cleanup() {
-            if (timeoutId)
-                clearTimeout(timeoutId);
-            helper_1.helper.removeEventListeners(listeners);
-        }
+    }
+    return remoteObject.value;
+}
+async function releaseObject(client, remoteObject) {
+    if (!remoteObject.objectId)
+        return;
+    await client
+        .send('Runtime.releaseObject', { objectId: remoteObject.objectId })
+        .catch((error) => {
+        // Exceptions might happen in case of a page been navigated or closed.
+        // Swallow these since they are harmless and we don't leak anything in this case.
+        exports.debugError(error);
     });
 }
+function addEventListener(emitter, eventName, handler) {
+    emitter.on(eventName, handler);
+    return { emitter, eventName, handler };
+}
+function removeEventListeners(listeners) {
+    for (const listener of listeners)
+        listener.emitter.removeListener(listener.eventName, listener.handler);
+    listeners.length = 0;
+}
+function isString(obj) {
+    return typeof obj === 'string' || obj instanceof String;
+}
+function isNumber(obj) {
+    return typeof obj === 'number' || obj instanceof Number;
+}
+async function waitForEvent(emitter, eventName, predicate, timeout, abortPromise) {
+    let eventTimeout, resolveCallback, rejectCallback;
+    const promise = new Promise((resolve, reject) => {
+        resolveCallback = resolve;
+        rejectCallback = reject;
+    });
+    const listener = addEventListener(emitter, eventName, (event) => {
+        if (!predicate(event))
+            return;
+        resolveCallback(event);
+    });
+    if (timeout) {
+        eventTimeout = setTimeout(() => {
+            rejectCallback(new Errors_js_1.TimeoutError('Timeout exceeded while waiting for event'));
+        }, timeout);
+    }
+    function cleanup() {
+        removeEventListeners([listener]);
+        clearTimeout(eventTimeout);
+    }
+    const result = await Promise.race([promise, abortPromise]).then((r) => {
+        cleanup();
+        return r;
+    }, (error) => {
+        cleanup();
+        throw error;
+    });
+    if (result instanceof Error)
+        throw result;
+    return result;
+}
+function evaluationString(fun, ...args) {
+    if (isString(fun)) {
+        assert_js_1.assert(args.length === 0, 'Cannot evaluate a string with arguments');
+        return fun;
+    }
+    function serializeArgument(arg) {
+        if (Object.is(arg, undefined))
+            return 'undefined';
+        return JSON.stringify(arg);
+    }
+    return `(${fun})(${args.map(serializeArgument).join(',')})`;
+}
+async function waitWithTimeout(promise, taskName, timeout) {
+    let reject;
+    const timeoutError = new Errors_js_1.TimeoutError(`waiting for ${taskName} failed: timeout ${timeout}ms exceeded`);
+    const timeoutPromise = new Promise((resolve, x) => (reject = x));
+    let timeoutTimer = null;
+    if (timeout)
+        timeoutTimer = setTimeout(() => reject(timeoutError), timeout);
+    try {
+        return await Promise.race([promise, timeoutPromise]);
+    }
+    finally {
+        if (timeoutTimer)
+            clearTimeout(timeoutTimer);
+    }
+}
+async function readProtocolStream(client, handle, path) {
+    let eof = false;
+    let file;
+    if (path)
+        file = await openAsync(path, 'w');
+    const bufs = [];
+    while (!eof) {
+        const response = await client.send('IO.read', { handle });
+        eof = response.eof;
+        const buf = Buffer.from(response.data, response.base64Encoded ? 'base64' : undefined);
+        bufs.push(buf);
+        if (path)
+            await writeAsync(file, buf);
+    }
+    if (path)
+        await closeAsync(file);
+    await client.send('IO.close', { handle });
+    let resultBuffer = null;
+    try {
+        resultBuffer = Buffer.concat(bufs);
+    }
+    finally {
+        return resultBuffer;
+    }
+}
+exports.helper = {
+    evaluationString,
+    readProtocolStream,
+    waitWithTimeout,
+    waitForEvent,
+    isString,
+    isNumber,
+    addEventListener,
+    removeEventListeners,
+    valueFromRemoteObject,
+    getExceptionMessage,
+    releaseObject,
+};
 
 
 /***/ }),
+/* 406 */,
+/* 407 */,
+/* 408 */,
+/* 409 */,
+/* 410 */,
 /* 411 */,
 /* 412 */,
 /* 413 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/***/ (function(module) {
 
-"use strict";
-
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.HTTPResponse = void 0;
-const SecurityDetails_1 = __webpack_require__(910);
-/**
- * The HTTPResponse class represents responses which are received by the
- * {@link Page} class.
- *
- * @public
- */
-class HTTPResponse {
-    /**
-     * @internal
-     */
-    constructor(client, request, responsePayload) {
-        this._contentPromise = null;
-        this._headers = {};
-        this._client = client;
-        this._request = request;
-        this._bodyLoadedPromise = new Promise((fulfill) => {
-            this._bodyLoadedPromiseFulfill = fulfill;
-        });
-        this._remoteAddress = {
-            ip: responsePayload.remoteIPAddress,
-            port: responsePayload.remotePort,
-        };
-        this._status = responsePayload.status;
-        this._statusText = responsePayload.statusText;
-        this._url = request.url();
-        this._fromDiskCache = !!responsePayload.fromDiskCache;
-        this._fromServiceWorker = !!responsePayload.fromServiceWorker;
-        for (const key of Object.keys(responsePayload.headers))
-            this._headers[key.toLowerCase()] = responsePayload.headers[key];
-        this._securityDetails = responsePayload.securityDetails
-            ? new SecurityDetails_1.SecurityDetails(responsePayload.securityDetails)
-            : null;
-    }
-    /**
-     * @internal
-     */
-    _resolveBody(err) {
-        return this._bodyLoadedPromiseFulfill(err);
-    }
-    /**
-     * @returns The IP address and port number used to connect to the remote
-     * server.
-     */
-    remoteAddress() {
-        return this._remoteAddress;
-    }
-    /**
-     * @returns The URL of the response.
-     */
-    url() {
-        return this._url;
-    }
-    /**
-     * @returns True if the response was successful (status in the range 200-299).
-     */
-    ok() {
-        // TODO: document === 0 case?
-        return this._status === 0 || (this._status >= 200 && this._status <= 299);
-    }
-    /**
-     * @returns The status code of the response (e.g., 200 for a success).
-     */
-    status() {
-        return this._status;
-    }
-    /**
-     * @returns  The status text of the response (e.g. usually an "OK" for a
-     * success).
-     */
-    statusText() {
-        return this._statusText;
-    }
-    /**
-     * @returns An object with HTTP headers associated with the response. All
-     * header names are lower-case.
-     */
-    headers() {
-        return this._headers;
-    }
-    /**
-     * @returns {@link SecurityDetails} if the response was received over the
-     * secure connection, or `null` otherwise.
-     */
-    securityDetails() {
-        return this._securityDetails;
-    }
-    /**
-     * @returns Promise which resolves to a buffer with response body.
-     */
-    buffer() {
-        if (!this._contentPromise) {
-            this._contentPromise = this._bodyLoadedPromise.then(async (error) => {
-                if (error)
-                    throw error;
-                const response = await this._client.send('Network.getResponseBody', {
-                    requestId: this._request._requestId,
-                });
-                return Buffer.from(response.body, response.base64Encoded ? 'base64' : 'utf8');
-            });
-        }
-        return this._contentPromise;
-    }
-    /**
-     * @returns Promise which resolves to a text representation of response body.
-     */
-    async text() {
-        const content = await this.buffer();
-        return content.toString('utf8');
-    }
-    /**
-     *
-     * @returns Promise which resolves to a JSON representation of response body.
-     *
-     * @remarks
-     *
-     * This method will throw if the response body is not parsable via
-     * `JSON.parse`.
-     */
-    async json() {
-        const content = await this.text();
-        return JSON.parse(content);
-    }
-    /**
-     * @returns A matching {@link HTTPRequest} object.
-     */
-    request() {
-        return this._request;
-    }
-    /**
-     * @returns True if the response was served from either the browser's disk
-     * cache or memory cache.
-     */
-    fromCache() {
-        return this._fromDiskCache || this._request._fromMemoryCache;
-    }
-    /**
-     * @returns True if the response was served by a service worker.
-     */
-    fromServiceWorker() {
-        return this._fromServiceWorker;
-    }
-    /**
-     * @returns A {@link Frame} that initiated this response, or `null` if
-     * navigating to error pages.
-     */
-    frame() {
-        return this._request.frame();
-    }
-}
-exports.HTTPResponse = HTTPResponse;
-
+module.exports = require("stream");
 
 /***/ }),
 /* 414 */,
@@ -19697,25 +21230,66 @@ exports.HTTPResponse = HTTPResponse;
 module.exports = require("crypto");
 
 /***/ }),
-/* 418 */
-/***/ (function(module) {
-
-module.exports = require("stream");
-
-/***/ }),
+/* 418 */,
 /* 419 */,
 /* 420 */,
 /* 421 */,
-/* 422 */,
+/* 422 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+/**
+ * Copyright 2018 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.puppeteerErrors = exports.TimeoutError = void 0;
+class CustomError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = this.constructor.name;
+        Error.captureStackTrace(this, this.constructor);
+    }
+}
+/**
+ * TimeoutError is emitted whenever certain operations are terminated due to timeout.
+ *
+ * @remarks
+ *
+ * Example operations are {@link Page.waitForSelector | page.waitForSelector}
+ * or {@link Puppeteer.launch | puppeteer.launch}.
+ *
+ * @public
+ */
+class TimeoutError extends CustomError {
+}
+exports.TimeoutError = TimeoutError;
+exports.puppeteerErrors = {
+    TimeoutError,
+};
+
+
+/***/ }),
 /* 423 */,
 /* 424 */,
 /* 425 */,
 /* 426 */,
 /* 427 */
-/***/ (function(module) {
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
-module.exports=function(n){return n=n||new Map,{on:function(e,t){var i=n.get(e);i&&i.push(t)||n.set(e,[t])},off:function(e,t){var i=n.get(e);i&&i.splice(i.indexOf(t)>>>0,1)},emit:function(e,t){(n.get(e)||[]).slice().map(function(n){n(t)}),(n.get("*")||[]).slice().map(function(n){n(e,t)})}}};
-//# sourceMappingURL=mitt.js.map
+module.exports = __webpack_require__(413);
 
 
 /***/ }),
@@ -19736,6 +21310,7 @@ var __importStar = (this && this.__importStar) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const os = __importStar(__webpack_require__(87));
+const utils_1 = __webpack_require__(82);
 /**
  * Commands
  *
@@ -19789,28 +21364,14 @@ class Command {
         return cmdStr;
     }
 }
-/**
- * Sanitizes an input into a string so it can be passed into issueCommand safely
- * @param input input to sanitize into a string
- */
-function toCommandValue(input) {
-    if (input === null || input === undefined) {
-        return '';
-    }
-    else if (typeof input === 'string' || input instanceof String) {
-        return input;
-    }
-    return JSON.stringify(input);
-}
-exports.toCommandValue = toCommandValue;
 function escapeData(s) {
-    return toCommandValue(s)
+    return utils_1.toCommandValue(s)
         .replace(/%/g, '%25')
         .replace(/\r/g, '%0D')
         .replace(/\n/g, '%0A');
 }
 function escapeProperty(s) {
-    return toCommandValue(s)
+    return utils_1.toCommandValue(s)
         .replace(/%/g, '%25')
         .replace(/\r/g, '%0D')
         .replace(/\n/g, '%0A')
@@ -20122,257 +21683,7 @@ function simpleEnd(buf) {
 }
 
 /***/ }),
-/* 433 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.CDPSession = exports.Connection = void 0;
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-const assert_1 = __webpack_require__(327);
-const Events_1 = __webpack_require__(872);
-const Debug_1 = __webpack_require__(145);
-const debugProtocolSend = Debug_1.debug('puppeteer:protocol:SEND ►');
-const debugProtocolReceive = Debug_1.debug('puppeteer:protocol:RECV ◀');
-const EventEmitter_1 = __webpack_require__(304);
-class Connection extends EventEmitter_1.EventEmitter {
-    constructor(url, transport, delay = 0) {
-        super();
-        this._lastId = 0;
-        this._sessions = new Map();
-        this._closed = false;
-        this._callbacks = new Map();
-        this._url = url;
-        this._delay = delay;
-        this._transport = transport;
-        this._transport.onmessage = this._onMessage.bind(this);
-        this._transport.onclose = this._onClose.bind(this);
-    }
-    static fromSession(session) {
-        return session._connection;
-    }
-    /**
-     * @param {string} sessionId
-     * @returns {?CDPSession}
-     */
-    session(sessionId) {
-        return this._sessions.get(sessionId) || null;
-    }
-    url() {
-        return this._url;
-    }
-    send(method, params) {
-        const id = this._rawSend({ method, params });
-        return new Promise((resolve, reject) => {
-            this._callbacks.set(id, { resolve, reject, error: new Error(), method });
-        });
-    }
-    _rawSend(message) {
-        const id = ++this._lastId;
-        message = JSON.stringify(Object.assign({}, message, { id }));
-        debugProtocolSend(message);
-        this._transport.send(message);
-        return id;
-    }
-    async _onMessage(message) {
-        if (this._delay)
-            await new Promise((f) => setTimeout(f, this._delay));
-        debugProtocolReceive(message);
-        const object = JSON.parse(message);
-        if (object.method === 'Target.attachedToTarget') {
-            const sessionId = object.params.sessionId;
-            const session = new CDPSession(this, object.params.targetInfo.type, sessionId);
-            this._sessions.set(sessionId, session);
-        }
-        else if (object.method === 'Target.detachedFromTarget') {
-            const session = this._sessions.get(object.params.sessionId);
-            if (session) {
-                session._onClosed();
-                this._sessions.delete(object.params.sessionId);
-            }
-        }
-        if (object.sessionId) {
-            const session = this._sessions.get(object.sessionId);
-            if (session)
-                session._onMessage(object);
-        }
-        else if (object.id) {
-            const callback = this._callbacks.get(object.id);
-            // Callbacks could be all rejected if someone has called `.dispose()`.
-            if (callback) {
-                this._callbacks.delete(object.id);
-                if (object.error)
-                    callback.reject(createProtocolError(callback.error, callback.method, object));
-                else
-                    callback.resolve(object.result);
-            }
-        }
-        else {
-            this.emit(object.method, object.params);
-        }
-    }
-    _onClose() {
-        if (this._closed)
-            return;
-        this._closed = true;
-        this._transport.onmessage = null;
-        this._transport.onclose = null;
-        for (const callback of this._callbacks.values())
-            callback.reject(rewriteError(callback.error, `Protocol error (${callback.method}): Target closed.`));
-        this._callbacks.clear();
-        for (const session of this._sessions.values())
-            session._onClosed();
-        this._sessions.clear();
-        this.emit(Events_1.Events.Connection.Disconnected);
-    }
-    dispose() {
-        this._onClose();
-        this._transport.close();
-    }
-    /**
-     * @param {Protocol.Target.TargetInfo} targetInfo
-     * @returns {!Promise<!CDPSession>}
-     */
-    async createSession(targetInfo) {
-        const { sessionId } = await this.send('Target.attachToTarget', {
-            targetId: targetInfo.targetId,
-            flatten: true,
-        });
-        return this._sessions.get(sessionId);
-    }
-}
-exports.Connection = Connection;
-/**
- * The `CDPSession` instances are used to talk raw Chrome Devtools Protocol.
- *
- * @remarks
- *
- * Protocol methods can be called with {@link CDPSession.send} method and protocol
- * events can be subscribed to with `CDPSession.on` method.
- *
- * Useful links: {@link https://chromedevtools.github.io/devtools-protocol/ | DevTools Protocol Viewer}
- * and {@link https://github.com/aslushnikov/getting-started-with-cdp/blob/master/README.md | Getting Started with DevTools Protocol}.
- *
- * @example
- * ```js
- * const client = await page.target().createCDPSession();
- * await client.send('Animation.enable');
- * client.on('Animation.animationCreated', () => console.log('Animation created!'));
- * const response = await client.send('Animation.getPlaybackRate');
- * console.log('playback rate is ' + response.playbackRate);
- * await client.send('Animation.setPlaybackRate', {
- *   playbackRate: response.playbackRate / 2
- * });
- * ```
- *
- * @public
- */
-class CDPSession extends EventEmitter_1.EventEmitter {
-    /**
-     * @internal
-     */
-    constructor(connection, targetType, sessionId) {
-        super();
-        this._callbacks = new Map();
-        this._connection = connection;
-        this._targetType = targetType;
-        this._sessionId = sessionId;
-    }
-    send(method, params) {
-        if (!this._connection)
-            return Promise.reject(new Error(`Protocol error (${method}): Session closed. Most likely the ${this._targetType} has been closed.`));
-        const id = this._connection._rawSend({
-            sessionId: this._sessionId,
-            method,
-            /* TODO(jacktfranklin@): once this Firefox bug is solved
-             * we no longer need the `|| {}` check
-             * https://bugzilla.mozilla.org/show_bug.cgi?id=1631570
-             */
-            params: params || {},
-        });
-        return new Promise((resolve, reject) => {
-            this._callbacks.set(id, { resolve, reject, error: new Error(), method });
-        });
-    }
-    /**
-     * @internal
-     */
-    _onMessage(object) {
-        if (object.id && this._callbacks.has(object.id)) {
-            const callback = this._callbacks.get(object.id);
-            this._callbacks.delete(object.id);
-            if (object.error)
-                callback.reject(createProtocolError(callback.error, callback.method, object));
-            else
-                callback.resolve(object.result);
-        }
-        else {
-            assert_1.assert(!object.id);
-            this.emit(object.method, object.params);
-        }
-    }
-    /**
-     * Detaches the cdpSession from the target. Once detached, the cdpSession object
-     * won't emit any events and can't be used to send messages.
-     */
-    async detach() {
-        if (!this._connection)
-            throw new Error(`Session already detached. Most likely the ${this._targetType} has been closed.`);
-        await this._connection.send('Target.detachFromTarget', {
-            sessionId: this._sessionId,
-        });
-    }
-    /**
-     * @internal
-     */
-    _onClosed() {
-        for (const callback of this._callbacks.values())
-            callback.reject(rewriteError(callback.error, `Protocol error (${callback.method}): Target closed.`));
-        this._callbacks.clear();
-        this._connection = null;
-        this.emit(Events_1.Events.CDPSession.Disconnected);
-    }
-}
-exports.CDPSession = CDPSession;
-/**
- * @param {!Error} error
- * @param {string} method
- * @param {{error: {message: string, data: any}}} object
- * @returns {!Error}
- */
-function createProtocolError(error, method, object) {
-    let message = `Protocol error (${method}): ${object.error.message}`;
-    if ('data' in object.error)
-        message += ` ${object.error.data}`;
-    return rewriteError(error, message);
-}
-/**
- * @param {!Error} error
- * @param {string} message
- * @returns {!Error}
- */
-function rewriteError(error, message) {
-    error.message = message;
-    return error;
-}
-
-
-/***/ }),
+/* 433 */,
 /* 434 */,
 /* 435 */,
 /* 436 */,
@@ -20594,17 +21905,7 @@ module.exports = createAgent;
 //# sourceMappingURL=index.js.map
 
 /***/ }),
-/* 444 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-"use strict";
-
-
-var Mime = __webpack_require__(217);
-module.exports = new Mime(__webpack_require__(460), __webpack_require__(983));
-
-
-/***/ }),
+/* 444 */,
 /* 445 */,
 /* 446 */,
 /* 447 */,
@@ -20620,7 +21921,7 @@ var universalUserAgent = __webpack_require__(796);
 var beforeAfterHook = __webpack_require__(500);
 var request = __webpack_require__(753);
 var graphql = __webpack_require__(898);
-var authToken = __webpack_require__(68);
+var authToken = __webpack_require__(813);
 
 function _defineProperty(obj, key, value) {
   if (key in obj) {
@@ -20794,7 +22095,978 @@ exports.Octokit = Octokit;
 /* 449 */,
 /* 450 */,
 /* 451 */,
-/* 452 */,
+/* 452 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Frame = exports.FrameManager = exports.FrameManagerEmittedEvents = void 0;
+const Debug_js_1 = __webpack_require__(459);
+const EventEmitter_js_1 = __webpack_require__(258);
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const ExecutionContext_js_1 = __webpack_require__(124);
+const LifecycleWatcher_js_1 = __webpack_require__(662);
+const DOMWorld_js_1 = __webpack_require__(225);
+const NetworkManager_js_1 = __webpack_require__(956);
+const UTILITY_WORLD_NAME = '__puppeteer_utility_world__';
+/**
+ * We use symbols to prevent external parties listening to these events.
+ * They are internal to Puppeteer.
+ *
+ * @internal
+ */
+exports.FrameManagerEmittedEvents = {
+    FrameAttached: Symbol('FrameManager.FrameAttached'),
+    FrameNavigated: Symbol('FrameManager.FrameNavigated'),
+    FrameDetached: Symbol('FrameManager.FrameDetached'),
+    LifecycleEvent: Symbol('FrameManager.LifecycleEvent'),
+    FrameNavigatedWithinDocument: Symbol('FrameManager.FrameNavigatedWithinDocument'),
+    ExecutionContextCreated: Symbol('FrameManager.ExecutionContextCreated'),
+    ExecutionContextDestroyed: Symbol('FrameManager.ExecutionContextDestroyed'),
+};
+/**
+ * @internal
+ */
+class FrameManager extends EventEmitter_js_1.EventEmitter {
+    constructor(client, page, ignoreHTTPSErrors, timeoutSettings) {
+        super();
+        this._frames = new Map();
+        this._contextIdToContext = new Map();
+        this._isolatedWorlds = new Set();
+        this._client = client;
+        this._page = page;
+        this._networkManager = new NetworkManager_js_1.NetworkManager(client, ignoreHTTPSErrors, this);
+        this._timeoutSettings = timeoutSettings;
+        this._client.on('Page.frameAttached', (event) => this._onFrameAttached(event.frameId, event.parentFrameId));
+        this._client.on('Page.frameNavigated', (event) => this._onFrameNavigated(event.frame));
+        this._client.on('Page.navigatedWithinDocument', (event) => this._onFrameNavigatedWithinDocument(event.frameId, event.url));
+        this._client.on('Page.frameDetached', (event) => this._onFrameDetached(event.frameId));
+        this._client.on('Page.frameStoppedLoading', (event) => this._onFrameStoppedLoading(event.frameId));
+        this._client.on('Runtime.executionContextCreated', (event) => this._onExecutionContextCreated(event.context));
+        this._client.on('Runtime.executionContextDestroyed', (event) => this._onExecutionContextDestroyed(event.executionContextId));
+        this._client.on('Runtime.executionContextsCleared', () => this._onExecutionContextsCleared());
+        this._client.on('Page.lifecycleEvent', (event) => this._onLifecycleEvent(event));
+        this._client.on('Target.attachedToTarget', async (event) => this._onFrameMoved(event));
+    }
+    async initialize() {
+        const result = await Promise.all([
+            this._client.send('Page.enable'),
+            this._client.send('Page.getFrameTree'),
+        ]);
+        const { frameTree } = result[1];
+        this._handleFrameTree(frameTree);
+        await Promise.all([
+            this._client.send('Page.setLifecycleEventsEnabled', { enabled: true }),
+            this._client
+                .send('Runtime.enable')
+                .then(() => this._ensureIsolatedWorld(UTILITY_WORLD_NAME)),
+            this._networkManager.initialize(),
+        ]);
+    }
+    networkManager() {
+        return this._networkManager;
+    }
+    async navigateFrame(frame, url, options = {}) {
+        assertNoLegacyNavigationOptions(options);
+        const { referer = this._networkManager.extraHTTPHeaders()['referer'], waitUntil = ['load'], timeout = this._timeoutSettings.navigationTimeout(), } = options;
+        const watcher = new LifecycleWatcher_js_1.LifecycleWatcher(this, frame, waitUntil, timeout);
+        let ensureNewDocumentNavigation = false;
+        let error = await Promise.race([
+            navigate(this._client, url, referer, frame._id),
+            watcher.timeoutOrTerminationPromise(),
+        ]);
+        if (!error) {
+            error = await Promise.race([
+                watcher.timeoutOrTerminationPromise(),
+                ensureNewDocumentNavigation
+                    ? watcher.newDocumentNavigationPromise()
+                    : watcher.sameDocumentNavigationPromise(),
+            ]);
+        }
+        watcher.dispose();
+        if (error)
+            throw error;
+        return watcher.navigationResponse();
+        async function navigate(client, url, referrer, frameId) {
+            try {
+                const response = await client.send('Page.navigate', {
+                    url,
+                    referrer,
+                    frameId,
+                });
+                ensureNewDocumentNavigation = !!response.loaderId;
+                return response.errorText
+                    ? new Error(`${response.errorText} at ${url}`)
+                    : null;
+            }
+            catch (error) {
+                return error;
+            }
+        }
+    }
+    async waitForFrameNavigation(frame, options = {}) {
+        assertNoLegacyNavigationOptions(options);
+        const { waitUntil = ['load'], timeout = this._timeoutSettings.navigationTimeout(), } = options;
+        const watcher = new LifecycleWatcher_js_1.LifecycleWatcher(this, frame, waitUntil, timeout);
+        const error = await Promise.race([
+            watcher.timeoutOrTerminationPromise(),
+            watcher.sameDocumentNavigationPromise(),
+            watcher.newDocumentNavigationPromise(),
+        ]);
+        watcher.dispose();
+        if (error)
+            throw error;
+        return watcher.navigationResponse();
+    }
+    async _onFrameMoved(event) {
+        if (event.targetInfo.type !== 'iframe') {
+            return;
+        }
+        // TODO(sadym): Remove debug message once proper OOPIF support is
+        // implemented: https://github.com/puppeteer/puppeteer/issues/2548
+        Debug_js_1.debug('puppeteer:frame')(`The frame '${event.targetInfo.targetId}' moved to another session. ` +
+            `Out-of-process iframes (OOPIF) are not supported by Puppeteer yet. ` +
+            `https://github.com/puppeteer/puppeteer/issues/2548`);
+    }
+    _onLifecycleEvent(event) {
+        const frame = this._frames.get(event.frameId);
+        if (!frame)
+            return;
+        frame._onLifecycleEvent(event.loaderId, event.name);
+        this.emit(exports.FrameManagerEmittedEvents.LifecycleEvent, frame);
+    }
+    _onFrameStoppedLoading(frameId) {
+        const frame = this._frames.get(frameId);
+        if (!frame)
+            return;
+        frame._onLoadingStopped();
+        this.emit(exports.FrameManagerEmittedEvents.LifecycleEvent, frame);
+    }
+    _handleFrameTree(frameTree) {
+        if (frameTree.frame.parentId)
+            this._onFrameAttached(frameTree.frame.id, frameTree.frame.parentId);
+        this._onFrameNavigated(frameTree.frame);
+        if (!frameTree.childFrames)
+            return;
+        for (const child of frameTree.childFrames)
+            this._handleFrameTree(child);
+    }
+    page() {
+        return this._page;
+    }
+    mainFrame() {
+        return this._mainFrame;
+    }
+    frames() {
+        return Array.from(this._frames.values());
+    }
+    frame(frameId) {
+        return this._frames.get(frameId) || null;
+    }
+    _onFrameAttached(frameId, parentFrameId) {
+        if (this._frames.has(frameId))
+            return;
+        assert_js_1.assert(parentFrameId);
+        const parentFrame = this._frames.get(parentFrameId);
+        const frame = new Frame(this, parentFrame, frameId);
+        this._frames.set(frame._id, frame);
+        this.emit(exports.FrameManagerEmittedEvents.FrameAttached, frame);
+    }
+    _onFrameNavigated(framePayload) {
+        const isMainFrame = !framePayload.parentId;
+        let frame = isMainFrame
+            ? this._mainFrame
+            : this._frames.get(framePayload.id);
+        assert_js_1.assert(isMainFrame || frame, 'We either navigate top level or have old version of the navigated frame');
+        // Detach all child frames first.
+        if (frame) {
+            for (const child of frame.childFrames())
+                this._removeFramesRecursively(child);
+        }
+        // Update or create main frame.
+        if (isMainFrame) {
+            if (frame) {
+                // Update frame id to retain frame identity on cross-process navigation.
+                this._frames.delete(frame._id);
+                frame._id = framePayload.id;
+            }
+            else {
+                // Initial main frame navigation.
+                frame = new Frame(this, null, framePayload.id);
+            }
+            this._frames.set(framePayload.id, frame);
+            this._mainFrame = frame;
+        }
+        // Update frame payload.
+        frame._navigated(framePayload);
+        this.emit(exports.FrameManagerEmittedEvents.FrameNavigated, frame);
+    }
+    async _ensureIsolatedWorld(name) {
+        if (this._isolatedWorlds.has(name))
+            return;
+        this._isolatedWorlds.add(name);
+        await this._client.send('Page.addScriptToEvaluateOnNewDocument', {
+            source: `//# sourceURL=${ExecutionContext_js_1.EVALUATION_SCRIPT_URL}`,
+            worldName: name,
+        }),
+            await Promise.all(this.frames().map((frame) => this._client
+                .send('Page.createIsolatedWorld', {
+                frameId: frame._id,
+                grantUniveralAccess: true,
+                worldName: name,
+            })
+                .catch(helper_js_1.debugError))); // frames might be removed before we send this
+    }
+    _onFrameNavigatedWithinDocument(frameId, url) {
+        const frame = this._frames.get(frameId);
+        if (!frame)
+            return;
+        frame._navigatedWithinDocument(url);
+        this.emit(exports.FrameManagerEmittedEvents.FrameNavigatedWithinDocument, frame);
+        this.emit(exports.FrameManagerEmittedEvents.FrameNavigated, frame);
+    }
+    _onFrameDetached(frameId) {
+        const frame = this._frames.get(frameId);
+        if (frame)
+            this._removeFramesRecursively(frame);
+    }
+    _onExecutionContextCreated(contextPayload) {
+        const auxData = contextPayload.auxData;
+        const frameId = auxData ? auxData.frameId : null;
+        const frame = this._frames.get(frameId) || null;
+        let world = null;
+        if (frame) {
+            if (contextPayload.auxData && !!contextPayload.auxData['isDefault']) {
+                world = frame._mainWorld;
+            }
+            else if (contextPayload.name === UTILITY_WORLD_NAME &&
+                !frame._secondaryWorld._hasContext()) {
+                // In case of multiple sessions to the same target, there's a race between
+                // connections so we might end up creating multiple isolated worlds.
+                // We can use either.
+                world = frame._secondaryWorld;
+            }
+        }
+        if (contextPayload.auxData && contextPayload.auxData['type'] === 'isolated')
+            this._isolatedWorlds.add(contextPayload.name);
+        const context = new ExecutionContext_js_1.ExecutionContext(this._client, contextPayload, world);
+        if (world)
+            world._setContext(context);
+        this._contextIdToContext.set(contextPayload.id, context);
+    }
+    _onExecutionContextDestroyed(executionContextId) {
+        const context = this._contextIdToContext.get(executionContextId);
+        if (!context)
+            return;
+        this._contextIdToContext.delete(executionContextId);
+        if (context._world)
+            context._world._setContext(null);
+    }
+    _onExecutionContextsCleared() {
+        for (const context of this._contextIdToContext.values()) {
+            if (context._world)
+                context._world._setContext(null);
+        }
+        this._contextIdToContext.clear();
+    }
+    executionContextById(contextId) {
+        const context = this._contextIdToContext.get(contextId);
+        assert_js_1.assert(context, 'INTERNAL ERROR: missing context with id = ' + contextId);
+        return context;
+    }
+    _removeFramesRecursively(frame) {
+        for (const child of frame.childFrames())
+            this._removeFramesRecursively(child);
+        frame._detach();
+        this._frames.delete(frame._id);
+        this.emit(exports.FrameManagerEmittedEvents.FrameDetached, frame);
+    }
+}
+exports.FrameManager = FrameManager;
+/**
+ * At every point of time, page exposes its current frame tree via the
+ * {@link Page.mainFrame | page.mainFrame} and
+ * {@link Frame.childFrames | frame.childFrames} methods.
+ *
+ * @remarks
+ *
+ * `Frame` object lifecycles are controlled by three events that are all
+ * dispatched on the page object:
+ *
+ * - {@link PageEmittedEvents.FrameAttached}
+ *
+ * - {@link PageEmittedEvents.FrameNavigated}
+ *
+ * - {@link PageEmittedEvents.FrameDetached}
+ *
+ * @Example
+ * An example of dumping frame tree:
+ *
+ * ```js
+ * const puppeteer = require('puppeteer');
+ *
+ * (async () => {
+ *   const browser = await puppeteer.launch();
+ *   const page = await browser.newPage();
+ *   await page.goto('https://www.google.com/chrome/browser/canary.html');
+ *   dumpFrameTree(page.mainFrame(), '');
+ *   await browser.close();
+ *
+ *   function dumpFrameTree(frame, indent) {
+ *     console.log(indent + frame.url());
+ *     for (const child of frame.childFrames()) {
+ *     dumpFrameTree(child, indent + '  ');
+ *     }
+ *   }
+ * })();
+ * ```
+ *
+ * @Example
+ * An example of getting text from an iframe element:
+ *
+ * ```js
+ * const frame = page.frames().find(frame => frame.name() === 'myframe');
+ * const text = await frame.$eval('.selector', element => element.textContent);
+ * console.log(text);
+ * ```
+ *
+ * @public
+ */
+class Frame {
+    /**
+     * @internal
+     */
+    constructor(frameManager, parentFrame, frameId) {
+        this._url = '';
+        this._detached = false;
+        /**
+         * @internal
+         */
+        this._loaderId = '';
+        /**
+         * @internal
+         */
+        this._lifecycleEvents = new Set();
+        this._frameManager = frameManager;
+        this._parentFrame = parentFrame;
+        this._url = '';
+        this._id = frameId;
+        this._detached = false;
+        this._loaderId = '';
+        this._mainWorld = new DOMWorld_js_1.DOMWorld(frameManager, this, frameManager._timeoutSettings);
+        this._secondaryWorld = new DOMWorld_js_1.DOMWorld(frameManager, this, frameManager._timeoutSettings);
+        this._childFrames = new Set();
+        if (this._parentFrame)
+            this._parentFrame._childFrames.add(this);
+    }
+    /**
+     * @remarks
+     *
+     * `frame.goto` will throw an error if:
+     * - there's an SSL error (e.g. in case of self-signed certificates).
+     *
+     * - target URL is invalid.
+     *
+     * - the `timeout` is exceeded during navigation.
+     *
+     * - the remote server does not respond or is unreachable.
+     *
+     * - the main resource failed to load.
+     *
+     * `frame.goto` will not throw an error when any valid HTTP status code is
+     * returned by the remote server, including 404 "Not Found" and 500 "Internal
+     * Server Error".  The status code for such responses can be retrieved by
+     * calling {@link HTTPResponse.status}.
+     *
+     * NOTE: `frame.goto` either throws an error or returns a main resource
+     * response. The only exceptions are navigation to `about:blank` or
+     * navigation to the same URL with a different hash, which would succeed and
+     * return `null`.
+     *
+     * NOTE: Headless mode doesn't support navigation to a PDF document. See
+     * the {@link https://bugs.chromium.org/p/chromium/issues/detail?id=761295 | upstream
+     * issue}.
+     *
+     * @param url - the URL to navigate the frame to. This should include the
+     * scheme, e.g. `https://`.
+     * @param options - navigation options. `waitUntil` is useful to define when
+     * the navigation should be considered successful - see the docs for
+     * {@link PuppeteerLifeCycleEvent} for more details.
+     *
+     * @returns A promise which resolves to the main resource response. In case of
+     * multiple redirects, the navigation will resolve with the response of the
+     * last redirect.
+     */
+    async goto(url, options = {}) {
+        return await this._frameManager.navigateFrame(this, url, options);
+    }
+    /**
+     * @remarks
+     *
+     * This resolves when the frame navigates to a new URL. It is useful for when
+     * you run code which will indirectly cause the frame to navigate. Consider
+     * this example:
+     *
+     * ```js
+     * const [response] = await Promise.all([
+     *   // The navigation promise resolves after navigation has finished
+     *   frame.waitForNavigation(),
+     *   // Clicking the link will indirectly cause a navigation
+     *   frame.click('a.my-link'),
+     * ]);
+     * ```
+     *
+     * Usage of the {@link https://developer.mozilla.org/en-US/docs/Web/API/History_API | History API} to change the URL is considered a navigation.
+     *
+     * @param options - options to configure when the navigation is consided finished.
+     * @returns a promise that resolves when the frame navigates to a new URL.
+     */
+    async waitForNavigation(options = {}) {
+        return await this._frameManager.waitForFrameNavigation(this, options);
+    }
+    /**
+     * @returns a promise that resolves to the frame's default execution context.
+     */
+    executionContext() {
+        return this._mainWorld.executionContext();
+    }
+    /**
+     * @remarks
+     *
+     * The only difference between {@link Frame.evaluate} and
+     * `frame.evaluateHandle` is that `evaluateHandle` will return the value
+     * wrapped in an in-page object.
+     *
+     * This method behaves identically to {@link Page.evaluateHandle} except it's
+     * run within the context of the `frame`, rather than the entire page.
+     *
+     * @param pageFunction - a function that is run within the frame
+     * @param args - arguments to be passed to the pageFunction
+     */
+    async evaluateHandle(pageFunction, ...args) {
+        return this._mainWorld.evaluateHandle(pageFunction, ...args);
+    }
+    /**
+     * @remarks
+     *
+     * This method behaves identically to {@link Page.evaluate} except it's run
+     * within the context of the `frame`, rather than the entire page.
+     *
+     * @param pageFunction - a function that is run within the frame
+     * @param args - arguments to be passed to the pageFunction
+     */
+    async evaluate(pageFunction, ...args) {
+        return this._mainWorld.evaluate(pageFunction, ...args);
+    }
+    /**
+     * This method queries the frame for the given selector.
+     *
+     * @param selector - a selector to query for.
+     * @returns A promise which resolves to an `ElementHandle` pointing at the
+     * element, or `null` if it was not found.
+     */
+    async $(selector) {
+        return this._mainWorld.$(selector);
+    }
+    /**
+     * This method evaluates the given XPath expression and returns the results.
+     *
+     * @param expression - the XPath expression to evaluate.
+     */
+    async $x(expression) {
+        return this._mainWorld.$x(expression);
+    }
+    /**
+     * @remarks
+     *
+     * This method runs `document.querySelector` within
+     * the frame and passes it as the first argument to `pageFunction`.
+     *
+     * If `pageFunction` returns a Promise, then `frame.$eval` would wait for
+     * the promise to resolve and return its value.
+     *
+     * @example
+     *
+     * ```js
+     * const searchValue = await frame.$eval('#search', el => el.value);
+     * ```
+     *
+     * @param selector - the selector to query for
+     * @param pageFunction - the function to be evaluated in the frame's context
+     * @param args - additional arguments to pass to `pageFuncton`
+     */
+    async $eval(selector, pageFunction, ...args) {
+        return this._mainWorld.$eval(selector, pageFunction, ...args);
+    }
+    /**
+     * @remarks
+     *
+     * This method runs `Array.from(document.querySelectorAll(selector))` within
+     * the frame and passes it as the first argument to `pageFunction`.
+     *
+     * If `pageFunction` returns a Promise, then `frame.$$eval` would wait for
+     * the promise to resolve and return its value.
+     *
+     * @example
+     *
+     * ```js
+     * const divsCounts = await frame.$$eval('div', divs => divs.length);
+     * ```
+     *
+     * @param selector - the selector to query for
+     * @param pageFunction - the function to be evaluated in the frame's context
+     * @param args - additional arguments to pass to `pageFuncton`
+     */
+    async $$eval(selector, pageFunction, ...args) {
+        return this._mainWorld.$$eval(selector, pageFunction, ...args);
+    }
+    /**
+     * This runs `document.querySelectorAll` in the frame and returns the result.
+     *
+     * @param selector - a selector to search for
+     * @returns An array of element handles pointing to the found frame elements.
+     */
+    async $$(selector) {
+        return this._mainWorld.$$(selector);
+    }
+    /**
+     * @returns the full HTML contents of the frame, including the doctype.
+     */
+    async content() {
+        return this._secondaryWorld.content();
+    }
+    /**
+     * Set the content of the frame.
+     *
+     * @param html - HTML markup to assign to the page.
+     * @param options - options to configure how long before timing out and at
+     * what point to consider the content setting successful.
+     */
+    async setContent(html, options = {}) {
+        return this._secondaryWorld.setContent(html, options);
+    }
+    /**
+     * @remarks
+     *
+     * If the name is empty, it returns the `id` attribute instead.
+     *
+     * Note: This value is calculated once when the frame is created, and will not
+     * update if the attribute is changed later.
+     *
+     * @returns the frame's `name` attribute as specified in the tag.
+     */
+    name() {
+        return this._name || '';
+    }
+    /**
+     * @returns the frame's URL.
+     */
+    url() {
+        return this._url;
+    }
+    /**
+     * @returns the parent `Frame`, if any. Detached and main frames return `null`.
+     */
+    parentFrame() {
+        return this._parentFrame;
+    }
+    /**
+     * @returns an array of child frames.
+     */
+    childFrames() {
+        return Array.from(this._childFrames);
+    }
+    /**
+     * @returns `true` if the frame has been detached, or `false` otherwise.
+     */
+    isDetached() {
+        return this._detached;
+    }
+    /**
+     * Adds a `<script>` tag into the page with the desired url or content.
+     *
+     * @param options - configure the script to add to the page.
+     *
+     * @returns a promise that resolves to the added tag when the script's
+     * `onload` event fires or when the script content was injected into the
+     * frame.
+     */
+    async addScriptTag(options) {
+        return this._mainWorld.addScriptTag(options);
+    }
+    /**
+     * Adds a `<link rel="stylesheet">` tag into the page with the desired url or
+     * a `<style type="text/css">` tag with the content.
+     *
+     * @param options - configure the CSS to add to the page.
+     *
+     * @returns a promise that resolves to the added tag when the stylesheets's
+     * `onload` event fires or when the CSS content was injected into the
+     * frame.
+     */
+    async addStyleTag(options) {
+        return this._mainWorld.addStyleTag(options);
+    }
+    /**
+     *
+     * This method clicks the first element found that matches `selector`.
+     *
+     * @remarks
+     *
+     * This method scrolls the element into view if needed, and then uses
+     * {@link Page.mouse} to click in the center of the element. If there's no
+     * element matching `selector`, the method throws an error.
+     *
+     * Bear in mind that if `click()` triggers a navigation event and there's a
+     * separate `page.waitForNavigation()` promise to be resolved, you may end up
+     * with a race condition that yields unexpected results. The correct pattern
+     * for click and wait for navigation is the following:
+     *
+     * ```javascript
+     * const [response] = await Promise.all([
+     *   page.waitForNavigation(waitOptions),
+     *   frame.click(selector, clickOptions),
+     * ]);
+     * ```
+     * @param selector - the selector to search for to click. If there are
+     * multiple elements, the first will be clicked.
+     */
+    async click(selector, options = {}) {
+        return this._secondaryWorld.click(selector, options);
+    }
+    /**
+     * This method fetches an element with `selector` and focuses it.
+     *
+     * @remarks
+     * If there's no element matching `selector`, the method throws an error.
+     *
+     * @param selector - the selector for the element to focus. If there are
+     * multiple elements, the first will be focused.
+     */
+    async focus(selector) {
+        return this._secondaryWorld.focus(selector);
+    }
+    /**
+     * This method fetches an element with `selector`, scrolls it into view if
+     * needed, and then uses {@link Page.mouse} to hover over the center of the
+     * element.
+     *
+     * @remarks
+     * If there's no element matching `selector`, the method throws an
+     *
+     * @param selector - the selector for the element to hover. If there are
+     * multiple elements, the first will be hovered.
+     */
+    async hover(selector) {
+        return this._secondaryWorld.hover(selector);
+    }
+    /**
+     * Triggers a `change` and `input` event once all the provided options have
+     * been selected.
+     *
+     * @remarks
+     *
+     * If there's no `<select>` element matching `selector`, the
+     * method throws an error.
+     *
+     * @example
+     * ```js
+     * frame.select('select#colors', 'blue'); // single selection
+     * frame.select('select#colors', 'red', 'green', 'blue'); // multiple selections
+     * ```
+     *
+     * @param selector - a selector to query the frame for
+     * @param values - an array of values to select. If the `<select>` has the
+     * `multiple` attribute, all values are considered, otherwise only the first
+     * one is taken into account.
+     * @returns the list of values that were successfully selected.
+     */
+    select(selector, ...values) {
+        return this._secondaryWorld.select(selector, ...values);
+    }
+    /**
+     * This method fetches an element with `selector`, scrolls it into view if
+     * needed, and then uses {@link Page.touchscreen} to tap in the center of the
+     * element.
+     *
+     * @remarks
+     *
+     * If there's no element matching `selector`, the method throws an error.
+     *
+     * @param selector - the selector to tap.
+     * @returns a promise that resolves when the element has been tapped.
+     */
+    async tap(selector) {
+        return this._secondaryWorld.tap(selector);
+    }
+    /**
+     * Sends a `keydown`, `keypress`/`input`, and `keyup` event for each character
+     * in the text.
+     *
+     * @remarks
+     * To press a special key, like `Control` or `ArrowDown`, use
+     * {@link Keyboard.press}.
+     *
+     * @example
+     * ```js
+     * await frame.type('#mytextarea', 'Hello'); // Types instantly
+     * await frame.type('#mytextarea', 'World', {delay: 100}); // Types slower, like a user
+     * ```
+     *
+     * @param selector - the selector for the element to type into. If there are
+     * multiple the first will be used.
+     * @param text - text to type into the element
+     * @param options - takes one option, `delay`, which sets the time to wait
+     * between key presses in milliseconds. Defaults to `0`.
+     *
+     * @returns a promise that resolves when the typing is complete.
+     */
+    async type(selector, text, options) {
+        return this._mainWorld.type(selector, text, options);
+    }
+    /**
+     * @remarks
+     *
+     * This method behaves differently depending on the first parameter. If it's a
+     * `string`, it will be treated as a `selector` or `xpath` (if the string
+     * starts with `//`). This method then is a shortcut for
+     * {@link Frame.waitForSelector} or {@link Frame.waitForXPath}.
+     *
+     * If the first argument is a function this method is a shortcut for
+     * {@link Frame.waitForFunction}.
+     *
+     * If the first argument is a `number`, it's treated as a timeout in
+     * milliseconds and the method returns a promise which resolves after the
+     * timeout.
+     *
+     * @param selectorOrFunctionOrTimeout - a selector, predicate or timeout to
+     * wait for.
+     * @param options - optional waiting parameters.
+     * @param args - arguments to pass to `pageFunction`.
+     *
+     * @deprecated Don't use this method directly. Instead use the more explicit
+     * methods available: {@link Frame.waitForSelector},
+     * {@link Frame.waitForXPath}, {@link Frame.waitForFunction} or
+     * {@link Frame.waitForTimeout}.
+     */
+    waitFor(selectorOrFunctionOrTimeout, options = {}, ...args) {
+        const xPathPattern = '//';
+        console.warn('waitFor is deprecated and will be removed in a future release. See https://github.com/puppeteer/puppeteer/issues/6214 for details and how to migrate your code.');
+        if (helper_js_1.helper.isString(selectorOrFunctionOrTimeout)) {
+            const string = selectorOrFunctionOrTimeout;
+            if (string.startsWith(xPathPattern))
+                return this.waitForXPath(string, options);
+            return this.waitForSelector(string, options);
+        }
+        if (helper_js_1.helper.isNumber(selectorOrFunctionOrTimeout))
+            return new Promise((fulfill) => setTimeout(fulfill, selectorOrFunctionOrTimeout));
+        if (typeof selectorOrFunctionOrTimeout === 'function')
+            return this.waitForFunction(selectorOrFunctionOrTimeout, options, ...args);
+        return Promise.reject(new Error('Unsupported target type: ' + typeof selectorOrFunctionOrTimeout));
+    }
+    /**
+     * Causes your script to wait for the given number of milliseconds.
+     *
+     * @remarks
+     * It's generally recommended to not wait for a number of seconds, but instead
+     * use {@link Frame.waitForSelector}, {@link Frame.waitForXPath} or
+     * {@link Frame.waitForFunction} to wait for exactly the conditions you want.
+     *
+     * @example
+     *
+     * Wait for 1 second:
+     *
+     * ```
+     * await frame.waitForTimeout(1000);
+     * ```
+     *
+     * @param milliseconds - the number of milliseconds to wait.
+     */
+    waitForTimeout(milliseconds) {
+        return new Promise((resolve) => {
+            setTimeout(resolve, milliseconds);
+        });
+    }
+    /**
+     * @remarks
+     *
+     *
+     * Wait for the `selector` to appear in page. If at the moment of calling the
+     * method the `selector` already exists, the method will return immediately.
+     * If the selector doesn't appear after the `timeout` milliseconds of waiting,
+     * the function will throw.
+     *
+     * This method works across navigations.
+     *
+     * @example
+     * ```js
+     * const puppeteer = require('puppeteer');
+     *
+     * (async () => {
+     *   const browser = await puppeteer.launch();
+     *   const page = await browser.newPage();
+     *   let currentURL;
+     *   page.mainFrame()
+     *   .waitForSelector('img')
+     *   .then(() => console.log('First URL with image: ' + currentURL));
+     *
+     *   for (currentURL of ['https://example.com', 'https://google.com', 'https://bbc.com']) {
+     *     await page.goto(currentURL);
+     *   }
+     *   await browser.close();
+     * })();
+     * ```
+     * @param selector - the selector to wait for.
+     * @param options - options to define if the element should be visible and how
+     * long to wait before timing out.
+     * @returns a promise which resolves when an element matching the selector
+     * string is added to the DOM.
+     */
+    async waitForSelector(selector, options = {}) {
+        const handle = await this._secondaryWorld.waitForSelector(selector, options);
+        if (!handle)
+            return null;
+        const mainExecutionContext = await this._mainWorld.executionContext();
+        const result = await mainExecutionContext._adoptElementHandle(handle);
+        await handle.dispose();
+        return result;
+    }
+    /**
+     * @remarks
+     * Wait for the `xpath` to appear in page. If at the moment of calling the
+     * method the `xpath` already exists, the method will return immediately. If
+     * the xpath doesn't appear after the `timeout` milliseconds of waiting, the
+     * function will throw.
+     *
+     * For a code example, see the example for {@link Frame.waitForSelector}. That
+     * function behaves identically other than taking a CSS selector rather than
+     * an XPath.
+     *
+     * @param xpath - the XPath expression to wait for.
+     * @param options  - options to configure the visiblity of the element and how
+     * long to wait before timing out.
+     */
+    async waitForXPath(xpath, options = {}) {
+        const handle = await this._secondaryWorld.waitForXPath(xpath, options);
+        if (!handle)
+            return null;
+        const mainExecutionContext = await this._mainWorld.executionContext();
+        const result = await mainExecutionContext._adoptElementHandle(handle);
+        await handle.dispose();
+        return result;
+    }
+    /**
+     * @remarks
+     *
+     * @example
+     *
+     * The `waitForFunction` can be used to observe viewport size change:
+     * ```js
+     * const puppeteer = require('puppeteer');
+     *
+     * (async () => {
+     * .  const browser = await puppeteer.launch();
+     * .  const page = await browser.newPage();
+     * .  const watchDog = page.mainFrame().waitForFunction('window.innerWidth < 100');
+     * .  page.setViewport({width: 50, height: 50});
+     * .  await watchDog;
+     * .  await browser.close();
+     * })();
+     * ```
+     *
+     * To pass arguments from Node.js to the predicate of `page.waitForFunction` function:
+     *
+     * ```js
+     * const selector = '.foo';
+     * await frame.waitForFunction(
+     *   selector => !!document.querySelector(selector),
+     *   {}, // empty options object
+     *   selector
+     *);
+     * ```
+     *
+     * @param pageFunction - the function to evaluate in the frame context.
+     * @param options - options to configure the polling method and timeout.
+     * @param args - arguments to pass to the `pageFunction`.
+     * @returns the promise which resolve when the `pageFunction` returns a truthy value.
+     */
+    waitForFunction(pageFunction, options = {}, ...args) {
+        return this._mainWorld.waitForFunction(pageFunction, options, ...args);
+    }
+    /**
+     * @returns the frame's title.
+     */
+    async title() {
+        return this._secondaryWorld.title();
+    }
+    /**
+     * @internal
+     */
+    _navigated(framePayload) {
+        this._name = framePayload.name;
+        this._url = `${framePayload.url}${framePayload.urlFragment || ''}`;
+    }
+    /**
+     * @internal
+     */
+    _navigatedWithinDocument(url) {
+        this._url = url;
+    }
+    /**
+     * @internal
+     */
+    _onLifecycleEvent(loaderId, name) {
+        if (name === 'init') {
+            this._loaderId = loaderId;
+            this._lifecycleEvents.clear();
+        }
+        this._lifecycleEvents.add(name);
+    }
+    /**
+     * @internal
+     */
+    _onLoadingStopped() {
+        this._lifecycleEvents.add('DOMContentLoaded');
+        this._lifecycleEvents.add('load');
+    }
+    /**
+     * @internal
+     */
+    _detach() {
+        this._detached = true;
+        this._mainWorld._detach();
+        this._secondaryWorld._detach();
+        if (this._parentFrame)
+            this._parentFrame._childFrames.delete(this);
+        this._parentFrame = null;
+    }
+}
+exports.Frame = Frame;
+function assertNoLegacyNavigationOptions(options) {
+    assert_js_1.assert(options['networkIdleTimeout'] === undefined, 'ERROR: networkIdleTimeout option is no longer supported.');
+    assert_js_1.assert(options['networkIdleInflight'] === undefined, 'ERROR: networkIdleInflight option is no longer supported.');
+    assert_js_1.assert(options.waitUntil !== 'networkidle', 'ERROR: "networkidle" option is no longer supported. Use "networkidle2" instead');
+}
+
+
+/***/ }),
 /* 453 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -20893,7 +23165,7 @@ Object.defineProperty(exports, '__esModule', { value: true });
 
 function _interopDefault (ex) { return (ex && (typeof ex === 'object') && 'default' in ex) ? ex['default'] : ex; }
 
-var Stream = _interopDefault(__webpack_require__(418));
+var Stream = _interopDefault(__webpack_require__(413));
 var http = _interopDefault(__webpack_require__(605));
 var Url = _interopDefault(__webpack_require__(835));
 var https = _interopDefault(__webpack_require__(211));
@@ -22608,18 +24880,93 @@ module.exports.sync = (paths, options) => {
 /***/ }),
 /* 458 */,
 /* 459 */
-/***/ (function(module) {
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
-module.exports = eval("require")("bufferutil");
+"use strict";
+
+/**
+ * Copyright 2020 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.debug = void 0;
+const environment_js_1 = __webpack_require__(975);
+/**
+ * A debug function that can be used in any environment.
+ *
+ * @remarks
+ *
+ * If used in Node, it falls back to the
+ * {@link https://www.npmjs.com/package/debug | debug module}. In the browser it
+ * uses `console.log`.
+ *
+ * @param prefix - this will be prefixed to each log.
+ * @returns a function that can be called to log to that debug channel.
+ *
+ * In Node, use the `DEBUG` environment variable to control logging:
+ *
+ * ```
+ * DEBUG=* // logs all channels
+ * DEBUG=foo // logs the `foo` channel
+ * DEBUG=foo* // logs any channels starting with `foo`
+ * ```
+ *
+ * In the browser, set `window.__PUPPETEER_DEBUG` to a string:
+ *
+ * ```
+ * window.__PUPPETEER_DEBUG='*'; // logs all channels
+ * window.__PUPPETEER_DEBUG='foo'; // logs the `foo` channel
+ * window.__PUPPETEER_DEBUG='foo*'; // logs any channels starting with `foo`
+ * ```
+ *
+ * @example
+ * ```
+ * const log = debug('Page');
+ *
+ * log('new page created')
+ * // logs "Page: new page created"
+ * ```
+ */
+exports.debug = (prefix) => {
+    if (environment_js_1.isNode) {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        return __webpack_require__(784)(prefix);
+    }
+    return (...logArgs) => {
+        const debugLevel = globalThis.__PUPPETEER_DEBUG;
+        if (!debugLevel)
+            return;
+        const everythingShouldBeLogged = debugLevel === '*';
+        const prefixMatchesDebugLevel = everythingShouldBeLogged ||
+            /**
+             * If the debug level is `foo*`, that means we match any prefix that
+             * starts with `foo`. If the level is `foo`, we match only the prefix
+             * `foo`.
+             */
+            (debugLevel.endsWith('*')
+                ? prefix.startsWith(debugLevel)
+                : prefix === debugLevel);
+        if (!prefixMatchesDebugLevel)
+            return;
+        // eslint-disable-next-line no-console
+        console.log(`${prefix}:`, ...logArgs);
+    };
+};
 
 
 /***/ }),
-/* 460 */
-/***/ (function(module) {
-
-module.exports = {"application/andrew-inset":["ez"],"application/applixware":["aw"],"application/atom+xml":["atom"],"application/atomcat+xml":["atomcat"],"application/atomdeleted+xml":["atomdeleted"],"application/atomsvc+xml":["atomsvc"],"application/atsc-dwd+xml":["dwd"],"application/atsc-held+xml":["held"],"application/atsc-rsat+xml":["rsat"],"application/bdoc":["bdoc"],"application/calendar+xml":["xcs"],"application/ccxml+xml":["ccxml"],"application/cdfx+xml":["cdfx"],"application/cdmi-capability":["cdmia"],"application/cdmi-container":["cdmic"],"application/cdmi-domain":["cdmid"],"application/cdmi-object":["cdmio"],"application/cdmi-queue":["cdmiq"],"application/cu-seeme":["cu"],"application/dash+xml":["mpd"],"application/davmount+xml":["davmount"],"application/docbook+xml":["dbk"],"application/dssc+der":["dssc"],"application/dssc+xml":["xdssc"],"application/ecmascript":["ecma","es"],"application/emma+xml":["emma"],"application/emotionml+xml":["emotionml"],"application/epub+zip":["epub"],"application/exi":["exi"],"application/fdt+xml":["fdt"],"application/font-tdpfr":["pfr"],"application/geo+json":["geojson"],"application/gml+xml":["gml"],"application/gpx+xml":["gpx"],"application/gxf":["gxf"],"application/gzip":["gz"],"application/hjson":["hjson"],"application/hyperstudio":["stk"],"application/inkml+xml":["ink","inkml"],"application/ipfix":["ipfix"],"application/its+xml":["its"],"application/java-archive":["jar","war","ear"],"application/java-serialized-object":["ser"],"application/java-vm":["class"],"application/javascript":["js","mjs"],"application/json":["json","map"],"application/json5":["json5"],"application/jsonml+json":["jsonml"],"application/ld+json":["jsonld"],"application/lgr+xml":["lgr"],"application/lost+xml":["lostxml"],"application/mac-binhex40":["hqx"],"application/mac-compactpro":["cpt"],"application/mads+xml":["mads"],"application/manifest+json":["webmanifest"],"application/marc":["mrc"],"application/marcxml+xml":["mrcx"],"application/mathematica":["ma","nb","mb"],"application/mathml+xml":["mathml"],"application/mbox":["mbox"],"application/mediaservercontrol+xml":["mscml"],"application/metalink+xml":["metalink"],"application/metalink4+xml":["meta4"],"application/mets+xml":["mets"],"application/mmt-aei+xml":["maei"],"application/mmt-usd+xml":["musd"],"application/mods+xml":["mods"],"application/mp21":["m21","mp21"],"application/mp4":["mp4s","m4p"],"application/mrb-consumer+xml":["*xdf"],"application/mrb-publish+xml":["*xdf"],"application/msword":["doc","dot"],"application/mxf":["mxf"],"application/n-quads":["nq"],"application/n-triples":["nt"],"application/node":["cjs"],"application/octet-stream":["bin","dms","lrf","mar","so","dist","distz","pkg","bpk","dump","elc","deploy","exe","dll","deb","dmg","iso","img","msi","msp","msm","buffer"],"application/oda":["oda"],"application/oebps-package+xml":["opf"],"application/ogg":["ogx"],"application/omdoc+xml":["omdoc"],"application/onenote":["onetoc","onetoc2","onetmp","onepkg"],"application/oxps":["oxps"],"application/p2p-overlay+xml":["relo"],"application/patch-ops-error+xml":["*xer"],"application/pdf":["pdf"],"application/pgp-encrypted":["pgp"],"application/pgp-signature":["asc","sig"],"application/pics-rules":["prf"],"application/pkcs10":["p10"],"application/pkcs7-mime":["p7m","p7c"],"application/pkcs7-signature":["p7s"],"application/pkcs8":["p8"],"application/pkix-attr-cert":["ac"],"application/pkix-cert":["cer"],"application/pkix-crl":["crl"],"application/pkix-pkipath":["pkipath"],"application/pkixcmp":["pki"],"application/pls+xml":["pls"],"application/postscript":["ai","eps","ps"],"application/provenance+xml":["provx"],"application/pskc+xml":["pskcxml"],"application/raml+yaml":["raml"],"application/rdf+xml":["rdf","owl"],"application/reginfo+xml":["rif"],"application/relax-ng-compact-syntax":["rnc"],"application/resource-lists+xml":["rl"],"application/resource-lists-diff+xml":["rld"],"application/rls-services+xml":["rs"],"application/route-apd+xml":["rapd"],"application/route-s-tsid+xml":["sls"],"application/route-usd+xml":["rusd"],"application/rpki-ghostbusters":["gbr"],"application/rpki-manifest":["mft"],"application/rpki-roa":["roa"],"application/rsd+xml":["rsd"],"application/rss+xml":["rss"],"application/rtf":["rtf"],"application/sbml+xml":["sbml"],"application/scvp-cv-request":["scq"],"application/scvp-cv-response":["scs"],"application/scvp-vp-request":["spq"],"application/scvp-vp-response":["spp"],"application/sdp":["sdp"],"application/senml+xml":["senmlx"],"application/sensml+xml":["sensmlx"],"application/set-payment-initiation":["setpay"],"application/set-registration-initiation":["setreg"],"application/shf+xml":["shf"],"application/sieve":["siv","sieve"],"application/smil+xml":["smi","smil"],"application/sparql-query":["rq"],"application/sparql-results+xml":["srx"],"application/srgs":["gram"],"application/srgs+xml":["grxml"],"application/sru+xml":["sru"],"application/ssdl+xml":["ssdl"],"application/ssml+xml":["ssml"],"application/swid+xml":["swidtag"],"application/tei+xml":["tei","teicorpus"],"application/thraud+xml":["tfi"],"application/timestamped-data":["tsd"],"application/toml":["toml"],"application/ttml+xml":["ttml"],"application/urc-ressheet+xml":["rsheet"],"application/voicexml+xml":["vxml"],"application/wasm":["wasm"],"application/widget":["wgt"],"application/winhlp":["hlp"],"application/wsdl+xml":["wsdl"],"application/wspolicy+xml":["wspolicy"],"application/xaml+xml":["xaml"],"application/xcap-att+xml":["xav"],"application/xcap-caps+xml":["xca"],"application/xcap-diff+xml":["xdf"],"application/xcap-el+xml":["xel"],"application/xcap-error+xml":["xer"],"application/xcap-ns+xml":["xns"],"application/xenc+xml":["xenc"],"application/xhtml+xml":["xhtml","xht"],"application/xliff+xml":["xlf"],"application/xml":["xml","xsl","xsd","rng"],"application/xml-dtd":["dtd"],"application/xop+xml":["xop"],"application/xproc+xml":["xpl"],"application/xslt+xml":["xslt"],"application/xspf+xml":["xspf"],"application/xv+xml":["mxml","xhvml","xvml","xvm"],"application/yang":["yang"],"application/yin+xml":["yin"],"application/zip":["zip"],"audio/3gpp":["*3gpp"],"audio/adpcm":["adp"],"audio/basic":["au","snd"],"audio/midi":["mid","midi","kar","rmi"],"audio/mobile-xmf":["mxmf"],"audio/mp3":["*mp3"],"audio/mp4":["m4a","mp4a"],"audio/mpeg":["mpga","mp2","mp2a","mp3","m2a","m3a"],"audio/ogg":["oga","ogg","spx"],"audio/s3m":["s3m"],"audio/silk":["sil"],"audio/wav":["wav"],"audio/wave":["*wav"],"audio/webm":["weba"],"audio/xm":["xm"],"font/collection":["ttc"],"font/otf":["otf"],"font/ttf":["ttf"],"font/woff":["woff"],"font/woff2":["woff2"],"image/aces":["exr"],"image/apng":["apng"],"image/bmp":["bmp"],"image/cgm":["cgm"],"image/dicom-rle":["drle"],"image/emf":["emf"],"image/fits":["fits"],"image/g3fax":["g3"],"image/gif":["gif"],"image/heic":["heic"],"image/heic-sequence":["heics"],"image/heif":["heif"],"image/heif-sequence":["heifs"],"image/hej2k":["hej2"],"image/hsj2":["hsj2"],"image/ief":["ief"],"image/jls":["jls"],"image/jp2":["jp2","jpg2"],"image/jpeg":["jpeg","jpg","jpe"],"image/jph":["jph"],"image/jphc":["jhc"],"image/jpm":["jpm"],"image/jpx":["jpx","jpf"],"image/jxr":["jxr"],"image/jxra":["jxra"],"image/jxrs":["jxrs"],"image/jxs":["jxs"],"image/jxsc":["jxsc"],"image/jxsi":["jxsi"],"image/jxss":["jxss"],"image/ktx":["ktx"],"image/png":["png"],"image/sgi":["sgi"],"image/svg+xml":["svg","svgz"],"image/t38":["t38"],"image/tiff":["tif","tiff"],"image/tiff-fx":["tfx"],"image/webp":["webp"],"image/wmf":["wmf"],"message/disposition-notification":["disposition-notification"],"message/global":["u8msg"],"message/global-delivery-status":["u8dsn"],"message/global-disposition-notification":["u8mdn"],"message/global-headers":["u8hdr"],"message/rfc822":["eml","mime"],"model/3mf":["3mf"],"model/gltf+json":["gltf"],"model/gltf-binary":["glb"],"model/iges":["igs","iges"],"model/mesh":["msh","mesh","silo"],"model/mtl":["mtl"],"model/obj":["obj"],"model/stl":["stl"],"model/vrml":["wrl","vrml"],"model/x3d+binary":["*x3db","x3dbz"],"model/x3d+fastinfoset":["x3db"],"model/x3d+vrml":["*x3dv","x3dvz"],"model/x3d+xml":["x3d","x3dz"],"model/x3d-vrml":["x3dv"],"text/cache-manifest":["appcache","manifest"],"text/calendar":["ics","ifb"],"text/coffeescript":["coffee","litcoffee"],"text/css":["css"],"text/csv":["csv"],"text/html":["html","htm","shtml"],"text/jade":["jade"],"text/jsx":["jsx"],"text/less":["less"],"text/markdown":["markdown","md"],"text/mathml":["mml"],"text/mdx":["mdx"],"text/n3":["n3"],"text/plain":["txt","text","conf","def","list","log","in","ini"],"text/richtext":["rtx"],"text/rtf":["*rtf"],"text/sgml":["sgml","sgm"],"text/shex":["shex"],"text/slim":["slim","slm"],"text/stylus":["stylus","styl"],"text/tab-separated-values":["tsv"],"text/troff":["t","tr","roff","man","me","ms"],"text/turtle":["ttl"],"text/uri-list":["uri","uris","urls"],"text/vcard":["vcard"],"text/vtt":["vtt"],"text/xml":["*xml"],"text/yaml":["yaml","yml"],"video/3gpp":["3gp","3gpp"],"video/3gpp2":["3g2"],"video/h261":["h261"],"video/h263":["h263"],"video/h264":["h264"],"video/jpeg":["jpgv"],"video/jpm":["*jpm","jpgm"],"video/mj2":["mj2","mjp2"],"video/mp2t":["ts"],"video/mp4":["mp4","mp4v","mpg4"],"video/mpeg":["mpeg","mpg","mpe","m1v","m2v"],"video/ogg":["ogv"],"video/quicktime":["qt","mov"],"video/webm":["webm"]};
-
-/***/ }),
+/* 460 */,
 /* 461 */,
 /* 462 */
 /***/ (function(module) {
@@ -22805,6 +25152,8 @@ var __importStar = (this && this.__importStar) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const command_1 = __webpack_require__(431);
+const file_command_1 = __webpack_require__(102);
+const utils_1 = __webpack_require__(82);
 const os = __importStar(__webpack_require__(87));
 const path = __importStar(__webpack_require__(622));
 /**
@@ -22831,9 +25180,17 @@ var ExitCode;
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function exportVariable(name, val) {
-    const convertedVal = command_1.toCommandValue(val);
+    const convertedVal = utils_1.toCommandValue(val);
     process.env[name] = convertedVal;
-    command_1.issueCommand('set-env', { name }, convertedVal);
+    const filePath = process.env['GITHUB_ENV'] || '';
+    if (filePath) {
+        const delimiter = '_GitHubActionsFileCommandDelimeter_';
+        const commandValue = `${name}<<${delimiter}${os.EOL}${convertedVal}${os.EOL}${delimiter}`;
+        file_command_1.issueCommand('ENV', commandValue);
+    }
+    else {
+        command_1.issueCommand('set-env', { name }, convertedVal);
+    }
 }
 exports.exportVariable = exportVariable;
 /**
@@ -22849,7 +25206,13 @@ exports.setSecret = setSecret;
  * @param inputPath
  */
 function addPath(inputPath) {
-    command_1.issueCommand('add-path', {}, inputPath);
+    const filePath = process.env['GITHUB_PATH'] || '';
+    if (filePath) {
+        file_command_1.issueCommand('PATH', inputPath);
+    }
+    else {
+        command_1.issueCommand('add-path', {}, inputPath);
+    }
     process.env['PATH'] = `${inputPath}${path.delimiter}${process.env['PATH']}`;
 }
 exports.addPath = addPath;
@@ -23038,109 +25401,7 @@ module.exports.sync = cwd => {
 
 /***/ }),
 /* 475 */,
-/* 476 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Dialog = void 0;
-const assert_1 = __webpack_require__(327);
-/**
- * Dialog instances are dispatched by the {@link Page} via the `dialog` event.
- *
- * @remarks
- *
- * @example
- * ```js
- * const puppeteer = require('puppeteer');
- *
- * (async () => {
- *   const browser = await puppeteer.launch();
- *   const page = await browser.newPage();
- *   page.on('dialog', async dialog => {
- *     console.log(dialog.message());
- *     await dialog.dismiss();
- *     await browser.close();
- *   });
- *   page.evaluate(() => alert('1'));
- * })();
- * ```
- */
-class Dialog {
-    /**
-     * @internal
-     */
-    constructor(client, type, message, defaultValue = '') {
-        this._handled = false;
-        this._client = client;
-        this._type = type;
-        this._message = message;
-        this._defaultValue = defaultValue;
-    }
-    /**
-     * @returns The type of the dialog.
-     */
-    type() {
-        return this._type;
-    }
-    /**
-     * @returns The message displayed in the dialog.
-     */
-    message() {
-        return this._message;
-    }
-    /**
-     * @returns The default value of the prompt, or an empty string if the dialog
-     * is not a `prompt`.
-     */
-    defaultValue() {
-        return this._defaultValue;
-    }
-    /**
-     * @param promptText - optional text that will be entered in the dialog
-     * prompt. Has no effect if the dialog's type is not `prompt`.
-     *
-     * @returns A promise that resolves when the dialog has been accepted.
-     */
-    async accept(promptText) {
-        assert_1.assert(!this._handled, 'Cannot accept dialog which is already handled!');
-        this._handled = true;
-        await this._client.send('Page.handleJavaScriptDialog', {
-            accept: true,
-            promptText: promptText,
-        });
-    }
-    /**
-     * @returns A promise which will resolve once the dialog has been dismissed
-     */
-    async dismiss() {
-        assert_1.assert(!this._handled, 'Cannot dismiss dialog which is already handled!');
-        this._handled = true;
-        await this._client.send('Page.handleJavaScriptDialog', {
-            accept: false,
-        });
-    }
-}
-exports.Dialog = Dialog;
-
-
-/***/ }),
+/* 476 */,
 /* 477 */,
 /* 478 */,
 /* 479 */,
@@ -23423,7 +25684,83 @@ module.exports = setup;
 
 /***/ }),
 /* 487 */,
-/* 488 */,
+/* 488 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/**
+ * Copyright 2020 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.FileChooser = void 0;
+const assert_js_1 = __webpack_require__(716);
+/**
+ * File choosers let you react to the page requesting for a file.
+ * @remarks
+ * `FileChooser` objects are returned via the `page.waitForFileChooser` method.
+ * @example
+ * An example of using `FileChooser`:
+ * ```js
+ * const [fileChooser] = await Promise.all([
+ *   page.waitForFileChooser(),
+ *   page.click('#upload-file-button'), // some button that triggers file selection
+ * ]);
+ * await fileChooser.accept(['/tmp/myfile.pdf']);
+ * ```
+ * **NOTE** In browsers, only one file chooser can be opened at a time.
+ * All file choosers must be accepted or canceled. Not doing so will prevent
+ * subsequent file choosers from appearing.
+ */
+class FileChooser {
+    /**
+     * @internal
+     */
+    constructor(element, event) {
+        this._handled = false;
+        this._element = element;
+        this._multiple = event.mode !== 'selectSingle';
+    }
+    /**
+     * Whether file chooser allow for {@link https://developer.mozilla.org/en-US/docs/Web/HTML/Element/input/file#attr-multiple | multiple} file selection.
+     */
+    isMultiple() {
+        return this._multiple;
+    }
+    /**
+     * Accept the file chooser request with given paths.
+     * @param filePaths - If some of the  `filePaths` are relative paths,
+     * then they are resolved relative to the {@link https://nodejs.org/api/process.html#process_process_cwd | current working directory}.
+     */
+    async accept(filePaths) {
+        assert_js_1.assert(!this._handled, 'Cannot accept FileChooser which is already handled!');
+        this._handled = true;
+        await this._element.uploadFile(...filePaths);
+    }
+    /**
+     * Closes the file chooser without selecting any files.
+     */
+    async cancel() {
+        assert_js_1.assert(!this._handled, 'Cannot cancel FileChooser which is already handled!');
+        this._handled = true;
+    }
+}
+exports.FileChooser = FileChooser;
+
+
+/***/ }),
 /* 489 */
 /***/ (function(__unusedmodule, __webpack_exports__, __webpack_require__) {
 
@@ -23620,61 +25957,46 @@ const commitFile = async ({ message, content, path }) => {
 /* 492 */,
 /* 493 */,
 /* 494 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/***/ (function(__unusedmodule, exports) {
 
 "use strict";
 
-const os = __webpack_require__(87);
-const execa = __webpack_require__(955);
-
-// Reference: https://www.gaijin.at/en/lstwinver.php
-const names = new Map([
-	['10.0', '10'],
-	['6.3', '8.1'],
-	['6.2', '8'],
-	['6.1', '7'],
-	['6.0', 'Vista'],
-	['5.2', 'Server 2003'],
-	['5.1', 'XP'],
-	['5.0', '2000'],
-	['4.9', 'ME'],
-	['4.1', '98'],
-	['4.0', '95']
-]);
-
-const windowsRelease = release => {
-	const version = /\d+\.\d/.exec(release || os.release());
-
-	if (release && !version) {
-		throw new Error('`release` argument doesn\'t match `n.n`');
-	}
-
-	const ver = (version || [])[0];
-
-	// Server 2008, 2012, 2016, and 2019 versions are ambiguous with desktop versions and must be detected at runtime.
-	// If `release` is omitted or we're on a Windows system, and the version number is an ambiguous version
-	// then use `wmic` to get the OS caption: https://msdn.microsoft.com/en-us/library/aa394531(v=vs.85).aspx
-	// If `wmic` is obsoloete (later versions of Windows 10), use PowerShell instead.
-	// If the resulting caption contains the year 2008, 2012, 2016 or 2019, it is a server version, so return a server OS name.
-	if ((!release || release === os.release()) && ['6.1', '6.2', '6.3', '10.0'].includes(ver)) {
-		let stdout;
-		try {
-			stdout = execa.sync('wmic', ['os', 'get', 'Caption']).stdout || '';
-		} catch (_) {
-			stdout = execa.sync('powershell', ['(Get-CimInstance -ClassName Win32_OperatingSystem).caption']).stdout || '';
-		}
-
-		const year = (stdout.match(/2008|2012|2016|2019/) || [])[0];
-
-		if (year) {
-			return `Server ${year}`;
-		}
-	}
-
-	return names.get(ver);
-};
-
-module.exports = windowsRelease;
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.EmulationManager = void 0;
+class EmulationManager {
+    constructor(client) {
+        this._emulatingMobile = false;
+        this._hasTouch = false;
+        this._client = client;
+    }
+    async emulateViewport(viewport) {
+        const mobile = viewport.isMobile || false;
+        const width = viewport.width;
+        const height = viewport.height;
+        const deviceScaleFactor = viewport.deviceScaleFactor || 1;
+        const screenOrientation = viewport.isLandscape
+            ? { angle: 90, type: 'landscapePrimary' }
+            : { angle: 0, type: 'portraitPrimary' };
+        const hasTouch = viewport.hasTouch || false;
+        await Promise.all([
+            this._client.send('Emulation.setDeviceMetricsOverride', {
+                mobile,
+                width,
+                height,
+                deviceScaleFactor,
+                screenOrientation,
+            }),
+            this._client.send('Emulation.setTouchEmulationEnabled', {
+                enabled: hasTouch,
+            }),
+        ]);
+        const reloadNeeded = this._emulatingMobile !== mobile || this._hasTouch !== hasTouch;
+        this._emulatingMobile = mobile;
+        this._hasTouch = hasTouch;
+        return reloadNeeded;
+    }
+}
+exports.EmulationManager = EmulationManager;
 
 
 /***/ }),
@@ -23961,7 +26283,154 @@ mkdirP.sync = function sync (p, opts, made) {
 
 
 /***/ }),
-/* 517 */,
+/* 517 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/**
+ * Copyright 2019 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Target = void 0;
+const Page_js_1 = __webpack_require__(121);
+const WebWorker_js_1 = __webpack_require__(702);
+/**
+ * @public
+ */
+class Target {
+    /**
+     * @internal
+     */
+    constructor(targetInfo, browserContext, sessionFactory, ignoreHTTPSErrors, defaultViewport) {
+        this._targetInfo = targetInfo;
+        this._browserContext = browserContext;
+        this._targetId = targetInfo.targetId;
+        this._sessionFactory = sessionFactory;
+        this._ignoreHTTPSErrors = ignoreHTTPSErrors;
+        this._defaultViewport = defaultViewport;
+        /** @type {?Promise<!Puppeteer.Page>} */
+        this._pagePromise = null;
+        /** @type {?Promise<!WebWorker>} */
+        this._workerPromise = null;
+        this._initializedPromise = new Promise((fulfill) => (this._initializedCallback = fulfill)).then(async (success) => {
+            if (!success)
+                return false;
+            const opener = this.opener();
+            if (!opener || !opener._pagePromise || this.type() !== 'page')
+                return true;
+            const openerPage = await opener._pagePromise;
+            if (!openerPage.listenerCount("popup" /* Popup */))
+                return true;
+            const popupPage = await this.page();
+            openerPage.emit("popup" /* Popup */, popupPage);
+            return true;
+        });
+        this._isClosedPromise = new Promise((fulfill) => (this._closedCallback = fulfill));
+        this._isInitialized =
+            this._targetInfo.type !== 'page' || this._targetInfo.url !== '';
+        if (this._isInitialized)
+            this._initializedCallback(true);
+    }
+    /**
+     * Creates a Chrome Devtools Protocol session attached to the target.
+     */
+    createCDPSession() {
+        return this._sessionFactory();
+    }
+    /**
+     * If the target is not of type `"page"` or `"background_page"`, returns `null`.
+     */
+    async page() {
+        if ((this._targetInfo.type === 'page' ||
+            this._targetInfo.type === 'background_page' ||
+            this._targetInfo.type === 'webview') &&
+            !this._pagePromise) {
+            this._pagePromise = this._sessionFactory().then((client) => Page_js_1.Page.create(client, this, this._ignoreHTTPSErrors, this._defaultViewport));
+        }
+        return this._pagePromise;
+    }
+    /**
+     * If the target is not of type `"service_worker"` or `"shared_worker"`, returns `null`.
+     */
+    async worker() {
+        if (this._targetInfo.type !== 'service_worker' &&
+            this._targetInfo.type !== 'shared_worker')
+            return null;
+        if (!this._workerPromise) {
+            // TODO(einbinder): Make workers send their console logs.
+            this._workerPromise = this._sessionFactory().then((client) => new WebWorker_js_1.WebWorker(client, this._targetInfo.url, () => { } /* consoleAPICalled */, () => { } /* exceptionThrown */));
+        }
+        return this._workerPromise;
+    }
+    url() {
+        return this._targetInfo.url;
+    }
+    /**
+     * Identifies what kind of target this is.
+     *
+     * @remarks
+     *
+     * See {@link https://developer.chrome.com/extensions/background_pages | docs} for more info about background pages.
+     */
+    type() {
+        const type = this._targetInfo.type;
+        if (type === 'page' ||
+            type === 'background_page' ||
+            type === 'service_worker' ||
+            type === 'shared_worker' ||
+            type === 'browser' ||
+            type === 'webview')
+            return type;
+        return 'other';
+    }
+    /**
+     * Get the browser the target belongs to.
+     */
+    browser() {
+        return this._browserContext.browser();
+    }
+    browserContext() {
+        return this._browserContext;
+    }
+    /**
+     * Get the target that opened this target. Top-level targets return `null`.
+     */
+    opener() {
+        const { openerId } = this._targetInfo;
+        if (!openerId)
+            return null;
+        return this.browser()._targets.get(openerId);
+    }
+    /**
+     * @internal
+     */
+    _targetInfoChanged(targetInfo) {
+        this._targetInfo = targetInfo;
+        if (!this._isInitialized &&
+            (this._targetInfo.type !== 'page' || this._targetInfo.url !== '')) {
+            this._isInitialized = true;
+            this._initializedCallback(true);
+            return;
+        }
+    }
+}
+exports.Target = Target;
+
+
+/***/ }),
 /* 518 */,
 /* 519 */,
 /* 520 */,
@@ -23996,7 +26465,7 @@ const Utils = __importStar(__webpack_require__(127));
 // octokit + plugins
 const core_1 = __webpack_require__(448);
 const plugin_rest_endpoint_methods_1 = __webpack_require__(842);
-const plugin_paginate_rest_1 = __webpack_require__(299);
+const plugin_paginate_rest_1 = __webpack_require__(983);
 exports.context = new Context.Context();
 const baseUrl = Utils.getApiBaseUrl();
 const defaults = {
@@ -24094,8 +26563,7 @@ module.exports.default = pLimit;
 /* 525 */,
 /* 526 */,
 /* 527 */,
-/* 528 */,
-/* 529 */
+/* 528 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
@@ -24115,485 +26583,514 @@ module.exports.default = pLimit;
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.BrowserFetcher = void 0;
-const os = __importStar(__webpack_require__(87));
-const fs = __importStar(__webpack_require__(747));
-const path = __importStar(__webpack_require__(622));
-const util = __importStar(__webpack_require__(669));
-const childProcess = __importStar(__webpack_require__(129));
-const https = __importStar(__webpack_require__(211));
-const http = __importStar(__webpack_require__(605));
-const extract_zip_1 = __importDefault(__webpack_require__(641));
-const Debug_1 = __webpack_require__(145);
-const util_1 = __webpack_require__(669);
-const rimraf_1 = __importDefault(__webpack_require__(569));
-const URL = __importStar(__webpack_require__(835));
-const https_proxy_agent_1 = __importDefault(__webpack_require__(717));
-const proxy_from_env_1 = __webpack_require__(18);
-const assert_1 = __webpack_require__(327);
-const debugFetcher = Debug_1.debug(`puppeteer:fetcher`);
-const downloadURLs = {
-    chrome: {
-        linux: '%s/chromium-browser-snapshots/Linux_x64/%d/%s.zip',
-        mac: '%s/chromium-browser-snapshots/Mac/%d/%s.zip',
-        win32: '%s/chromium-browser-snapshots/Win/%d/%s.zip',
-        win64: '%s/chromium-browser-snapshots/Win_x64/%d/%s.zip',
-    },
-    firefox: {
-        linux: '%s/firefox-%s.en-US.%s-x86_64.tar.bz2',
-        mac: '%s/firefox-%s.en-US.%s.dmg',
-        win32: '%s/firefox-%s.en-US.%s.zip',
-        win64: '%s/firefox-%s.en-US.%s.zip',
-    },
-};
-const browserConfig = {
-    chrome: {
-        host: 'https://storage.googleapis.com',
-        destination: '.local-chromium',
-    },
-    firefox: {
-        host: 'https://archive.mozilla.org/pub/firefox/nightly/latest-mozilla-central',
-        destination: '.local-firefox',
-    },
-};
-function archiveName(product, platform, revision) {
-    if (product === 'chrome') {
-        if (platform === 'linux')
-            return 'chrome-linux';
-        if (platform === 'mac')
-            return 'chrome-mac';
-        if (platform === 'win32' || platform === 'win64') {
-            // Windows archive name changed at r591479.
-            return parseInt(revision, 10) > 591479 ? 'chrome-win' : 'chrome-win32';
-        }
-    }
-    else if (product === 'firefox') {
-        return platform;
-    }
-}
+exports.BrowserContext = exports.Browser = void 0;
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const Target_js_1 = __webpack_require__(517);
+const EventEmitter_js_1 = __webpack_require__(258);
+const Connection_js_1 = __webpack_require__(330);
 /**
- * @internal
- */
-function downloadURL(product, platform, host, revision) {
-    const url = util.format(downloadURLs[product][platform], host, revision, archiveName(product, platform, revision));
-    return url;
-}
-/**
- * @internal
- */
-function handleArm64() {
-    fs.stat('/usr/bin/chromium-browser', function (err, stats) {
-        if (stats === undefined) {
-            console.error(`The chromium binary is not available for arm64: `);
-            console.error(`If you are on Ubuntu, you can install with: `);
-            console.error(`\n apt-get install chromium-browser\n`);
-            throw new Error();
-        }
-    });
-}
-const readdirAsync = util_1.promisify(fs.readdir.bind(fs));
-const mkdirAsync = util_1.promisify(fs.mkdir.bind(fs));
-const unlinkAsync = util_1.promisify(fs.unlink.bind(fs));
-const chmodAsync = util_1.promisify(fs.chmod.bind(fs));
-function existsAsync(filePath) {
-    return new Promise((resolve) => {
-        fs.access(filePath, (err) => resolve(!err));
-    });
-}
-/**
- * BrowserFetcher can download and manage different versions of Chromium and Firefox.
+ * A Browser is created when Puppeteer connects to a Chromium instance, either through
+ * {@link Puppeteer.launch} or {@link Puppeteer.connect}.
  *
  * @remarks
- * BrowserFetcher operates on revision strings that specify a precise version of Chromium, e.g. `"533271"`. Revision strings can be obtained from {@link http://omahaproxy.appspot.com/ | omahaproxy.appspot.com}.
- * In the Firefox case, BrowserFetcher downloads Firefox Nightly and
- * operates on version numbers such as `"75"`.
+ *
+ * The Browser class extends from Puppeteer's {@link EventEmitter} class and will
+ * emit various events which are documented in the {@link BrowserEmittedEvents} enum.
  *
  * @example
- * An example of using BrowserFetcher to download a specific version of Chromium
- * and running Puppeteer against it:
  *
+ * An example of using a {@link Browser} to create a {@link Page}:
  * ```js
- * const browserFetcher = puppeteer.createBrowserFetcher();
- * const revisionInfo = await browserFetcher.download('533271');
- * const browser = await puppeteer.launch({executablePath: revisionInfo.executablePath})
+ * const puppeteer = require('puppeteer');
+ *
+ * (async () => {
+ *   const browser = await puppeteer.launch();
+ *   const page = await browser.newPage();
+ *   await page.goto('https://example.com');
+ *   await browser.close();
+ * })();
  * ```
  *
- * **NOTE** BrowserFetcher is not designed to work concurrently with other
- * instances of BrowserFetcher that share the same downloads directory.
+ * @example
+ *
+ * An example of disconnecting from and reconnecting to a {@link Browser}:
+ * ```js
+ * const puppeteer = require('puppeteer');
+ *
+ * (async () => {
+ *   const browser = await puppeteer.launch();
+ *   // Store the endpoint to be able to reconnect to Chromium
+ *   const browserWSEndpoint = browser.wsEndpoint();
+ *   // Disconnect puppeteer from Chromium
+ *   browser.disconnect();
+ *
+ *   // Use the endpoint to reestablish a connection
+ *   const browser2 = await puppeteer.connect({browserWSEndpoint});
+ *   // Close Chromium
+ *   await browser2.close();
+ * })();
+ * ```
  *
  * @public
  */
-class BrowserFetcher {
+class Browser extends EventEmitter_js_1.EventEmitter {
     /**
      * @internal
      */
-    constructor(projectRoot, options = {}) {
-        this._product = (options.product || 'chrome').toLowerCase();
-        assert_1.assert(this._product === 'chrome' || this._product === 'firefox', `Unknown product: "${options.product}"`);
-        this._downloadsFolder =
-            options.path ||
-                path.join(projectRoot, browserConfig[this._product].destination);
-        this._downloadHost = options.host || browserConfig[this._product].host;
-        this.setPlatform(options.platform);
-        assert_1.assert(downloadURLs[this._product][this._platform], 'Unsupported platform: ' + this._platform);
-    }
-    setPlatform(platformFromOptions) {
-        if (platformFromOptions) {
-            this._platform = platformFromOptions;
-            return;
-        }
-        const platform = os.platform();
-        if (platform === 'darwin')
-            this._platform = 'mac';
-        else if (platform === 'linux')
-            this._platform = 'linux';
-        else if (platform === 'win32')
-            this._platform = os.arch() === 'x64' ? 'win64' : 'win32';
-        else
-            assert_1.assert(this._platform, 'Unsupported platform: ' + os.platform());
+    constructor(connection, contextIds, ignoreHTTPSErrors, defaultViewport, process, closeCallback) {
+        super();
+        this._ignoreHTTPSErrors = ignoreHTTPSErrors;
+        this._defaultViewport = defaultViewport;
+        this._process = process;
+        this._connection = connection;
+        this._closeCallback = closeCallback || function () { };
+        this._defaultContext = new BrowserContext(this._connection, this, null);
+        this._contexts = new Map();
+        for (const contextId of contextIds)
+            this._contexts.set(contextId, new BrowserContext(this._connection, this, contextId));
+        this._targets = new Map();
+        this._connection.on(Connection_js_1.ConnectionEmittedEvents.Disconnected, () => this.emit("disconnected" /* Disconnected */));
+        this._connection.on('Target.targetCreated', this._targetCreated.bind(this));
+        this._connection.on('Target.targetDestroyed', this._targetDestroyed.bind(this));
+        this._connection.on('Target.targetInfoChanged', this._targetInfoChanged.bind(this));
     }
     /**
-     * @returns Returns the current `Platform`.
+     * @internal
      */
-    platform() {
-        return this._platform;
+    static async create(connection, contextIds, ignoreHTTPSErrors, defaultViewport, process, closeCallback) {
+        const browser = new Browser(connection, contextIds, ignoreHTTPSErrors, defaultViewport, process, closeCallback);
+        await connection.send('Target.setDiscoverTargets', { discover: true });
+        return browser;
     }
     /**
-     * @returns Returns the current `Product`.
+     * The spawned browser process. Returns `null` if the browser instance was created with
+     * {@link Puppeteer.connect}.
      */
-    product() {
-        return this._product;
+    process() {
+        return this._process;
     }
     /**
-     * @returns The download host being used.
+     * Creates a new incognito browser context. This won't share cookies/cache with other
+     * browser contexts.
+     *
+     * @example
+     * ```js
+     * (async () => {
+     *  const browser = await puppeteer.launch();
+     *   // Create a new incognito browser context.
+     *   const context = await browser.createIncognitoBrowserContext();
+     *   // Create a new page in a pristine context.
+     *   const page = await context.newPage();
+     *   // Do stuff
+     *   await page.goto('https://example.com');
+     * })();
+     * ```
      */
-    host() {
-        return this._downloadHost;
+    async createIncognitoBrowserContext() {
+        const { browserContextId } = await this._connection.send('Target.createBrowserContext');
+        const context = new BrowserContext(this._connection, this, browserContextId);
+        this._contexts.set(browserContextId, context);
+        return context;
     }
     /**
-     * Initiates a HEAD request to check if the revision is available.
-     * @remarks
-     * This method is affected by the current `product`.
-     * @param revision - The revision to check availability for.
-     * @returns A promise that resolves to `true` if the revision could be downloaded
-     * from the host.
+     * Returns an array of all open browser contexts. In a newly created browser, this will
+     * return a single instance of {@link BrowserContext}.
      */
-    canDownload(revision) {
-        const url = downloadURL(this._product, this._platform, this._downloadHost, revision);
-        return new Promise((resolve) => {
-            const request = httpRequest(url, 'HEAD', (response) => {
-                resolve(response.statusCode === 200);
-            });
-            request.on('error', (error) => {
-                console.error(error);
-                resolve(false);
-            });
+    browserContexts() {
+        return [this._defaultContext, ...Array.from(this._contexts.values())];
+    }
+    /**
+     * Returns the default browser context. The default browser context cannot be closed.
+     */
+    defaultBrowserContext() {
+        return this._defaultContext;
+    }
+    /**
+     * @internal
+     * Used by BrowserContext directly so cannot be marked private.
+     */
+    async _disposeContext(contextId) {
+        await this._connection.send('Target.disposeBrowserContext', {
+            browserContextId: contextId || undefined,
         });
+        this._contexts.delete(contextId);
+    }
+    async _targetCreated(event) {
+        const targetInfo = event.targetInfo;
+        const { browserContextId } = targetInfo;
+        const context = browserContextId && this._contexts.has(browserContextId)
+            ? this._contexts.get(browserContextId)
+            : this._defaultContext;
+        const target = new Target_js_1.Target(targetInfo, context, () => this._connection.createSession(targetInfo), this._ignoreHTTPSErrors, this._defaultViewport);
+        assert_js_1.assert(!this._targets.has(event.targetInfo.targetId), 'Target should not exist before targetCreated');
+        this._targets.set(event.targetInfo.targetId, target);
+        if (await target._initializedPromise) {
+            this.emit("targetcreated" /* TargetCreated */, target);
+            context.emit("targetcreated" /* TargetCreated */, target);
+        }
+    }
+    async _targetDestroyed(event) {
+        const target = this._targets.get(event.targetId);
+        target._initializedCallback(false);
+        this._targets.delete(event.targetId);
+        target._closedCallback();
+        if (await target._initializedPromise) {
+            this.emit("targetdestroyed" /* TargetDestroyed */, target);
+            target
+                .browserContext()
+                .emit("targetdestroyed" /* TargetDestroyed */, target);
+        }
+    }
+    _targetInfoChanged(event) {
+        const target = this._targets.get(event.targetInfo.targetId);
+        assert_js_1.assert(target, 'target should exist before targetInfoChanged');
+        const previousURL = target.url();
+        const wasInitialized = target._isInitialized;
+        target._targetInfoChanged(event.targetInfo);
+        if (wasInitialized && previousURL !== target.url()) {
+            this.emit("targetchanged" /* TargetChanged */, target);
+            target
+                .browserContext()
+                .emit("targetchanged" /* TargetChanged */, target);
+        }
     }
     /**
-     * Initiates a GET request to download the revision from the host.
+     * The browser websocket endpoint which can be used as an argument to
+     * {@link Puppeteer.connect}.
+     *
+     * @returns The Browser websocket url.
+     *
      * @remarks
-     * This method is affected by the current `product`.
-     * @param revision - The revision to download.
-     * @param progressCallback - A function that will be called with two arguments:
-     * How many bytes have been downloaded and the total number of bytes of the download.
-     * @returns A promise with revision information when the revision is downloaded
-     * and extracted.
+     *
+     * The format is `ws://${host}:${port}/devtools/browser/<id>`.
+     *
+     * You can find the `webSocketDebuggerUrl` from `http://${host}:${port}/json/version`.
+     * Learn more about the
+     * {@link https://chromedevtools.github.io/devtools-protocol | devtools protocol} and
+     * the {@link
+     * https://chromedevtools.github.io/devtools-protocol/#how-do-i-access-the-browser-target
+     * | browser endpoint}.
      */
-    async download(revision, progressCallback = () => { }) {
-        const url = downloadURL(this._product, this._platform, this._downloadHost, revision);
-        const fileName = url.split('/').pop();
-        const archivePath = path.join(this._downloadsFolder, fileName);
-        const outputPath = this._getFolderPath(revision);
-        if (await existsAsync(outputPath))
-            return this.revisionInfo(revision);
-        if (!(await existsAsync(this._downloadsFolder)))
-            await mkdirAsync(this._downloadsFolder);
-        if (os.arch() === 'arm64') {
-            handleArm64();
-            return;
-        }
+    wsEndpoint() {
+        return this._connection.url();
+    }
+    /**
+     * Creates a {@link Page} in the default browser context.
+     */
+    async newPage() {
+        return this._defaultContext.newPage();
+    }
+    /**
+     * @internal
+     * Used by BrowserContext directly so cannot be marked private.
+     */
+    async _createPageInContext(contextId) {
+        const { targetId } = await this._connection.send('Target.createTarget', {
+            url: 'about:blank',
+            browserContextId: contextId || undefined,
+        });
+        const target = await this._targets.get(targetId);
+        assert_js_1.assert(await target._initializedPromise, 'Failed to create target for page');
+        const page = await target.page();
+        return page;
+    }
+    /**
+     * All active targets inside the Browser. In case of multiple browser contexts, returns
+     * an array with all the targets in all browser contexts.
+     */
+    targets() {
+        return Array.from(this._targets.values()).filter((target) => target._isInitialized);
+    }
+    /**
+     * The target associated with the browser.
+     */
+    target() {
+        return this.targets().find((target) => target.type() === 'browser');
+    }
+    /**
+     * Searches for a target in all browser contexts.
+     *
+     * @param predicate - A function to be run for every target.
+     * @returns The first target found that matches the `predicate` function.
+     *
+     * @example
+     *
+     * An example of finding a target for a page opened via `window.open`:
+     * ```js
+     * await page.evaluate(() => window.open('https://www.example.com/'));
+     * const newWindowTarget = await browser.waitForTarget(target => target.url() === 'https://www.example.com/');
+     * ```
+     */
+    async waitForTarget(predicate, options = {}) {
+        const { timeout = 30000 } = options;
+        const existingTarget = this.targets().find(predicate);
+        if (existingTarget)
+            return existingTarget;
+        let resolve;
+        const targetPromise = new Promise((x) => (resolve = x));
+        this.on("targetcreated" /* TargetCreated */, check);
+        this.on("targetchanged" /* TargetChanged */, check);
         try {
-            await downloadFile(url, archivePath, progressCallback);
-            await install(archivePath, outputPath);
+            if (!timeout)
+                return await targetPromise;
+            return await helper_js_1.helper.waitWithTimeout(targetPromise, 'target', timeout);
         }
         finally {
-            if (await existsAsync(archivePath))
-                await unlinkAsync(archivePath);
+            this.removeListener("targetcreated" /* TargetCreated */, check);
+            this.removeListener("targetchanged" /* TargetChanged */, check);
         }
-        const revisionInfo = this.revisionInfo(revision);
-        if (revisionInfo)
-            await chmodAsync(revisionInfo.executablePath, 0o755);
-        return revisionInfo;
+        function check(target) {
+            if (predicate(target))
+                resolve(target);
+        }
     }
     /**
+     * An array of all open pages inside the Browser.
+     *
      * @remarks
-     * This method is affected by the current `product`.
-     * @returns A promise with a list of all revision strings (for the current `product`)
-     * available locally on disk.
+     *
+     * In case of multiple browser contexts, returns an array with all the pages in all
+     * browser contexts. Non-visible pages, such as `"background_page"`, will not be listed
+     * here. You can find them using {@link Target.page}.
      */
-    async localRevisions() {
-        if (!(await existsAsync(this._downloadsFolder)))
-            return [];
-        const fileNames = await readdirAsync(this._downloadsFolder);
-        return fileNames
-            .map((fileName) => parseFolderPath(this._product, fileName))
-            .filter((entry) => entry && entry.platform === this._platform)
-            .map((entry) => entry.revision);
+    async pages() {
+        const contextPages = await Promise.all(this.browserContexts().map((context) => context.pages()));
+        // Flatten array.
+        return contextPages.reduce((acc, x) => acc.concat(x), []);
     }
     /**
+     * A string representing the browser name and version.
+     *
      * @remarks
-     * This method is affected by the current `product`.
-     * @param revision - A revision to remove for the current `product`.
-     * @returns A promise that resolves when the revision has been removes or
-     * throws if the revision has not been downloaded.
+     *
+     * For headless Chromium, this is similar to `HeadlessChrome/61.0.3153.0`. For
+     * non-headless, this is similar to `Chrome/61.0.3153.0`.
+     *
+     * The format of browser.version() might change with future releases of Chromium.
      */
-    async remove(revision) {
-        const folderPath = this._getFolderPath(revision);
-        assert_1.assert(await existsAsync(folderPath), `Failed to remove: revision ${revision} is not downloaded`);
-        await new Promise((fulfill) => rimraf_1.default(folderPath, fulfill));
+    async version() {
+        const version = await this._getVersion();
+        return version.product;
     }
     /**
-     * @param revision - The revision to get info for.
-     * @returns The revision info for the given revision.
+     * The browser's original user agent. Pages can override the browser user agent with
+     * {@link Page.setUserAgent}.
      */
-    revisionInfo(revision) {
-        const folderPath = this._getFolderPath(revision);
-        let executablePath = '';
-        if (this._product === 'chrome') {
-            if (this._platform === 'mac')
-                executablePath = path.join(folderPath, archiveName(this._product, this._platform, revision), 'Chromium.app', 'Contents', 'MacOS', 'Chromium');
-            else if (this._platform === 'linux')
-                executablePath = path.join(folderPath, archiveName(this._product, this._platform, revision), 'chrome');
-            else if (this._platform === 'win32' || this._platform === 'win64')
-                executablePath = path.join(folderPath, archiveName(this._product, this._platform, revision), 'chrome.exe');
-            else
-                throw new Error('Unsupported platform: ' + this._platform);
-        }
-        else if (this._product === 'firefox') {
-            if (this._platform === 'mac')
-                executablePath = path.join(folderPath, 'Firefox Nightly.app', 'Contents', 'MacOS', 'firefox');
-            else if (this._platform === 'linux')
-                executablePath = path.join(folderPath, 'firefox', 'firefox');
-            else if (this._platform === 'win32' || this._platform === 'win64')
-                executablePath = path.join(folderPath, 'firefox', 'firefox.exe');
-            else
-                throw new Error('Unsupported platform: ' + this._platform);
-        }
-        else {
-            throw new Error('Unsupported product: ' + this._product);
-        }
-        const url = downloadURL(this._product, this._platform, this._downloadHost, revision);
-        const local = fs.existsSync(folderPath);
-        debugFetcher({
-            revision,
-            executablePath,
-            folderPath,
-            local,
-            url,
-            product: this._product,
-        });
-        return {
-            revision,
-            executablePath,
-            folderPath,
-            local,
-            url,
-            product: this._product,
-        };
+    async userAgent() {
+        const version = await this._getVersion();
+        return version.userAgent;
     }
+    /**
+     * Closes Chromium and all of its pages (if any were opened). The {@link Browser} object
+     * itself is considered to be disposed and cannot be used anymore.
+     */
+    async close() {
+        await this._closeCallback.call(null);
+        this.disconnect();
+    }
+    /**
+     * Disconnects Puppeteer from the browser, but leaves the Chromium process running.
+     * After calling `disconnect`, the {@link Browser} object is considered disposed and
+     * cannot be used anymore.
+     */
+    disconnect() {
+        this._connection.dispose();
+    }
+    /**
+     * Indicates that the browser is connected.
+     */
+    isConnected() {
+        return !this._connection._closed;
+    }
+    _getVersion() {
+        return this._connection.send('Browser.getVersion');
+    }
+}
+exports.Browser = Browser;
+/**
+ * BrowserContexts provide a way to operate multiple independent browser
+ * sessions. When a browser is launched, it has a single BrowserContext used by
+ * default. The method {@link Browser.newPage | Browser.newPage} creates a page
+ * in the default browser context.
+ *
+ * @remarks
+ *
+ * The Browser class extends from Puppeteer's {@link EventEmitter} class and
+ * will emit various events which are documented in the
+ * {@link BrowserContextEmittedEvents} enum.
+ *
+ * If a page opens another page, e.g. with a `window.open` call, the popup will
+ * belong to the parent page's browser context.
+ *
+ * Puppeteer allows creation of "incognito" browser contexts with
+ * {@link Browser.createIncognitoBrowserContext | Browser.createIncognitoBrowserContext}
+ * method. "Incognito" browser contexts don't write any browsing data to disk.
+ *
+ * @example
+ * ```js
+ * // Create a new incognito browser context
+ * const context = await browser.createIncognitoBrowserContext();
+ * // Create a new page inside context.
+ * const page = await context.newPage();
+ * // ... do stuff with page ...
+ * await page.goto('https://example.com');
+ * // Dispose context once it's no longer needed.
+ * await context.close();
+ * ```
+ */
+class BrowserContext extends EventEmitter_js_1.EventEmitter {
     /**
      * @internal
      */
-    _getFolderPath(revision) {
-        return path.join(this._downloadsFolder, this._platform + '-' + revision);
+    constructor(connection, browser, contextId) {
+        super();
+        this._connection = connection;
+        this._browser = browser;
+        this._id = contextId;
     }
-}
-exports.BrowserFetcher = BrowserFetcher;
-function parseFolderPath(product, folderPath) {
-    const name = path.basename(folderPath);
-    const splits = name.split('-');
-    if (splits.length !== 2)
-        return null;
-    const [platform, revision] = splits;
-    if (!downloadURLs[product][platform])
-        return null;
-    return { product, platform, revision };
-}
-/**
- * @internal
- */
-function downloadFile(url, destinationPath, progressCallback) {
-    debugFetcher(`Downloading binary from ${url}`);
-    let fulfill, reject;
-    let downloadedBytes = 0;
-    let totalBytes = 0;
-    const promise = new Promise((x, y) => {
-        fulfill = x;
-        reject = y;
-    });
-    const request = httpRequest(url, 'GET', (response) => {
-        if (response.statusCode !== 200) {
-            const error = new Error(`Download failed: server returned code ${response.statusCode}. URL: ${url}`);
-            // consume response data to free up memory
-            response.resume();
-            reject(error);
-            return;
-        }
-        const file = fs.createWriteStream(destinationPath);
-        file.on('finish', () => fulfill());
-        file.on('error', (error) => reject(error));
-        response.pipe(file);
-        totalBytes = parseInt(
-        /** @type {string} */ response.headers['content-length'], 10);
-        if (progressCallback)
-            response.on('data', onData);
-    });
-    request.on('error', (error) => reject(error));
-    return promise;
-    function onData(chunk) {
-        downloadedBytes += chunk.length;
-        progressCallback(downloadedBytes, totalBytes);
+    /**
+     * An array of all active targets inside the browser context.
+     */
+    targets() {
+        return this._browser
+            .targets()
+            .filter((target) => target.browserContext() === this);
     }
-}
-function install(archivePath, folderPath) {
-    debugFetcher(`Installing ${archivePath} to ${folderPath}`);
-    if (archivePath.endsWith('.zip'))
-        return extract_zip_1.default(archivePath, { dir: folderPath });
-    else if (archivePath.endsWith('.tar.bz2'))
-        return extractTar(archivePath, folderPath);
-    else if (archivePath.endsWith('.dmg'))
-        return mkdirAsync(folderPath).then(() => installDMG(archivePath, folderPath));
-    else
-        throw new Error(`Unsupported archive format: ${archivePath}`);
-}
-/**
- * @internal
- */
-function extractTar(tarPath, folderPath) {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const tar = __webpack_require__(120);
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const bzip = __webpack_require__(849);
-    return new Promise((fulfill, reject) => {
-        const tarStream = tar.extract(folderPath);
-        tarStream.on('error', reject);
-        tarStream.on('finish', fulfill);
-        const readStream = fs.createReadStream(tarPath);
-        readStream.pipe(bzip()).pipe(tarStream);
-    });
-}
-/**
- * @internal
- */
-function installDMG(dmgPath, folderPath) {
-    let mountPath;
-    function mountAndCopy(fulfill, reject) {
-        const mountCommand = `hdiutil attach -nobrowse -noautoopen "${dmgPath}"`;
-        childProcess.exec(mountCommand, (err, stdout) => {
-            if (err)
-                return reject(err);
-            const volumes = stdout.match(/\/Volumes\/(.*)/m);
-            if (!volumes)
-                return reject(new Error(`Could not find volume path in ${stdout}`));
-            mountPath = volumes[0];
-            readdirAsync(mountPath)
-                .then((fileNames) => {
-                const appName = fileNames.filter((item) => typeof item === 'string' && item.endsWith('.app'))[0];
-                if (!appName)
-                    return reject(new Error(`Cannot find app in ${mountPath}`));
-                const copyPath = path.join(mountPath, appName);
-                debugFetcher(`Copying ${copyPath} to ${folderPath}`);
-                childProcess.exec(`cp -R "${copyPath}" "${folderPath}"`, (err) => {
-                    if (err)
-                        reject(err);
-                    else
-                        fulfill();
-                });
-            })
-                .catch(reject);
+    /**
+     * This searches for a target in this specific browser context.
+     *
+     * @example
+     * An example of finding a target for a page opened via `window.open`:
+     * ```js
+     * await page.evaluate(() => window.open('https://www.example.com/'));
+     * const newWindowTarget = await browserContext.waitForTarget(target => target.url() === 'https://www.example.com/');
+     * ```
+     *
+     * @param predicate - A function to be run for every target
+     * @param options - An object of options. Accepts a timout,
+     * which is the maximum wait time in milliseconds.
+     * Pass `0` to disable the timeout. Defaults to 30 seconds.
+     * @returns Promise which resolves to the first target found
+     * that matches the `predicate` function.
+     */
+    waitForTarget(predicate, options = {}) {
+        return this._browser.waitForTarget((target) => target.browserContext() === this && predicate(target), options);
+    }
+    /**
+     * An array of all pages inside the browser context.
+     *
+     * @returns Promise which resolves to an array of all open pages.
+     * Non visible pages, such as `"background_page"`, will not be listed here.
+     * You can find them using {@link Target.page | the target page}.
+     */
+    async pages() {
+        const pages = await Promise.all(this.targets()
+            .filter((target) => target.type() === 'page')
+            .map((target) => target.page()));
+        return pages.filter((page) => !!page);
+    }
+    /**
+     * Returns whether BrowserContext is incognito.
+     * The default browser context is the only non-incognito browser context.
+     *
+     * @remarks
+     * The default browser context cannot be closed.
+     */
+    isIncognito() {
+        return !!this._id;
+    }
+    /**
+     * @example
+     * ```js
+     * const context = browser.defaultBrowserContext();
+     * await context.overridePermissions('https://html5demos.com', ['geolocation']);
+     * ```
+     *
+     * @param origin - The origin to grant permissions to, e.g. "https://example.com".
+     * @param permissions - An array of permissions to grant.
+     * All permissions that are not listed here will be automatically denied.
+     */
+    async overridePermissions(origin, permissions) {
+        const webPermissionToProtocol = new Map([
+            ['geolocation', 'geolocation'],
+            ['midi', 'midi'],
+            ['notifications', 'notifications'],
+            // TODO: push isn't a valid type?
+            // ['push', 'push'],
+            ['camera', 'videoCapture'],
+            ['microphone', 'audioCapture'],
+            ['background-sync', 'backgroundSync'],
+            ['ambient-light-sensor', 'sensors'],
+            ['accelerometer', 'sensors'],
+            ['gyroscope', 'sensors'],
+            ['magnetometer', 'sensors'],
+            ['accessibility-events', 'accessibilityEvents'],
+            ['clipboard-read', 'clipboardReadWrite'],
+            ['clipboard-write', 'clipboardReadWrite'],
+            ['payment-handler', 'paymentHandler'],
+            ['idle-detection', 'idleDetection'],
+            // chrome-specific permissions we have.
+            ['midi-sysex', 'midiSysex'],
+        ]);
+        permissions = permissions.map((permission) => {
+            const protocolPermission = webPermissionToProtocol.get(permission);
+            if (!protocolPermission)
+                throw new Error('Unknown permission: ' + permission);
+            return protocolPermission;
+        });
+        await this._connection.send('Browser.grantPermissions', {
+            origin,
+            browserContextId: this._id || undefined,
+            permissions,
         });
     }
-    function unmount() {
-        if (!mountPath)
-            return;
-        const unmountCommand = `hdiutil detach "${mountPath}" -quiet`;
-        debugFetcher(`Unmounting ${mountPath}`);
-        childProcess.exec(unmountCommand, (err) => {
-            if (err)
-                console.error(`Error unmounting dmg: ${err}`);
+    /**
+     * Clears all permission overrides for the browser context.
+     *
+     * @example
+     * ```js
+     * const context = browser.defaultBrowserContext();
+     * context.overridePermissions('https://example.com', ['clipboard-read']);
+     * // do stuff ..
+     * context.clearPermissionOverrides();
+     * ```
+     */
+    async clearPermissionOverrides() {
+        await this._connection.send('Browser.resetPermissions', {
+            browserContextId: this._id || undefined,
         });
     }
-    return new Promise(mountAndCopy)
-        .catch((error) => {
-        console.error(error);
-    })
-        .finally(unmount);
-}
-function httpRequest(url, method, response) {
-    const urlParsed = URL.parse(url);
-    let options = {
-        ...urlParsed,
-        method,
-    };
-    const proxyURL = proxy_from_env_1.getProxyForUrl(url);
-    if (proxyURL) {
-        if (url.startsWith('http:')) {
-            const proxy = URL.parse(proxyURL);
-            options = {
-                path: options.href,
-                host: proxy.hostname,
-                port: proxy.port,
-            };
-        }
-        else {
-            const parsedProxyURL = URL.parse(proxyURL);
-            const proxyOptions = {
-                ...parsedProxyURL,
-                secureProxy: parsedProxyURL.protocol === 'https:',
-            };
-            options.agent = new https_proxy_agent_1.default(proxyOptions);
-            options.rejectUnauthorized = false;
-        }
+    /**
+     * Creates a new page in the browser context.
+     */
+    newPage() {
+        return this._browser._createPageInContext(this._id);
     }
-    const requestCallback = (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location)
-            httpRequest(res.headers.location, method, response);
-        else
-            response(res);
-    };
-    const request = options.protocol === 'https:'
-        ? https.request(options, requestCallback)
-        : http.request(options, requestCallback);
-    request.end();
-    return request;
+    /**
+     * The browser this browser context belongs to.
+     */
+    browser() {
+        return this._browser;
+    }
+    /**
+     * Closes the browser context. All the targets that belong to the browser context
+     * will be closed.
+     *
+     * @remarks
+     * Only incognito browser contexts can be closed.
+     */
+    async close() {
+        assert_js_1.assert(this._id, 'Non-incognito profiles cannot be closed!');
+        await this._browser._disposeContext(this._id);
+    }
 }
+exports.BrowserContext = BrowserContext;
 
 
 /***/ }),
+/* 529 */,
 /* 530 */,
 /* 531 */,
 /* 532 */,
@@ -25983,7 +28480,7 @@ rimraf.sync = rimrafSync
 /* 574 */
 /***/ (function(module, exports, __webpack_require__) {
 
-var Stream = __webpack_require__(418);
+var Stream = __webpack_require__(413);
 if (process.env.READABLE_STREAM === 'disable' && Stream) {
   module.exports = Stream.Readable;
   Object.assign(module.exports, Stream);
@@ -26019,72 +28516,7 @@ if (process.env.READABLE_STREAM === 'disable' && Stream) {
 /* 589 */,
 /* 590 */,
 /* 591 */,
-/* 592 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-/**
- * Copyright 2020 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.getQueryHandlerAndSelector = exports.clearQueryHandlers = exports.customQueryHandlers = exports.unregisterCustomQueryHandler = exports.registerCustomQueryHandler = void 0;
-const _customQueryHandlers = new Map();
-function registerCustomQueryHandler(name, handler) {
-    if (_customQueryHandlers.get(name))
-        throw new Error(`A custom query handler named "${name}" already exists`);
-    const isValidName = /^[a-zA-Z]+$/.test(name);
-    if (!isValidName)
-        throw new Error(`Custom query handler names may only contain [a-zA-Z]`);
-    _customQueryHandlers.set(name, handler);
-}
-exports.registerCustomQueryHandler = registerCustomQueryHandler;
-/**
- * @param {string} name
- */
-function unregisterCustomQueryHandler(name) {
-    _customQueryHandlers.delete(name);
-}
-exports.unregisterCustomQueryHandler = unregisterCustomQueryHandler;
-function customQueryHandlers() {
-    return _customQueryHandlers;
-}
-exports.customQueryHandlers = customQueryHandlers;
-function clearQueryHandlers() {
-    _customQueryHandlers.clear();
-}
-exports.clearQueryHandlers = clearQueryHandlers;
-function getQueryHandlerAndSelector(selector, defaultQueryHandler) {
-    const hasCustomQueryHandler = /^[a-zA-Z]+\//.test(selector);
-    if (!hasCustomQueryHandler)
-        return { updatedSelector: selector, queryHandler: defaultQueryHandler };
-    const index = selector.indexOf('/');
-    const name = selector.slice(0, index);
-    const updatedSelector = selector.slice(index + 1);
-    const queryHandler = customQueryHandlers().get(name);
-    if (!queryHandler)
-        throw new Error(`Query set to use "${name}", but no query handler of that name was found`);
-    return {
-        updatedSelector,
-        queryHandler,
-    };
-}
-exports.getQueryHandlerAndSelector = getQueryHandlerAndSelector;
-
-
-/***/ }),
+/* 592 */,
 /* 593 */,
 /* 594 */,
 /* 595 */,
@@ -26122,7 +28554,7 @@ const { createServer, STATUS_CODES } = __webpack_require__(605);
 
 const PerMessageDeflate = __webpack_require__(301);
 const WebSocket = __webpack_require__(21);
-const { format, parse } = __webpack_require__(330);
+const { format, parse } = __webpack_require__(288);
 const { GUID, kWebSocket } = __webpack_require__(799);
 
 const keyRegex = /^[+/0-9A-Za-z]{22}==$/;
@@ -26611,13 +29043,239 @@ module.exports = require("path");
 
 /***/ }),
 /* 623 */,
-/* 624 */,
+/* 624 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/**
+ * Copyright 2020 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.BrowserRunner = void 0;
+const Debug_js_1 = __webpack_require__(459);
+const rimraf_1 = __importDefault(__webpack_require__(569));
+const childProcess = __importStar(__webpack_require__(129));
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const Connection_js_1 = __webpack_require__(330);
+const WebSocketTransport_js_1 = __webpack_require__(299);
+const PipeTransport_js_1 = __webpack_require__(819);
+const readline = __importStar(__webpack_require__(58));
+const Errors_js_1 = __webpack_require__(422);
+const util_1 = __webpack_require__(669);
+const removeFolderAsync = util_1.promisify(rimraf_1.default);
+const debugLauncher = Debug_js_1.debug('puppeteer:launcher');
+const PROCESS_ERROR_EXPLANATION = `Puppeteer was unable to kill the process which ran the browser binary.
+This means that, on future Puppeteer launches, Puppeteer might not be able to launch the browser.
+Please check your open processes and ensure that the browser processes that Puppeteer launched have been killed.
+If you think this is a bug, please report it on the Puppeteer issue tracker.`;
+class BrowserRunner {
+    constructor(executablePath, processArguments, tempDirectory) {
+        this.proc = null;
+        this.connection = null;
+        this._closed = true;
+        this._listeners = [];
+        this._executablePath = executablePath;
+        this._processArguments = processArguments;
+        this._tempDirectory = tempDirectory;
+    }
+    start(options) {
+        const { handleSIGINT, handleSIGTERM, handleSIGHUP, dumpio, env, pipe, } = options;
+        let stdio = ['pipe', 'pipe', 'pipe'];
+        if (pipe) {
+            if (dumpio)
+                stdio = ['ignore', 'pipe', 'pipe', 'pipe', 'pipe'];
+            else
+                stdio = ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'];
+        }
+        assert_js_1.assert(!this.proc, 'This process has previously been started.');
+        debugLauncher(`Calling ${this._executablePath} ${this._processArguments.join(' ')}`);
+        this.proc = childProcess.spawn(this._executablePath, this._processArguments, {
+            // On non-windows platforms, `detached: true` makes child process a
+            // leader of a new process group, making it possible to kill child
+            // process tree with `.kill(-pid)` command. @see
+            // https://nodejs.org/api/child_process.html#child_process_options_detached
+            detached: process.platform !== 'win32',
+            env,
+            stdio,
+        });
+        if (dumpio) {
+            this.proc.stderr.pipe(process.stderr);
+            this.proc.stdout.pipe(process.stdout);
+        }
+        this._closed = false;
+        this._processClosing = new Promise((fulfill) => {
+            this.proc.once('exit', () => {
+                this._closed = true;
+                // Cleanup as processes exit.
+                if (this._tempDirectory) {
+                    removeFolderAsync(this._tempDirectory)
+                        .then(() => fulfill())
+                        .catch((error) => console.error(error));
+                }
+                else {
+                    fulfill();
+                }
+            });
+        });
+        this._listeners = [
+            helper_js_1.helper.addEventListener(process, 'exit', this.kill.bind(this)),
+        ];
+        if (handleSIGINT)
+            this._listeners.push(helper_js_1.helper.addEventListener(process, 'SIGINT', () => {
+                this.kill();
+                process.exit(130);
+            }));
+        if (handleSIGTERM)
+            this._listeners.push(helper_js_1.helper.addEventListener(process, 'SIGTERM', this.close.bind(this)));
+        if (handleSIGHUP)
+            this._listeners.push(helper_js_1.helper.addEventListener(process, 'SIGHUP', this.close.bind(this)));
+    }
+    close() {
+        if (this._closed)
+            return Promise.resolve();
+        if (this._tempDirectory) {
+            this.kill();
+        }
+        else if (this.connection) {
+            // Attempt to close the browser gracefully
+            this.connection.send('Browser.close').catch((error) => {
+                helper_js_1.debugError(error);
+                this.kill();
+            });
+        }
+        // Cleanup this listener last, as that makes sure the full callback runs. If we
+        // perform this earlier, then the previous function calls would not happen.
+        helper_js_1.helper.removeEventListeners(this._listeners);
+        return this._processClosing;
+    }
+    kill() {
+        // Attempt to remove temporary profile directory to avoid littering.
+        try {
+            rimraf_1.default.sync(this._tempDirectory);
+        }
+        catch (error) { }
+        // If the process failed to launch (for example if the browser executable path
+        // is invalid), then the process does not get a pid assigned. A call to
+        // `proc.kill` would error, as the `pid` to-be-killed can not be found.
+        if (this.proc && this.proc.pid && !this.proc.killed) {
+            try {
+                this.proc.kill('SIGKILL');
+            }
+            catch (error) {
+                throw new Error(`${PROCESS_ERROR_EXPLANATION}\nError cause: ${error.stack}`);
+            }
+        }
+        // Cleanup this listener last, as that makes sure the full callback runs. If we
+        // perform this earlier, then the previous function calls would not happen.
+        helper_js_1.helper.removeEventListeners(this._listeners);
+    }
+    async setupConnection(options) {
+        const { usePipe, timeout, slowMo, preferredRevision } = options;
+        if (!usePipe) {
+            const browserWSEndpoint = await waitForWSEndpoint(this.proc, timeout, preferredRevision);
+            const transport = await WebSocketTransport_js_1.WebSocketTransport.create(browserWSEndpoint);
+            this.connection = new Connection_js_1.Connection(browserWSEndpoint, transport, slowMo);
+        }
+        else {
+            // stdio was assigned during start(), and the 'pipe' option there adds the
+            // 4th and 5th items to stdio array
+            const { 3: pipeWrite, 4: pipeRead } = this.proc.stdio;
+            const transport = new PipeTransport_js_1.PipeTransport(pipeWrite, pipeRead);
+            this.connection = new Connection_js_1.Connection('', transport, slowMo);
+        }
+        return this.connection;
+    }
+}
+exports.BrowserRunner = BrowserRunner;
+function waitForWSEndpoint(browserProcess, timeout, preferredRevision) {
+    return new Promise((resolve, reject) => {
+        const rl = readline.createInterface({ input: browserProcess.stderr });
+        let stderr = '';
+        const listeners = [
+            helper_js_1.helper.addEventListener(rl, 'line', onLine),
+            helper_js_1.helper.addEventListener(rl, 'close', () => onClose()),
+            helper_js_1.helper.addEventListener(browserProcess, 'exit', () => onClose()),
+            helper_js_1.helper.addEventListener(browserProcess, 'error', (error) => onClose(error)),
+        ];
+        const timeoutId = timeout ? setTimeout(onTimeout, timeout) : 0;
+        /**
+         * @param {!Error=} error
+         */
+        function onClose(error) {
+            cleanup();
+            reject(new Error([
+                'Failed to launch the browser process!' +
+                    (error ? ' ' + error.message : ''),
+                stderr,
+                '',
+                'TROUBLESHOOTING: https://github.com/puppeteer/puppeteer/blob/main/docs/troubleshooting.md',
+                '',
+            ].join('\n')));
+        }
+        function onTimeout() {
+            cleanup();
+            reject(new Errors_js_1.TimeoutError(`Timed out after ${timeout} ms while trying to connect to the browser! Only Chrome at revision r${preferredRevision} is guaranteed to work.`));
+        }
+        function onLine(line) {
+            stderr += line + '\n';
+            const match = line.match(/^DevTools listening on (ws:\/\/.*)$/);
+            if (!match)
+                return;
+            cleanup();
+            resolve(match[1]);
+        }
+        function cleanup() {
+            if (timeoutId)
+                clearTimeout(timeoutId);
+            helper_js_1.helper.removeEventListeners(listeners);
+        }
+    });
+}
+
+
+/***/ }),
 /* 625 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
 "use strict";
 
-const {PassThrough} = __webpack_require__(418);
+const {PassThrough} = __webpack_require__(413);
 
 module.exports = options => {
 	options = Object.assign({}, options);
@@ -26670,41 +29328,10 @@ module.exports = options => {
 
 
 /***/ }),
-/* 626 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-module.exports = __webpack_require__(418);
-
-
-/***/ }),
+/* 626 */,
 /* 627 */,
 /* 628 */,
-/* 629 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-/**
- * Copyright 2020 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.isNode = void 0;
-exports.isNode = typeof document === 'undefined';
-
-
-/***/ }),
+/* 629 */,
 /* 630 */,
 /* 631 */
 /***/ (function(module) {
@@ -26727,10 +29354,10 @@ module.exports = require("net");
 const debug = __webpack_require__(784)('extract-zip')
 // eslint-disable-next-line node/no-unsupported-features/node-builtins
 const { createWriteStream, promises: fs } = __webpack_require__(747)
-const getStream = __webpack_require__(813)
+const getStream = __webpack_require__(145)
 const path = __webpack_require__(622)
 const { promisify } = __webpack_require__(669)
-const stream = __webpack_require__(418)
+const stream = __webpack_require__(413)
 const yauzl = __webpack_require__(766)
 
 const openZip = promisify(yauzl.open)
@@ -27088,7 +29715,76 @@ module.exports = EventTarget;
 
 
 /***/ }),
-/* 647 */,
+/* 647 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+/**
+ * Copyright 2020 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.getQueryHandlerAndSelector = exports.clearQueryHandlers = exports.customQueryHandlers = exports.unregisterCustomQueryHandler = exports.registerCustomQueryHandler = void 0;
+const _customQueryHandlers = new Map();
+function registerCustomQueryHandler(name, handler) {
+    if (_customQueryHandlers.get(name))
+        throw new Error(`A custom query handler named "${name}" already exists`);
+    const isValidName = /^[a-zA-Z]+$/.test(name);
+    if (!isValidName)
+        throw new Error(`Custom query handler names may only contain [a-zA-Z]`);
+    _customQueryHandlers.set(name, handler);
+}
+exports.registerCustomQueryHandler = registerCustomQueryHandler;
+/**
+ * @param {string} name
+ */
+function unregisterCustomQueryHandler(name) {
+    _customQueryHandlers.delete(name);
+}
+exports.unregisterCustomQueryHandler = unregisterCustomQueryHandler;
+function customQueryHandlers() {
+    return _customQueryHandlers;
+}
+exports.customQueryHandlers = customQueryHandlers;
+function clearQueryHandlers() {
+    _customQueryHandlers.clear();
+}
+exports.clearQueryHandlers = clearQueryHandlers;
+function getQueryHandlerAndSelector(selector) {
+    const defaultHandler = {
+        queryOne: (element, selector) => element.querySelector(selector),
+        queryAll: (element, selector) => element.querySelectorAll(selector),
+    };
+    const hasCustomQueryHandler = /^[a-zA-Z]+\//.test(selector);
+    if (!hasCustomQueryHandler)
+        return { updatedSelector: selector, queryHandler: defaultHandler };
+    const index = selector.indexOf('/');
+    const name = selector.slice(0, index);
+    const updatedSelector = selector.slice(index + 1);
+    const queryHandler = customQueryHandlers().get(name);
+    if (!queryHandler)
+        throw new Error(`Query set to use "${name}", but no query handler of that name was found`);
+    return {
+        updatedSelector,
+        queryHandler,
+    };
+}
+exports.getQueryHandlerAndSelector = getQueryHandlerAndSelector;
+
+
+/***/ }),
 /* 648 */,
 /* 649 */,
 /* 650 */,
@@ -27187,13 +29883,15 @@ if (process.platform === 'linux') {
  * This means that we can publish to CJS and ESM whilst maintaining the expected
  * import behaviour for CJS and ESM users.
  */
-const puppeteerExport = __webpack_require__(876);
+const puppeteerExport = __webpack_require__(985);
 module.exports = puppeteerExport.default;
 
 
 /***/ }),
 /* 659 */,
-/* 660 */
+/* 660 */,
+/* 661 */,
+/* 662 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
@@ -27215,16 +29913,21 @@ module.exports = puppeteerExport.default;
  */
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.LifecycleWatcher = void 0;
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const Events_1 = __webpack_require__(872);
-const Errors_1 = __webpack_require__(24);
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const Errors_js_1 = __webpack_require__(422);
+const FrameManager_js_1 = __webpack_require__(452);
+const NetworkManager_js_1 = __webpack_require__(956);
+const Connection_js_1 = __webpack_require__(330);
 const puppeteerToProtocolLifecycle = new Map([
     ['load', 'load'],
     ['domcontentloaded', 'DOMContentLoaded'],
     ['networkidle0', 'networkIdle'],
     ['networkidle2', 'networkAlmostIdle'],
 ]);
+/**
+ * @internal
+ */
 class LifecycleWatcher {
     constructor(frameManager, frame, waitUntil, timeout) {
         if (Array.isArray(waitUntil))
@@ -27233,7 +29936,7 @@ class LifecycleWatcher {
             waitUntil = [waitUntil];
         this._expectedLifecycle = waitUntil.map((value) => {
             const protocolEvent = puppeteerToProtocolLifecycle.get(value);
-            assert_1.assert(protocolEvent, 'Unknown value for options.waitUntil: ' + value);
+            assert_js_1.assert(protocolEvent, 'Unknown value for options.waitUntil: ' + value);
             return protocolEvent;
         });
         this._frameManager = frameManager;
@@ -27242,11 +29945,11 @@ class LifecycleWatcher {
         this._timeout = timeout;
         this._navigationRequest = null;
         this._eventListeners = [
-            helper_1.helper.addEventListener(frameManager._client, Events_1.Events.CDPSession.Disconnected, () => this._terminate(new Error('Navigation failed because browser has disconnected!'))),
-            helper_1.helper.addEventListener(this._frameManager, Events_1.Events.FrameManager.LifecycleEvent, this._checkLifecycleComplete.bind(this)),
-            helper_1.helper.addEventListener(this._frameManager, Events_1.Events.FrameManager.FrameNavigatedWithinDocument, this._navigatedWithinDocument.bind(this)),
-            helper_1.helper.addEventListener(this._frameManager, Events_1.Events.FrameManager.FrameDetached, this._onFrameDetached.bind(this)),
-            helper_1.helper.addEventListener(this._frameManager.networkManager(), Events_1.Events.NetworkManager.Request, this._onRequest.bind(this)),
+            helper_js_1.helper.addEventListener(frameManager._client, Connection_js_1.CDPSessionEmittedEvents.Disconnected, () => this._terminate(new Error('Navigation failed because browser has disconnected!'))),
+            helper_js_1.helper.addEventListener(this._frameManager, FrameManager_js_1.FrameManagerEmittedEvents.LifecycleEvent, this._checkLifecycleComplete.bind(this)),
+            helper_js_1.helper.addEventListener(this._frameManager, FrameManager_js_1.FrameManagerEmittedEvents.FrameNavigatedWithinDocument, this._navigatedWithinDocument.bind(this)),
+            helper_js_1.helper.addEventListener(this._frameManager, FrameManager_js_1.FrameManagerEmittedEvents.FrameDetached, this._onFrameDetached.bind(this)),
+            helper_js_1.helper.addEventListener(this._frameManager.networkManager(), NetworkManager_js_1.NetworkManagerEmittedEvents.Request, this._onRequest.bind(this)),
         ];
         this._sameDocumentNavigationPromise = new Promise((fulfill) => {
             this._sameDocumentNavigationCompleteCallback = fulfill;
@@ -27297,7 +30000,7 @@ class LifecycleWatcher {
         if (!this._timeout)
             return new Promise(() => { });
         const errorMessage = 'Navigation timeout of ' + this._timeout + ' ms exceeded';
-        return new Promise((fulfill) => (this._maximumTimer = setTimeout(fulfill, this._timeout))).then(() => new Errors_1.TimeoutError(errorMessage));
+        return new Promise((fulfill) => (this._maximumTimer = setTimeout(fulfill, this._timeout))).then(() => new Errors_js_1.TimeoutError(errorMessage));
     }
     _navigatedWithinDocument(frame) {
         if (frame !== this._frame)
@@ -27335,1129 +30038,11 @@ class LifecycleWatcher {
         }
     }
     dispose() {
-        helper_1.helper.removeEventListeners(this._eventListeners);
+        helper_js_1.helper.removeEventListeners(this._eventListeners);
         clearTimeout(this._maximumTimer);
     }
 }
 exports.LifecycleWatcher = LifecycleWatcher;
-
-
-/***/ }),
-/* 661 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-/**
- * Copyright 2019 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.ElementHandle = exports.JSHandle = exports.createJSHandle = void 0;
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const QueryHandler_1 = __webpack_require__(592);
-/**
- * @internal
- */
-function createJSHandle(context, remoteObject) {
-    const frame = context.frame();
-    if (remoteObject.subtype === 'node' && frame) {
-        const frameManager = frame._frameManager;
-        return new ElementHandle(context, context._client, remoteObject, frameManager.page(), frameManager);
-    }
-    return new JSHandle(context, context._client, remoteObject);
-}
-exports.createJSHandle = createJSHandle;
-/**
- * Represents an in-page JavaScript object. JSHandles can be created with the
- * {@link Page.evaluateHandle | page.evaluateHandle} method.
- *
- * @example
- * ```js
- * const windowHandle = await page.evaluateHandle(() => window);
- * ```
- *
- * JSHandle prevents the referenced JavaScript object from being garbage-collected
- * unless the handle is {@link JSHandle.dispose | disposed}. JSHandles are auto-
- * disposed when their origin frame gets navigated or the parent context gets destroyed.
- *
- * JSHandle instances can be used as arguments for {@link Page.$eval},
- * {@link Page.evaluate}, and {@link Page.evaluateHandle}.
- *
- * @public
- */
-class JSHandle {
-    /**
-     * @internal
-     */
-    constructor(context, client, remoteObject) {
-        /**
-         * @internal
-         */
-        this._disposed = false;
-        this._context = context;
-        this._client = client;
-        this._remoteObject = remoteObject;
-    }
-    /** Returns the execution context the handle belongs to.
-     */
-    executionContext() {
-        return this._context;
-    }
-    /**
-     * This method passes this handle as the first argument to `pageFunction`.
-     * If `pageFunction` returns a Promise, then `handle.evaluate` would wait
-     * for the promise to resolve and return its value.
-     *
-     * @example
-     * ```js
-     * const tweetHandle = await page.$('.tweet .retweets');
-     * expect(await tweetHandle.evaluate(node => node.innerText)).toBe('10');
-     * ```
-     */
-    async evaluate(pageFunction, ...args) {
-        return await this.executionContext().evaluate(pageFunction, this, ...args);
-    }
-    /**
-     * This method passes this handle as the first argument to `pageFunction`.
-     *
-     * @remarks
-     *
-     * The only difference between `jsHandle.evaluate` and
-     * `jsHandle.evaluateHandle` is that `jsHandle.evaluateHandle`
-     * returns an in-page object (JSHandle).
-     *
-     * If the function passed to `jsHandle.evaluateHandle` returns a Promise,
-     * then `evaluateHandle.evaluateHandle` waits for the promise to resolve and
-     * returns its value.
-     *
-     * See {@link Page.evaluateHandle} for more details.
-     */
-    async evaluateHandle(pageFunction, ...args) {
-        return await this.executionContext().evaluateHandle(pageFunction, this, ...args);
-    }
-    /** Fetches a single property from the referenced object.
-     */
-    async getProperty(propertyName) {
-        const objectHandle = await this.evaluateHandle((object, propertyName) => {
-            const result = { __proto__: null };
-            result[propertyName] = object[propertyName];
-            return result;
-        }, propertyName);
-        const properties = await objectHandle.getProperties();
-        const result = properties.get(propertyName) || null;
-        await objectHandle.dispose();
-        return result;
-    }
-    /**
-     * The method returns a map with property names as keys and JSHandle
-     * instances for the property values.
-     *
-     * @example
-     * ```js
-     * const listHandle = await page.evaluateHandle(() => document.body.children);
-     * const properties = await listHandle.getProperties();
-     * const children = [];
-     * for (const property of properties.values()) {
-     *   const element = property.asElement();
-     *   if (element)
-     *     children.push(element);
-     * }
-     * children; // holds elementHandles to all children of document.body
-     * ```
-     */
-    async getProperties() {
-        const response = await this._client.send('Runtime.getProperties', {
-            objectId: this._remoteObject.objectId,
-            ownProperties: true,
-        });
-        const result = new Map();
-        for (const property of response.result) {
-            if (!property.enumerable)
-                continue;
-            result.set(property.name, createJSHandle(this._context, property.value));
-        }
-        return result;
-    }
-    /**
-     * Returns a JSON representation of the object.
-     *
-     * @remarks
-     *
-     * The JSON is generated by running {@link https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify | JSON.stringify}
-     * on the object in page and consequent {@link https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/parse | JSON.parse} in puppeteer.
-     * **NOTE** The method throws if the referenced object is not stringifiable.
-     */
-    async jsonValue() {
-        if (this._remoteObject.objectId) {
-            const response = await this._client.send('Runtime.callFunctionOn', {
-                functionDeclaration: 'function() { return this; }',
-                objectId: this._remoteObject.objectId,
-                returnByValue: true,
-                awaitPromise: true,
-            });
-            return helper_1.helper.valueFromRemoteObject(response.result);
-        }
-        return helper_1.helper.valueFromRemoteObject(this._remoteObject);
-    }
-    /**
-     * Returns either `null` or the object handle itself, if the object handle is
-     * an instance of {@link ElementHandle}.
-     */
-    asElement() {
-        // This always returns null, but subclasses can override this and return an
-        // ElementHandle.
-        return null;
-    }
-    /**
-     * Stops referencing the element handle, and resolves when the object handle is
-     * successfully disposed of.
-     */
-    async dispose() {
-        if (this._disposed)
-            return;
-        this._disposed = true;
-        await helper_1.helper.releaseObject(this._client, this._remoteObject);
-    }
-    /**
-     * Returns a string representation of the JSHandle.
-     *
-     * @remarks Useful during debugging.
-     */
-    toString() {
-        if (this._remoteObject.objectId) {
-            const type = this._remoteObject.subtype || this._remoteObject.type;
-            return 'JSHandle@' + type;
-        }
-        return 'JSHandle:' + helper_1.helper.valueFromRemoteObject(this._remoteObject);
-    }
-}
-exports.JSHandle = JSHandle;
-/**
- * ElementHandle represents an in-page DOM element.
- *
- * @remarks
- *
- * ElementHandles can be created with the {@link Page.$} method.
- *
- * ```js
- * const puppeteer = require('puppeteer');
- *
- * (async () => {
- *  const browser = await puppeteer.launch();
- *  const page = await browser.newPage();
- *  await page.goto('https://example.com');
- *  const hrefElement = await page.$('a');
- *  await hrefElement.click();
- *  // ...
- * })();
- * ```
- *
- * ElementHandle prevents the DOM element from being garbage-collected unless the
- * handle is {@link JSHandle.dispose | disposed}. ElementHandles are auto-disposed
- * when their origin frame gets navigated.
- *
- * ElementHandle instances can be used as arguments in {@link Page.$eval} and
- * {@link Page.evaluate} methods.
- *
- * If you're using TypeScript, ElementHandle takes a generic argument that
- * denotes the type of element the handle is holding within. For example, if you
- * have a handle to a `<select>` element, you can type it as
- * `ElementHandle<HTMLSelectElement>` and you get some nicer type checks.
- *
- * @public
- */
-class ElementHandle extends JSHandle {
-    /**
-     * @internal
-     */
-    constructor(context, client, remoteObject, page, frameManager) {
-        super(context, client, remoteObject);
-        this._client = client;
-        this._remoteObject = remoteObject;
-        this._page = page;
-        this._frameManager = frameManager;
-    }
-    asElement() {
-        return this;
-    }
-    /**
-     * Resolves to the content frame for element handles referencing
-     * iframe nodes, or null otherwise
-     */
-    async contentFrame() {
-        const nodeInfo = await this._client.send('DOM.describeNode', {
-            objectId: this._remoteObject.objectId,
-        });
-        if (typeof nodeInfo.node.frameId !== 'string')
-            return null;
-        return this._frameManager.frame(nodeInfo.node.frameId);
-    }
-    async _scrollIntoViewIfNeeded() {
-        const error = await this.evaluate(async (element, pageJavascriptEnabled) => {
-            if (!element.isConnected)
-                return 'Node is detached from document';
-            if (element.nodeType !== Node.ELEMENT_NODE)
-                return 'Node is not of type HTMLElement';
-            // force-scroll if page's javascript is disabled.
-            if (!pageJavascriptEnabled) {
-                element.scrollIntoView({
-                    block: 'center',
-                    inline: 'center',
-                    // Chrome still supports behavior: instant but it's not in the spec
-                    // so TS shouts We don't want to make this breaking change in
-                    // Puppeteer yet so we'll ignore the line.
-                    // @ts-ignore
-                    behavior: 'instant',
-                });
-                return false;
-            }
-            const visibleRatio = await new Promise((resolve) => {
-                const observer = new IntersectionObserver((entries) => {
-                    resolve(entries[0].intersectionRatio);
-                    observer.disconnect();
-                });
-                observer.observe(element);
-            });
-            if (visibleRatio !== 1.0) {
-                element.scrollIntoView({
-                    block: 'center',
-                    inline: 'center',
-                    // Chrome still supports behavior: instant but it's not in the spec
-                    // so TS shouts We don't want to make this breaking change in
-                    // Puppeteer yet so we'll ignore the line.
-                    // @ts-ignore
-                    behavior: 'instant',
-                });
-            }
-            return false;
-        }, this._page.isJavaScriptEnabled());
-        if (error)
-            throw new Error(error);
-    }
-    async _clickablePoint() {
-        const [result, layoutMetrics] = await Promise.all([
-            this._client
-                .send('DOM.getContentQuads', {
-                objectId: this._remoteObject.objectId,
-            })
-                .catch(helper_1.debugError),
-            this._client.send('Page.getLayoutMetrics'),
-        ]);
-        if (!result || !result.quads.length)
-            throw new Error('Node is either not visible or not an HTMLElement');
-        // Filter out quads that have too small area to click into.
-        const { clientWidth, clientHeight } = layoutMetrics.layoutViewport;
-        const quads = result.quads
-            .map((quad) => this._fromProtocolQuad(quad))
-            .map((quad) => this._intersectQuadWithViewport(quad, clientWidth, clientHeight))
-            .filter((quad) => computeQuadArea(quad) > 1);
-        if (!quads.length)
-            throw new Error('Node is either not visible or not an HTMLElement');
-        // Return the middle point of the first quad.
-        const quad = quads[0];
-        let x = 0;
-        let y = 0;
-        for (const point of quad) {
-            x += point.x;
-            y += point.y;
-        }
-        return {
-            x: x / 4,
-            y: y / 4,
-        };
-    }
-    _getBoxModel() {
-        return this._client
-            .send('DOM.getBoxModel', {
-            objectId: this._remoteObject.objectId,
-        })
-            .catch((error) => helper_1.debugError(error));
-    }
-    _fromProtocolQuad(quad) {
-        return [
-            { x: quad[0], y: quad[1] },
-            { x: quad[2], y: quad[3] },
-            { x: quad[4], y: quad[5] },
-            { x: quad[6], y: quad[7] },
-        ];
-    }
-    _intersectQuadWithViewport(quad, width, height) {
-        return quad.map((point) => ({
-            x: Math.min(Math.max(point.x, 0), width),
-            y: Math.min(Math.max(point.y, 0), height),
-        }));
-    }
-    /**
-     * This method scrolls element into view if needed, and then
-     * uses {@link Page.mouse} to hover over the center of the element.
-     * If the element is detached from DOM, the method throws an error.
-     */
-    async hover() {
-        await this._scrollIntoViewIfNeeded();
-        const { x, y } = await this._clickablePoint();
-        await this._page.mouse.move(x, y);
-    }
-    /**
-     * This method scrolls element into view if needed, and then
-     * uses {@link Page.mouse} to click in the center of the element.
-     * If the element is detached from DOM, the method throws an error.
-     */
-    async click(options = {}) {
-        await this._scrollIntoViewIfNeeded();
-        const { x, y } = await this._clickablePoint();
-        await this._page.mouse.click(x, y, options);
-    }
-    /**
-     * Triggers a `change` and `input` event once all the provided options have been
-     * selected. If there's no `<select>` element matching `selector`, the method
-     * throws an error.
-     *
-     * @example
-     * ```js
-     * handle.select('blue'); // single selection
-     * handle.select('red', 'green', 'blue'); // multiple selections
-     * ```
-     * @param values - Values of options to select. If the `<select>` has the
-     *    `multiple` attribute, all values are considered, otherwise only the first
-     *    one is taken into account.
-     */
-    async select(...values) {
-        for (const value of values)
-            assert_1.assert(helper_1.helper.isString(value), 'Values must be strings. Found value "' +
-                value +
-                '" of type "' +
-                typeof value +
-                '"');
-        return this.evaluate((element, values) => {
-            if (element.nodeName.toLowerCase() !== 'select')
-                throw new Error('Element is not a <select> element.');
-            const options = Array.from(element.options);
-            element.value = undefined;
-            for (const option of options) {
-                option.selected = values.includes(option.value);
-                if (option.selected && !element.multiple)
-                    break;
-            }
-            element.dispatchEvent(new Event('input', { bubbles: true }));
-            element.dispatchEvent(new Event('change', { bubbles: true }));
-            return options
-                .filter((option) => option.selected)
-                .map((option) => option.value);
-        }, values);
-    }
-    /**
-     * This method expects `elementHandle` to point to an
-     * {@link https://developer.mozilla.org/en-US/docs/Web/HTML/Element/input | input element}.
-     * @param filePaths - Sets the value of the file input to these paths.
-     *    If some of the  `filePaths` are relative paths, then they are resolved
-     *    relative to the {@link https://nodejs.org/api/process.html#process_process_cwd | current working directory}
-     */
-    async uploadFile(...filePaths) {
-        const isMultiple = await this.evaluate((element) => element.multiple);
-        assert_1.assert(filePaths.length <= 1 || isMultiple, 'Multiple file uploads only work with <input type=file multiple>');
-        // This import is only needed for `uploadFile`, so keep it scoped here to avoid paying
-        // the cost unnecessarily.
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const path = __webpack_require__(622);
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const fs = __webpack_require__(747);
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const { promisify } = __webpack_require__(669);
-        const access = promisify(fs.access);
-        // Locate all files and confirm that they exist.
-        const files = await Promise.all(filePaths.map(async (filePath) => {
-            const resolvedPath = path.resolve(filePath);
-            try {
-                await access(resolvedPath, fs.constants.R_OK);
-            }
-            catch (error) {
-                if (error.code === 'ENOENT')
-                    throw new Error(`${filePath} does not exist or is not readable`);
-            }
-            return resolvedPath;
-        }));
-        const { objectId } = this._remoteObject;
-        const { node } = await this._client.send('DOM.describeNode', { objectId });
-        const { backendNodeId } = node;
-        // The zero-length array is a special case, it seems that DOM.setFileInputFiles does
-        // not actually update the files in that case, so the solution is to eval the element
-        // value to a new FileList directly.
-        if (files.length === 0) {
-            await this.evaluate((element) => {
-                element.files = new DataTransfer().files;
-                // Dispatch events for this case because it should behave akin to a user action.
-                element.dispatchEvent(new Event('input', { bubbles: true }));
-                element.dispatchEvent(new Event('change', { bubbles: true }));
-            });
-        }
-        else {
-            await this._client.send('DOM.setFileInputFiles', {
-                objectId,
-                files,
-                backendNodeId,
-            });
-        }
-    }
-    /**
-     * This method scrolls element into view if needed, and then uses
-     * {@link Touchscreen.tap} to tap in the center of the element.
-     * If the element is detached from DOM, the method throws an error.
-     */
-    async tap() {
-        await this._scrollIntoViewIfNeeded();
-        const { x, y } = await this._clickablePoint();
-        await this._page.touchscreen.tap(x, y);
-    }
-    /**
-     * Calls {@link https://developer.mozilla.org/en-US/docs/Web/API/HTMLElement/focus | focus} on the element.
-     */
-    async focus() {
-        await this.evaluate((element) => element.focus());
-    }
-    /**
-     * Focuses the element, and then sends a `keydown`, `keypress`/`input`, and
-     * `keyup` event for each character in the text.
-     *
-     * To press a special key, like `Control` or `ArrowDown`,
-     * use {@link ElementHandle.press}.
-     *
-     * @example
-     * ```js
-     * await elementHandle.type('Hello'); // Types instantly
-     * await elementHandle.type('World', {delay: 100}); // Types slower, like a user
-     * ```
-     *
-     * @example
-     * An example of typing into a text field and then submitting the form:
-     *
-     * ```js
-     * const elementHandle = await page.$('input');
-     * await elementHandle.type('some text');
-     * await elementHandle.press('Enter');
-     * ```
-     */
-    async type(text, options) {
-        await this.focus();
-        await this._page.keyboard.type(text, options);
-    }
-    /**
-     * Focuses the element, and then uses {@link Keyboard.down} and {@link Keyboard.up}.
-     *
-     * @remarks
-     * If `key` is a single character and no modifier keys besides `Shift`
-     * are being held down, a `keypress`/`input` event will also be generated.
-     * The `text` option can be specified to force an input event to be generated.
-     *
-     * **NOTE** Modifier keys DO affect `elementHandle.press`. Holding down `Shift`
-     * will type the text in upper case.
-     *
-     * @param key - Name of key to press, such as `ArrowLeft`.
-     *    See {@link KeyInput} for a list of all key names.
-     */
-    async press(key, options) {
-        await this.focus();
-        await this._page.keyboard.press(key, options);
-    }
-    /**
-     * This method returns the bounding box of the element (relative to the main frame),
-     * or `null` if the element is not visible.
-     */
-    async boundingBox() {
-        const result = await this._getBoxModel();
-        if (!result)
-            return null;
-        const quad = result.model.border;
-        const x = Math.min(quad[0], quad[2], quad[4], quad[6]);
-        const y = Math.min(quad[1], quad[3], quad[5], quad[7]);
-        const width = Math.max(quad[0], quad[2], quad[4], quad[6]) - x;
-        const height = Math.max(quad[1], quad[3], quad[5], quad[7]) - y;
-        return { x, y, width, height };
-    }
-    /**
-     * This method returns boxes of the element, or `null` if the element is not visible.
-     *
-     * @remarks
-     *
-     * Boxes are represented as an array of points;
-     * Each Point is an object `{x, y}`. Box points are sorted clock-wise.
-     */
-    async boxModel() {
-        const result = await this._getBoxModel();
-        if (!result)
-            return null;
-        const { content, padding, border, margin, width, height } = result.model;
-        return {
-            content: this._fromProtocolQuad(content),
-            padding: this._fromProtocolQuad(padding),
-            border: this._fromProtocolQuad(border),
-            margin: this._fromProtocolQuad(margin),
-            width,
-            height,
-        };
-    }
-    /**
-     * This method scrolls element into view if needed, and then uses
-     * {@link Page.screenshot} to take a screenshot of the element.
-     * If the element is detached from DOM, the method throws an error.
-     */
-    async screenshot(options = {}) {
-        let needsViewportReset = false;
-        let boundingBox = await this.boundingBox();
-        assert_1.assert(boundingBox, 'Node is either not visible or not an HTMLElement');
-        const viewport = this._page.viewport();
-        if (viewport &&
-            (boundingBox.width > viewport.width ||
-                boundingBox.height > viewport.height)) {
-            const newViewport = {
-                width: Math.max(viewport.width, Math.ceil(boundingBox.width)),
-                height: Math.max(viewport.height, Math.ceil(boundingBox.height)),
-            };
-            await this._page.setViewport(Object.assign({}, viewport, newViewport));
-            needsViewportReset = true;
-        }
-        await this._scrollIntoViewIfNeeded();
-        boundingBox = await this.boundingBox();
-        assert_1.assert(boundingBox, 'Node is either not visible or not an HTMLElement');
-        assert_1.assert(boundingBox.width !== 0, 'Node has 0 width.');
-        assert_1.assert(boundingBox.height !== 0, 'Node has 0 height.');
-        const { layoutViewport: { pageX, pageY }, } = await this._client.send('Page.getLayoutMetrics');
-        const clip = Object.assign({}, boundingBox);
-        clip.x += pageX;
-        clip.y += pageY;
-        const imageData = await this._page.screenshot(Object.assign({}, {
-            clip,
-        }, options));
-        if (needsViewportReset)
-            await this._page.setViewport(viewport);
-        return imageData;
-    }
-    /**
-     * Runs `element.querySelector` within the page. If no element matches the selector,
-     * the return value resolves to `null`.
-     */
-    async $(selector) {
-        const defaultHandler = (element, selector) => element.querySelector(selector);
-        const { updatedSelector, queryHandler } = QueryHandler_1.getQueryHandlerAndSelector(selector, defaultHandler);
-        const handle = await this.evaluateHandle(queryHandler, updatedSelector);
-        const element = handle.asElement();
-        if (element)
-            return element;
-        await handle.dispose();
-        return null;
-    }
-    /**
-     * Runs `element.querySelectorAll` within the page. If no elements match the selector,
-     * the return value resolves to `[]`.
-     */
-    async $$(selector) {
-        const defaultHandler = (element, selector) => element.querySelectorAll(selector);
-        const { updatedSelector, queryHandler } = QueryHandler_1.getQueryHandlerAndSelector(selector, defaultHandler);
-        const arrayHandle = await this.evaluateHandle(queryHandler, updatedSelector);
-        const properties = await arrayHandle.getProperties();
-        await arrayHandle.dispose();
-        const result = [];
-        for (const property of properties.values()) {
-            const elementHandle = property.asElement();
-            if (elementHandle)
-                result.push(elementHandle);
-        }
-        return result;
-    }
-    /**
-     * This method runs `document.querySelector` within the element and passes it as
-     * the first argument to `pageFunction`. If there's no element matching `selector`,
-     * the method throws an error.
-     *
-     * If `pageFunction` returns a Promise, then `frame.$eval` would wait for the promise
-     * to resolve and return its value.
-     *
-     * @example
-     * ```js
-     * const tweetHandle = await page.$('.tweet');
-     * expect(await tweetHandle.$eval('.like', node => node.innerText)).toBe('100');
-     * expect(await tweetHandle.$eval('.retweets', node => node.innerText)).toBe('10');
-     * ```
-     */
-    async $eval(selector, pageFunction, ...args) {
-        const elementHandle = await this.$(selector);
-        if (!elementHandle)
-            throw new Error(`Error: failed to find element matching selector "${selector}"`);
-        const result = await elementHandle.evaluate(pageFunction, ...args);
-        await elementHandle.dispose();
-        /**
-         * This as is a little unfortunate but helps TS understand the behavour of
-         * `elementHandle.evaluate`. If evalute returns an element it will return an
-         * ElementHandle instance, rather than the plain object. All the
-         * WrapElementHandle type does is wrap ReturnType into
-         * ElementHandle<ReturnType> if it is an ElementHandle, or leave it alone as
-         * ReturnType if it isn't.
-         */
-        return result;
-    }
-    /**
-     * This method runs `document.querySelectorAll` within the element and passes it as
-     * the first argument to `pageFunction`. If there's no element matching `selector`,
-     * the method throws an error.
-     *
-     * If `pageFunction` returns a Promise, then `frame.$$eval` would wait for the
-     * promise to resolve and return its value.
-     *
-     * @example
-     * ```html
-     * <div class="feed">
-     *   <div class="tweet">Hello!</div>
-     *   <div class="tweet">Hi!</div>
-     * </div>
-     * ```
-     *
-     * @example
-     * ```js
-     * const feedHandle = await page.$('.feed');
-     * expect(await feedHandle.$$eval('.tweet', nodes => nodes.map(n => n.innerText)))
-     *  .toEqual(['Hello!', 'Hi!']);
-     * ```
-     */
-    async $$eval(selector, pageFunction, ...args) {
-        const defaultHandler = (element, selector) => Array.from(element.querySelectorAll(selector));
-        const { updatedSelector, queryHandler } = QueryHandler_1.getQueryHandlerAndSelector(selector, defaultHandler);
-        const arrayHandle = await this.evaluateHandle(queryHandler, updatedSelector);
-        const result = await arrayHandle.evaluate(pageFunction, ...args);
-        await arrayHandle.dispose();
-        return result;
-    }
-    /**
-     * The method evaluates the XPath expression relative to the elementHandle.
-     * If there are no such elements, the method will resolve to an empty array.
-     * @param expression - Expression to {@link https://developer.mozilla.org/en-US/docs/Web/API/Document/evaluate | evaluate}
-     */
-    async $x(expression) {
-        const arrayHandle = await this.evaluateHandle((element, expression) => {
-            const document = element.ownerDocument || element;
-            const iterator = document.evaluate(expression, element, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE);
-            const array = [];
-            let item;
-            while ((item = iterator.iterateNext()))
-                array.push(item);
-            return array;
-        }, expression);
-        const properties = await arrayHandle.getProperties();
-        await arrayHandle.dispose();
-        const result = [];
-        for (const property of properties.values()) {
-            const elementHandle = property.asElement();
-            if (elementHandle)
-                result.push(elementHandle);
-        }
-        return result;
-    }
-    /**
-     * Resolves to true if the element is visible in the current viewport.
-     */
-    async isIntersectingViewport() {
-        return await this.evaluate(async (element) => {
-            const visibleRatio = await new Promise((resolve) => {
-                const observer = new IntersectionObserver((entries) => {
-                    resolve(entries[0].intersectionRatio);
-                    observer.disconnect();
-                });
-                observer.observe(element);
-            });
-            return visibleRatio > 0;
-        });
-    }
-}
-exports.ElementHandle = ElementHandle;
-function computeQuadArea(quad) {
-    // Compute sum of all directed areas of adjacent triangles
-    // https://en.wikipedia.org/wiki/Polygon#Simple_polygons
-    let area = 0;
-    for (let i = 0; i < quad.length; ++i) {
-        const p1 = quad[i];
-        const p2 = quad[(i + 1) % quad.length];
-        area += (p1.x * p2.y - p2.x * p1.y) / 2;
-    }
-    return Math.abs(area);
-}
-
-
-/***/ }),
-/* 662 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-/**
- * Copyright 2018 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the 'License');
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an 'AS IS' BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Accessibility = void 0;
-/**
- * The Accessibility class provides methods for inspecting Chromium's
- * accessibility tree. The accessibility tree is used by assistive technology
- * such as {@link https://en.wikipedia.org/wiki/Screen_reader | screen readers} or
- * {@link https://en.wikipedia.org/wiki/Switch_access | switches}.
- *
- * @remarks
- *
- * Accessibility is a very platform-specific thing. On different platforms,
- * there are different screen readers that might have wildly different output.
- *
- * Blink - Chrome's rendering engine - has a concept of "accessibility tree",
- * which is then translated into different platform-specific APIs. Accessibility
- * namespace gives users access to the Blink Accessibility Tree.
- *
- * Most of the accessibility tree gets filtered out when converting from Blink
- * AX Tree to Platform-specific AX-Tree or by assistive technologies themselves.
- * By default, Puppeteer tries to approximate this filtering, exposing only
- * the "interesting" nodes of the tree.
- *
- * @public
- */
-class Accessibility {
-    /**
-     * @internal
-     */
-    constructor(client) {
-        this._client = client;
-    }
-    /**
-     * Captures the current state of the accessibility tree.
-     * The returned object represents the root accessible node of the page.
-     *
-     * @remarks
-     *
-     * **NOTE** The Chromium accessibility tree contains nodes that go unused on
-     * most platforms and by most screen readers. Puppeteer will discard them as
-     * well for an easier to process tree, unless `interestingOnly` is set to
-     * `false`.
-     *
-     * @example
-     * An example of dumping the entire accessibility tree:
-     * ```js
-     * const snapshot = await page.accessibility.snapshot();
-     * console.log(snapshot);
-     * ```
-     *
-     * @example
-     * An example of logging the focused node's name:
-     * ```js
-     * const snapshot = await page.accessibility.snapshot();
-     * const node = findFocusedNode(snapshot);
-     * console.log(node && node.name);
-     *
-     * function findFocusedNode(node) {
-     *   if (node.focused)
-     *     return node;
-     *   for (const child of node.children || []) {
-     *     const foundNode = findFocusedNode(child);
-     *     return foundNode;
-     *   }
-     *   return null;
-     * }
-     * ```
-     *
-     * @returns An AXNode object representing the snapshot.
-     *
-     */
-    async snapshot(options = {}) {
-        const { interestingOnly = true, root = null } = options;
-        const { nodes } = await this._client.send('Accessibility.getFullAXTree');
-        let backendNodeId = null;
-        if (root) {
-            const { node } = await this._client.send('DOM.describeNode', {
-                objectId: root._remoteObject.objectId,
-            });
-            backendNodeId = node.backendNodeId;
-        }
-        const defaultRoot = AXNode.createTree(nodes);
-        let needle = defaultRoot;
-        if (backendNodeId) {
-            needle = defaultRoot.find((node) => node.payload.backendDOMNodeId === backendNodeId);
-            if (!needle)
-                return null;
-        }
-        if (!interestingOnly)
-            return this.serializeTree(needle)[0];
-        const interestingNodes = new Set();
-        this.collectInterestingNodes(interestingNodes, defaultRoot, false);
-        if (!interestingNodes.has(needle))
-            return null;
-        return this.serializeTree(needle, interestingNodes)[0];
-    }
-    serializeTree(node, whitelistedNodes) {
-        const children = [];
-        for (const child of node.children)
-            children.push(...this.serializeTree(child, whitelistedNodes));
-        if (whitelistedNodes && !whitelistedNodes.has(node))
-            return children;
-        const serializedNode = node.serialize();
-        if (children.length)
-            serializedNode.children = children;
-        return [serializedNode];
-    }
-    collectInterestingNodes(collection, node, insideControl) {
-        if (node.isInteresting(insideControl))
-            collection.add(node);
-        if (node.isLeafNode())
-            return;
-        insideControl = insideControl || node.isControl();
-        for (const child of node.children)
-            this.collectInterestingNodes(collection, child, insideControl);
-    }
-}
-exports.Accessibility = Accessibility;
-class AXNode {
-    constructor(payload) {
-        this.children = [];
-        this._richlyEditable = false;
-        this._editable = false;
-        this._focusable = false;
-        this._hidden = false;
-        this.payload = payload;
-        this._name = this.payload.name ? this.payload.name.value : '';
-        this._role = this.payload.role ? this.payload.role.value : 'Unknown';
-        for (const property of this.payload.properties || []) {
-            if (property.name === 'editable') {
-                this._richlyEditable = property.value.value === 'richtext';
-                this._editable = true;
-            }
-            if (property.name === 'focusable')
-                this._focusable = property.value.value;
-            if (property.name === 'hidden')
-                this._hidden = property.value.value;
-        }
-    }
-    _isPlainTextField() {
-        if (this._richlyEditable)
-            return false;
-        if (this._editable)
-            return true;
-        return (this._role === 'textbox' ||
-            this._role === 'ComboBox' ||
-            this._role === 'searchbox');
-    }
-    _isTextOnlyObject() {
-        const role = this._role;
-        return role === 'LineBreak' || role === 'text' || role === 'InlineTextBox';
-    }
-    _hasFocusableChild() {
-        if (this._cachedHasFocusableChild === undefined) {
-            this._cachedHasFocusableChild = false;
-            for (const child of this.children) {
-                if (child._focusable || child._hasFocusableChild()) {
-                    this._cachedHasFocusableChild = true;
-                    break;
-                }
-            }
-        }
-        return this._cachedHasFocusableChild;
-    }
-    find(predicate) {
-        if (predicate(this))
-            return this;
-        for (const child of this.children) {
-            const result = child.find(predicate);
-            if (result)
-                return result;
-        }
-        return null;
-    }
-    isLeafNode() {
-        if (!this.children.length)
-            return true;
-        // These types of objects may have children that we use as internal
-        // implementation details, but we want to expose them as leaves to platform
-        // accessibility APIs because screen readers might be confused if they find
-        // any children.
-        if (this._isPlainTextField() || this._isTextOnlyObject())
-            return true;
-        // Roles whose children are only presentational according to the ARIA and
-        // HTML5 Specs should be hidden from screen readers.
-        // (Note that whilst ARIA buttons can have only presentational children, HTML5
-        // buttons are allowed to have content.)
-        switch (this._role) {
-            case 'doc-cover':
-            case 'graphics-symbol':
-            case 'img':
-            case 'Meter':
-            case 'scrollbar':
-            case 'slider':
-            case 'separator':
-            case 'progressbar':
-                return true;
-            default:
-                break;
-        }
-        // Here and below: Android heuristics
-        if (this._hasFocusableChild())
-            return false;
-        if (this._focusable && this._name)
-            return true;
-        if (this._role === 'heading' && this._name)
-            return true;
-        return false;
-    }
-    isControl() {
-        switch (this._role) {
-            case 'button':
-            case 'checkbox':
-            case 'ColorWell':
-            case 'combobox':
-            case 'DisclosureTriangle':
-            case 'listbox':
-            case 'menu':
-            case 'menubar':
-            case 'menuitem':
-            case 'menuitemcheckbox':
-            case 'menuitemradio':
-            case 'radio':
-            case 'scrollbar':
-            case 'searchbox':
-            case 'slider':
-            case 'spinbutton':
-            case 'switch':
-            case 'tab':
-            case 'textbox':
-            case 'tree':
-                return true;
-            default:
-                return false;
-        }
-    }
-    isInteresting(insideControl) {
-        const role = this._role;
-        if (role === 'Ignored' || this._hidden)
-            return false;
-        if (this._focusable || this._richlyEditable)
-            return true;
-        // If it's not focusable but has a control role, then it's interesting.
-        if (this.isControl())
-            return true;
-        // A non focusable child of a control is not interesting
-        if (insideControl)
-            return false;
-        return this.isLeafNode() && !!this._name;
-    }
-    serialize() {
-        const properties = new Map();
-        for (const property of this.payload.properties || [])
-            properties.set(property.name.toLowerCase(), property.value.value);
-        if (this.payload.name)
-            properties.set('name', this.payload.name.value);
-        if (this.payload.value)
-            properties.set('value', this.payload.value.value);
-        if (this.payload.description)
-            properties.set('description', this.payload.description.value);
-        const node = {
-            role: this._role,
-        };
-        const userStringProperties = [
-            'name',
-            'value',
-            'description',
-            'keyshortcuts',
-            'roledescription',
-            'valuetext',
-        ];
-        const getUserStringPropertyValue = (key) => properties.get(key);
-        for (const userStringProperty of userStringProperties) {
-            if (!properties.has(userStringProperty))
-                continue;
-            node[userStringProperty] = getUserStringPropertyValue(userStringProperty);
-        }
-        const booleanProperties = [
-            'disabled',
-            'expanded',
-            'focused',
-            'modal',
-            'multiline',
-            'multiselectable',
-            'readonly',
-            'required',
-            'selected',
-        ];
-        const getBooleanPropertyValue = (key) => properties.get(key);
-        for (const booleanProperty of booleanProperties) {
-            // WebArea's treat focus differently than other nodes. They report whether
-            // their frame  has focus, not whether focus is specifically on the root
-            // node.
-            if (booleanProperty === 'focused' && this._role === 'WebArea')
-                continue;
-            const value = getBooleanPropertyValue(booleanProperty);
-            if (!value)
-                continue;
-            node[booleanProperty] = getBooleanPropertyValue(booleanProperty);
-        }
-        const tristateProperties = ['checked', 'pressed'];
-        for (const tristateProperty of tristateProperties) {
-            if (!properties.has(tristateProperty))
-                continue;
-            const value = properties.get(tristateProperty);
-            node[tristateProperty] =
-                value === 'mixed' ? 'mixed' : value === 'true' ? true : false;
-        }
-        const numericalProperties = [
-            'level',
-            'valuemax',
-            'valuemin',
-        ];
-        const getNumericalPropertyValue = (key) => properties.get(key);
-        for (const numericalProperty of numericalProperties) {
-            if (!properties.has(numericalProperty))
-                continue;
-            node[numericalProperty] = getNumericalPropertyValue(numericalProperty);
-        }
-        const tokenProperties = [
-            'autocomplete',
-            'haspopup',
-            'invalid',
-            'orientation',
-        ];
-        const getTokenPropertyValue = (key) => properties.get(key);
-        for (const tokenProperty of tokenProperties) {
-            const value = getTokenPropertyValue(tokenProperty);
-            if (!value || value === 'false')
-                continue;
-            node[tokenProperty] = getTokenPropertyValue(tokenProperty);
-        }
-        return node;
-    }
-    static createTree(payloads) {
-        const nodeById = new Map();
-        for (const payload of payloads)
-            nodeById.set(payload.nodeId, new AXNode(payload));
-        for (const node of nodeById.values()) {
-            for (const childId of node.payload.childIds || [])
-                node.children.push(nodeById.get(childId));
-        }
-        return nodeById.values().next().value;
-    }
-}
 
 
 /***/ }),
@@ -28523,7 +30108,332 @@ module.exports = Limiter;
 
 
 /***/ }),
-/* 665 */,
+/* 665 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Coverage = void 0;
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const ExecutionContext_js_1 = __webpack_require__(124);
+/**
+ * The Coverage class provides methods to gathers information about parts of
+ * JavaScript and CSS that were used by the page.
+ *
+ * @remarks
+ * To output coverage in a form consumable by {@link https://github.com/istanbuljs | Istanbul},
+ * see {@link https://github.com/istanbuljs/puppeteer-to-istanbul | puppeteer-to-istanbul}.
+ *
+ * @example
+ * An example of using JavaScript and CSS coverage to get percentage of initially
+ * executed code:
+ * ```js
+ * // Enable both JavaScript and CSS coverage
+ * await Promise.all([
+ *   page.coverage.startJSCoverage(),
+ *   page.coverage.startCSSCoverage()
+ * ]);
+ * // Navigate to page
+ * await page.goto('https://example.com');
+ * // Disable both JavaScript and CSS coverage
+ * const [jsCoverage, cssCoverage] = await Promise.all([
+ *   page.coverage.stopJSCoverage(),
+ *   page.coverage.stopCSSCoverage(),
+ * ]);
+ * let totalBytes = 0;
+ * let usedBytes = 0;
+ * const coverage = [...jsCoverage, ...cssCoverage];
+ * for (const entry of coverage) {
+ *   totalBytes += entry.text.length;
+ *   for (const range of entry.ranges)
+ *     usedBytes += range.end - range.start - 1;
+ * }
+ * console.log(`Bytes used: ${usedBytes / totalBytes * 100}%`);
+ * ```
+ * @public
+ */
+class Coverage {
+    constructor(client) {
+        this._jsCoverage = new JSCoverage(client);
+        this._cssCoverage = new CSSCoverage(client);
+    }
+    /**
+     * @param options - defaults to
+     * `{ resetOnNavigation : true, reportAnonymousScripts : false }`
+     * @returns Promise that resolves when coverage is started.
+     *
+     * @remarks
+     * Anonymous scripts are ones that don't have an associated url. These are
+     * scripts that are dynamically created on the page using `eval` or
+     * `new Function`. If `reportAnonymousScripts` is set to `true`, anonymous
+     * scripts will have `__puppeteer_evaluation_script__` as their URL.
+     */
+    async startJSCoverage(options = {}) {
+        return await this._jsCoverage.start(options);
+    }
+    /**
+     * @returns Promise that resolves to the array of coverage reports for
+     * all scripts.
+     *
+     * @remarks
+     * JavaScript Coverage doesn't include anonymous scripts by default.
+     * However, scripts with sourceURLs are reported.
+     */
+    async stopJSCoverage() {
+        return await this._jsCoverage.stop();
+    }
+    /**
+     * @param options - defaults to `{ resetOnNavigation : true }`
+     * @returns Promise that resolves when coverage is started.
+     */
+    async startCSSCoverage(options = {}) {
+        return await this._cssCoverage.start(options);
+    }
+    /**
+     * @returns Promise that resolves to the array of coverage reports
+     * for all stylesheets.
+     * @remarks
+     * CSS Coverage doesn't include dynamically injected style tags
+     * without sourceURLs.
+     */
+    async stopCSSCoverage() {
+        return await this._cssCoverage.stop();
+    }
+}
+exports.Coverage = Coverage;
+class JSCoverage {
+    constructor(client) {
+        this._enabled = false;
+        this._scriptURLs = new Map();
+        this._scriptSources = new Map();
+        this._eventListeners = [];
+        this._resetOnNavigation = false;
+        this._reportAnonymousScripts = false;
+        this._client = client;
+    }
+    async start(options = {}) {
+        assert_js_1.assert(!this._enabled, 'JSCoverage is already enabled');
+        const { resetOnNavigation = true, reportAnonymousScripts = false, } = options;
+        this._resetOnNavigation = resetOnNavigation;
+        this._reportAnonymousScripts = reportAnonymousScripts;
+        this._enabled = true;
+        this._scriptURLs.clear();
+        this._scriptSources.clear();
+        this._eventListeners = [
+            helper_js_1.helper.addEventListener(this._client, 'Debugger.scriptParsed', this._onScriptParsed.bind(this)),
+            helper_js_1.helper.addEventListener(this._client, 'Runtime.executionContextsCleared', this._onExecutionContextsCleared.bind(this)),
+        ];
+        await Promise.all([
+            this._client.send('Profiler.enable'),
+            this._client.send('Profiler.startPreciseCoverage', {
+                callCount: false,
+                detailed: true,
+            }),
+            this._client.send('Debugger.enable'),
+            this._client.send('Debugger.setSkipAllPauses', { skip: true }),
+        ]);
+    }
+    _onExecutionContextsCleared() {
+        if (!this._resetOnNavigation)
+            return;
+        this._scriptURLs.clear();
+        this._scriptSources.clear();
+    }
+    async _onScriptParsed(event) {
+        // Ignore puppeteer-injected scripts
+        if (event.url === ExecutionContext_js_1.EVALUATION_SCRIPT_URL)
+            return;
+        // Ignore other anonymous scripts unless the reportAnonymousScripts option is true.
+        if (!event.url && !this._reportAnonymousScripts)
+            return;
+        try {
+            const response = await this._client.send('Debugger.getScriptSource', {
+                scriptId: event.scriptId,
+            });
+            this._scriptURLs.set(event.scriptId, event.url);
+            this._scriptSources.set(event.scriptId, response.scriptSource);
+        }
+        catch (error) {
+            // This might happen if the page has already navigated away.
+            helper_js_1.debugError(error);
+        }
+    }
+    async stop() {
+        assert_js_1.assert(this._enabled, 'JSCoverage is not enabled');
+        this._enabled = false;
+        const result = await Promise.all([
+            this._client.send('Profiler.takePreciseCoverage'),
+            this._client.send('Profiler.stopPreciseCoverage'),
+            this._client.send('Profiler.disable'),
+            this._client.send('Debugger.disable'),
+        ]);
+        helper_js_1.helper.removeEventListeners(this._eventListeners);
+        const coverage = [];
+        const profileResponse = result[0];
+        for (const entry of profileResponse.result) {
+            let url = this._scriptURLs.get(entry.scriptId);
+            if (!url && this._reportAnonymousScripts)
+                url = 'debugger://VM' + entry.scriptId;
+            const text = this._scriptSources.get(entry.scriptId);
+            if (text === undefined || url === undefined)
+                continue;
+            const flattenRanges = [];
+            for (const func of entry.functions)
+                flattenRanges.push(...func.ranges);
+            const ranges = convertToDisjointRanges(flattenRanges);
+            coverage.push({ url, ranges, text });
+        }
+        return coverage;
+    }
+}
+class CSSCoverage {
+    constructor(client) {
+        this._enabled = false;
+        this._stylesheetURLs = new Map();
+        this._stylesheetSources = new Map();
+        this._eventListeners = [];
+        this._resetOnNavigation = false;
+        this._reportAnonymousScripts = false;
+        this._client = client;
+    }
+    async start(options = {}) {
+        assert_js_1.assert(!this._enabled, 'CSSCoverage is already enabled');
+        const { resetOnNavigation = true } = options;
+        this._resetOnNavigation = resetOnNavigation;
+        this._enabled = true;
+        this._stylesheetURLs.clear();
+        this._stylesheetSources.clear();
+        this._eventListeners = [
+            helper_js_1.helper.addEventListener(this._client, 'CSS.styleSheetAdded', this._onStyleSheet.bind(this)),
+            helper_js_1.helper.addEventListener(this._client, 'Runtime.executionContextsCleared', this._onExecutionContextsCleared.bind(this)),
+        ];
+        await Promise.all([
+            this._client.send('DOM.enable'),
+            this._client.send('CSS.enable'),
+            this._client.send('CSS.startRuleUsageTracking'),
+        ]);
+    }
+    _onExecutionContextsCleared() {
+        if (!this._resetOnNavigation)
+            return;
+        this._stylesheetURLs.clear();
+        this._stylesheetSources.clear();
+    }
+    async _onStyleSheet(event) {
+        const header = event.header;
+        // Ignore anonymous scripts
+        if (!header.sourceURL)
+            return;
+        try {
+            const response = await this._client.send('CSS.getStyleSheetText', {
+                styleSheetId: header.styleSheetId,
+            });
+            this._stylesheetURLs.set(header.styleSheetId, header.sourceURL);
+            this._stylesheetSources.set(header.styleSheetId, response.text);
+        }
+        catch (error) {
+            // This might happen if the page has already navigated away.
+            helper_js_1.debugError(error);
+        }
+    }
+    async stop() {
+        assert_js_1.assert(this._enabled, 'CSSCoverage is not enabled');
+        this._enabled = false;
+        const ruleTrackingResponse = await this._client.send('CSS.stopRuleUsageTracking');
+        await Promise.all([
+            this._client.send('CSS.disable'),
+            this._client.send('DOM.disable'),
+        ]);
+        helper_js_1.helper.removeEventListeners(this._eventListeners);
+        // aggregate by styleSheetId
+        const styleSheetIdToCoverage = new Map();
+        for (const entry of ruleTrackingResponse.ruleUsage) {
+            let ranges = styleSheetIdToCoverage.get(entry.styleSheetId);
+            if (!ranges) {
+                ranges = [];
+                styleSheetIdToCoverage.set(entry.styleSheetId, ranges);
+            }
+            ranges.push({
+                startOffset: entry.startOffset,
+                endOffset: entry.endOffset,
+                count: entry.used ? 1 : 0,
+            });
+        }
+        const coverage = [];
+        for (const styleSheetId of this._stylesheetURLs.keys()) {
+            const url = this._stylesheetURLs.get(styleSheetId);
+            const text = this._stylesheetSources.get(styleSheetId);
+            const ranges = convertToDisjointRanges(styleSheetIdToCoverage.get(styleSheetId) || []);
+            coverage.push({ url, ranges, text });
+        }
+        return coverage;
+    }
+}
+function convertToDisjointRanges(nestedRanges) {
+    const points = [];
+    for (const range of nestedRanges) {
+        points.push({ offset: range.startOffset, type: 0, range });
+        points.push({ offset: range.endOffset, type: 1, range });
+    }
+    // Sort points to form a valid parenthesis sequence.
+    points.sort((a, b) => {
+        // Sort with increasing offsets.
+        if (a.offset !== b.offset)
+            return a.offset - b.offset;
+        // All "end" points should go before "start" points.
+        if (a.type !== b.type)
+            return b.type - a.type;
+        const aLength = a.range.endOffset - a.range.startOffset;
+        const bLength = b.range.endOffset - b.range.startOffset;
+        // For two "start" points, the one with longer range goes first.
+        if (a.type === 0)
+            return bLength - aLength;
+        // For two "end" points, the one with shorter range goes first.
+        return aLength - bLength;
+    });
+    const hitCountStack = [];
+    const results = [];
+    let lastOffset = 0;
+    // Run scanning line to intersect all ranges.
+    for (const point of points) {
+        if (hitCountStack.length &&
+            lastOffset < point.offset &&
+            hitCountStack[hitCountStack.length - 1] > 0) {
+            const lastResult = results.length ? results[results.length - 1] : null;
+            if (lastResult && lastResult.end === lastOffset)
+                lastResult.end = point.offset;
+            else
+                results.push({ start: lastOffset, end: point.offset });
+        }
+        lastOffset = point.offset;
+        if (point.type === 0)
+            hitCountStack.push(point.range.count);
+        else
+            hitCountStack.pop();
+    }
+    // Filter out empty ranges.
+    return results.filter((range) => range.end - range.start > 1);
+}
+
+
+/***/ }),
 /* 666 */,
 /* 667 */,
 /* 668 */,
@@ -28994,155 +30904,7 @@ function slice (args) {
 /* 676 */,
 /* 677 */,
 /* 678 */,
-/* 679 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-/**
- * Copyright 2019 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Target = void 0;
-const Events_1 = __webpack_require__(872);
-const Page_1 = __webpack_require__(398);
-const WebWorker_1 = __webpack_require__(10);
-/**
- * @public
- */
-class Target {
-    /**
-     * @internal
-     */
-    constructor(targetInfo, browserContext, sessionFactory, ignoreHTTPSErrors, defaultViewport) {
-        this._targetInfo = targetInfo;
-        this._browserContext = browserContext;
-        this._targetId = targetInfo.targetId;
-        this._sessionFactory = sessionFactory;
-        this._ignoreHTTPSErrors = ignoreHTTPSErrors;
-        this._defaultViewport = defaultViewport;
-        /** @type {?Promise<!Puppeteer.Page>} */
-        this._pagePromise = null;
-        /** @type {?Promise<!WebWorker>} */
-        this._workerPromise = null;
-        this._initializedPromise = new Promise((fulfill) => (this._initializedCallback = fulfill)).then(async (success) => {
-            if (!success)
-                return false;
-            const opener = this.opener();
-            if (!opener || !opener._pagePromise || this.type() !== 'page')
-                return true;
-            const openerPage = await opener._pagePromise;
-            if (!openerPage.listenerCount(Events_1.Events.Page.Popup))
-                return true;
-            const popupPage = await this.page();
-            openerPage.emit(Events_1.Events.Page.Popup, popupPage);
-            return true;
-        });
-        this._isClosedPromise = new Promise((fulfill) => (this._closedCallback = fulfill));
-        this._isInitialized =
-            this._targetInfo.type !== 'page' || this._targetInfo.url !== '';
-        if (this._isInitialized)
-            this._initializedCallback(true);
-    }
-    /**
-     * Creates a Chrome Devtools Protocol session attached to the target.
-     */
-    createCDPSession() {
-        return this._sessionFactory();
-    }
-    /**
-     * If the target is not of type `"page"` or `"background_page"`, returns `null`.
-     */
-    async page() {
-        if ((this._targetInfo.type === 'page' ||
-            this._targetInfo.type === 'background_page' ||
-            this._targetInfo.type === 'webview') &&
-            !this._pagePromise) {
-            this._pagePromise = this._sessionFactory().then((client) => Page_1.Page.create(client, this, this._ignoreHTTPSErrors, this._defaultViewport));
-        }
-        return this._pagePromise;
-    }
-    /**
-     * If the target is not of type `"service_worker"` or `"shared_worker"`, returns `null`.
-     */
-    async worker() {
-        if (this._targetInfo.type !== 'service_worker' &&
-            this._targetInfo.type !== 'shared_worker')
-            return null;
-        if (!this._workerPromise) {
-            // TODO(einbinder): Make workers send their console logs.
-            this._workerPromise = this._sessionFactory().then((client) => new WebWorker_1.WebWorker(client, this._targetInfo.url, () => { } /* consoleAPICalled */, () => { } /* exceptionThrown */));
-        }
-        return this._workerPromise;
-    }
-    url() {
-        return this._targetInfo.url;
-    }
-    /**
-     * Identifies what kind of target this is.
-     *
-     * @remarks
-     *
-     * See {@link https://developer.chrome.com/extensions/background_pages | docs} for more info about background pages.
-     */
-    type() {
-        const type = this._targetInfo.type;
-        if (type === 'page' ||
-            type === 'background_page' ||
-            type === 'service_worker' ||
-            type === 'shared_worker' ||
-            type === 'browser' ||
-            type === 'webview')
-            return type;
-        return 'other';
-    }
-    /**
-     * Get the browser the target belongs to.
-     */
-    browser() {
-        return this._browserContext.browser();
-    }
-    browserContext() {
-        return this._browserContext;
-    }
-    /**
-     * Get the target that opened this target. Top-level targets return `null`.
-     */
-    opener() {
-        const { openerId } = this._targetInfo;
-        if (!openerId)
-            return null;
-        return this.browser()._targets.get(openerId);
-    }
-    /**
-     * @internal
-     */
-    _targetInfoChanged(targetInfo) {
-        this._targetInfo = targetInfo;
-        if (!this._isInitialized &&
-            (this._targetInfo.type !== 'page' || this._targetInfo.url !== '')) {
-            this._isInitialized = true;
-            this._initializedCallback(true);
-            return;
-        }
-    }
-}
-exports.Target = Target;
-
-
-/***/ }),
+/* 679 */,
 /* 680 */,
 /* 681 */
 /***/ (function(module) {
@@ -29350,7 +31112,125 @@ module.exports = (promise, onFinally) => {
 /* 699 */,
 /* 700 */,
 /* 701 */,
-/* 702 */,
+/* 702 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.WebWorker = void 0;
+/**
+ * Copyright 2018 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+const EventEmitter_js_1 = __webpack_require__(258);
+const helper_js_1 = __webpack_require__(405);
+const ExecutionContext_js_1 = __webpack_require__(124);
+const JSHandle_js_1 = __webpack_require__(933);
+/**
+ * The WebWorker class represents a
+ * {@link https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API | WebWorker}.
+ *
+ * @remarks
+ * The events `workercreated` and `workerdestroyed` are emitted on the page
+ * object to signal the worker lifecycle.
+ *
+ * @example
+ * ```js
+ * page.on('workercreated', worker => console.log('Worker created: ' + worker.url()));
+ * page.on('workerdestroyed', worker => console.log('Worker destroyed: ' + worker.url()));
+ *
+ * console.log('Current workers:');
+ * for (const worker of page.workers()) {
+ *   console.log('  ' + worker.url());
+ * }
+ * ```
+ *
+ * @public
+ */
+class WebWorker extends EventEmitter_js_1.EventEmitter {
+    /**
+     *
+     * @internal
+     */
+    constructor(client, url, consoleAPICalled, exceptionThrown) {
+        super();
+        this._client = client;
+        this._url = url;
+        this._executionContextPromise = new Promise((x) => (this._executionContextCallback = x));
+        let jsHandleFactory;
+        this._client.once('Runtime.executionContextCreated', async (event) => {
+            // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+            jsHandleFactory = (remoteObject) => new JSHandle_js_1.JSHandle(executionContext, client, remoteObject);
+            const executionContext = new ExecutionContext_js_1.ExecutionContext(client, event.context, null);
+            this._executionContextCallback(executionContext);
+        });
+        // This might fail if the target is closed before we recieve all execution contexts.
+        this._client.send('Runtime.enable').catch(helper_js_1.debugError);
+        this._client.on('Runtime.consoleAPICalled', (event) => consoleAPICalled(event.type, event.args.map(jsHandleFactory), event.stackTrace));
+        this._client.on('Runtime.exceptionThrown', (exception) => exceptionThrown(exception.exceptionDetails));
+    }
+    /**
+     * @returns The URL of this web worker.
+     */
+    url() {
+        return this._url;
+    }
+    /**
+     * Returns the ExecutionContext the WebWorker runs in
+     * @returns The ExecutionContext the web worker runs in.
+     */
+    async executionContext() {
+        return this._executionContextPromise;
+    }
+    /**
+     * If the function passed to the `worker.evaluate` returns a Promise, then
+     * `worker.evaluate` would wait for the promise to resolve and return its
+     * value. If the function passed to the `worker.evaluate` returns a
+     * non-serializable value, then `worker.evaluate` resolves to `undefined`.
+     * DevTools Protocol also supports transferring some additional values that
+     * are not serializable by `JSON`: `-0`, `NaN`, `Infinity`, `-Infinity`, and
+     * bigint literals.
+     * Shortcut for `await worker.executionContext()).evaluate(pageFunction, ...args)`.
+     *
+     * @param pageFunction - Function to be evaluated in the worker context.
+     * @param args - Arguments to pass to `pageFunction`.
+     * @returns Promise which resolves to the return value of `pageFunction`.
+     */
+    async evaluate(pageFunction, ...args) {
+        return (await this._executionContextPromise).evaluate(pageFunction, ...args);
+    }
+    /**
+     * The only difference between `worker.evaluate` and `worker.evaluateHandle`
+     * is that `worker.evaluateHandle` returns in-page object (JSHandle). If the
+     * function passed to the `worker.evaluateHandle` returns a [Promise], then
+     * `worker.evaluateHandle` would wait for the promise to resolve and return
+     * its value. Shortcut for
+     * `await worker.executionContext()).evaluateHandle(pageFunction, ...args)`
+     *
+     * @param pageFunction - Function to be evaluated in the page context.
+     * @param args - Arguments to pass to `pageFunction`.
+     * @returns Promise which resolves to the return value of `pageFunction`.
+     */
+    async evaluateHandle(pageFunction, ...args) {
+        return (await this._executionContextPromise).evaluateHandle(pageFunction, ...args);
+    }
+}
+exports.WebWorker = WebWorker;
+
+
+/***/ }),
 /* 703 */,
 /* 704 */,
 /* 705 */,
@@ -29362,56 +31242,42 @@ module.exports = (promise, onFinally) => {
 /* 711 */,
 /* 712 */,
 /* 713 */,
-/* 714 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/* 714 */,
+/* 715 */,
+/* 716 */
+/***/ (function(__unusedmodule, exports) {
 
 "use strict";
 
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
+/**
+ * Copyright 2020 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.WebSocketTransport = void 0;
-const ws_1 = __importDefault(__webpack_require__(237));
-class WebSocketTransport {
-    constructor(ws) {
-        this._ws = ws;
-        this._ws.addEventListener('message', (event) => {
-            if (this.onmessage)
-                this.onmessage.call(null, event.data);
-        });
-        this._ws.addEventListener('close', () => {
-            if (this.onclose)
-                this.onclose.call(null);
-        });
-        // Silently ignore all errors - we don't know what to do with them.
-        this._ws.addEventListener('error', () => { });
-        this.onmessage = null;
-        this.onclose = null;
-    }
-    static create(url) {
-        return new Promise((resolve, reject) => {
-            const ws = new ws_1.default(url, [], {
-                perMessageDeflate: false,
-                maxPayload: 256 * 1024 * 1024,
-            });
-            ws.addEventListener('open', () => resolve(new WebSocketTransport(ws)));
-            ws.addEventListener('error', reject);
-        });
-    }
-    send(message) {
-        this._ws.send(message);
-    }
-    close() {
-        this._ws.close();
-    }
-}
-exports.WebSocketTransport = WebSocketTransport;
+exports.assert = void 0;
+/**
+ * Asserts that the given value is truthy.
+ * @param value
+ * @param message - the error message to throw if the value is not truthy.
+ */
+exports.assert = (value, message) => {
+    if (!value)
+        throw new Error(message);
+};
 
 
 /***/ }),
-/* 715 */,
-/* 716 */,
 /* 717 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -29657,266 +31523,7 @@ function isDefaultPort(port, secure) {
 
 
 /***/ }),
-/* 718 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Puppeteer = void 0;
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-const Launcher_1 = __importDefault(__webpack_require__(948));
-const BrowserFetcher_1 = __webpack_require__(529);
-const Errors_1 = __webpack_require__(24);
-const DeviceDescriptors_1 = __webpack_require__(88);
-const QueryHandler_1 = __webpack_require__(592);
-const revisions_1 = __webpack_require__(3);
-/**
- * The main Puppeteer class
- * Puppeteer module provides a method to launch a browser instance.
- *
- * @remarks
- *
- * @example
- * The following is a typical example of using Puppeteer to drive automation:
- * ```js
- * const puppeteer = require('puppeteer');
- *
- * (async () => {
- *   const browser = await puppeteer.launch();
- *   const page = await browser.newPage();
- *   await page.goto('https://www.google.com');
- *   // other actions...
- *   await browser.close();
- * })();
- * ```
- * @public
- */
-class Puppeteer {
-    /**
-     * @internal
-     */
-    constructor(projectRoot, preferredRevision, isPuppeteerCore, productName) {
-        this._changedProduct = false;
-        this._projectRoot = projectRoot;
-        this._preferredRevision = preferredRevision;
-        this._isPuppeteerCore = isPuppeteerCore;
-        // track changes to Launcher configuration via options or environment variables
-        this.__productName = productName;
-    }
-    /**
-     * Launches puppeteer and launches a browser instance with given arguments
-     * and options when specified.
-     *
-     * @remarks
-     *
-     * @example
-     * You can use `ignoreDefaultArgs` to filter out `--mute-audio` from default arguments:
-     * ```js
-     * const browser = await puppeteer.launch({
-     *   ignoreDefaultArgs: ['--mute-audio']
-     * });
-     * ```
-     *
-     * **NOTE** Puppeteer can also be used to control the Chrome browser,
-     * but it works best with the version of Chromium it is bundled with.
-     * There is no guarantee it will work with any other version.
-     * Use `executablePath` option with extreme caution.
-     * If Google Chrome (rather than Chromium) is preferred, a {@link https://www.google.com/chrome/browser/canary.html | Chrome Canary} or {@link https://www.chromium.org/getting-involved/dev-channel | Dev Channel} build is suggested.
-     * In `puppeteer.launch([options])`, any mention of Chromium also applies to Chrome.
-     * See {@link https://www.howtogeek.com/202825/what%E2%80%99s-the-difference-between-chromium-and-chrome/ | this article} for a description of the differences between Chromium and Chrome. {@link https://chromium.googlesource.com/chromium/src/+/lkgr/docs/chromium_browser_vs_google_chrome.md | This article} describes some differences for Linux users.
-     *
-     * @param options - Set of configurable options to set on the browser.
-     * @returns Promise which resolves to browser instance.
-     */
-    launch(options = {}) {
-        if (options.product)
-            this._productName = options.product;
-        return this._launcher.launch(options);
-    }
-    /**
-     * This method attaches Puppeteer to an existing browser instance.
-     *
-     * @remarks
-     *
-     * @param options - Set of configurable options to set on the browser.
-     * @returns Promise which resolves to browser instance.
-     */
-    connect(options) {
-        if (options.product)
-            this._productName = options.product;
-        return this._launcher.connect(options);
-    }
-    /**
-     * @internal
-     */
-    get _productName() {
-        return this.__productName;
-    }
-    // don't need any TSDoc here - because the getter is internal the setter is too.
-    set _productName(name) {
-        if (this.__productName !== name)
-            this._changedProduct = true;
-        this.__productName = name;
-    }
-    /**
-     * @remarks
-     *
-     * **NOTE** `puppeteer.executablePath()` is affected by the `PUPPETEER_EXECUTABLE_PATH`
-     * and `PUPPETEER_CHROMIUM_REVISION` environment variables.
-     *
-     * @returns A path where Puppeteer expects to find the bundled browser.
-     * The browser binary might not be there if the download was skipped with
-     * the `PUPPETEER_SKIP_DOWNLOAD` environment variable.
-     */
-    executablePath() {
-        return this._launcher.executablePath();
-    }
-    /**
-     * @internal
-     */
-    get _launcher() {
-        if (!this._lazyLauncher ||
-            this._lazyLauncher.product !== this._productName ||
-            this._changedProduct) {
-            switch (this._productName) {
-                case 'firefox':
-                    this._preferredRevision = revisions_1.PUPPETEER_REVISIONS.firefox;
-                    break;
-                case 'chrome':
-                default:
-                    this._preferredRevision = revisions_1.PUPPETEER_REVISIONS.chromium;
-            }
-            this._changedProduct = false;
-            this._lazyLauncher = Launcher_1.default(this._projectRoot, this._preferredRevision, this._isPuppeteerCore, this._productName);
-        }
-        return this._lazyLauncher;
-    }
-    /**
-     * @returns The name of the browser that is under automation (`"chrome"` or `"firefox"`)
-     *
-     * @remarks
-     * The product is set by the `PUPPETEER_PRODUCT` environment variable or the `product`
-     * option in `puppeteer.launch([options])` and defaults to `chrome`.
-     * Firefox support is experimental.
-     */
-    get product() {
-        return this._launcher.product;
-    }
-    /**
-     * @remarks
-     * @example
-     *
-     * ```js
-     * const puppeteer = require('puppeteer');
-     * const iPhone = puppeteer.devices['iPhone 6'];
-     *
-     * (async () => {
-     *   const browser = await puppeteer.launch();
-     *   const page = await browser.newPage();
-     *   await page.emulate(iPhone);
-     *   await page.goto('https://www.google.com');
-     *   // other actions...
-     *   await browser.close();
-     * })();
-     * ```
-     *
-     * @returns a list of devices to be used with `page.emulate(options)`. Actual list of devices can be found in {@link https://github.com/puppeteer/puppeteer/blob/main/src/DeviceDescriptors.ts | src/DeviceDescriptors.ts}.
-     */
-    get devices() {
-        return DeviceDescriptors_1.devicesMap;
-    }
-    /**
-     * @remarks
-     *
-     * Puppeteer methods might throw errors if they are unable to fulfill a request.
-     * For example, `page.waitForSelector(selector[, options])` might fail if
-     * the selector doesn't match any nodes during the given timeframe.
-     *
-     * For certain types of errors Puppeteer uses specific error classes.
-     * These classes are available via `puppeteer.errors`
-     * @example
-     * An example of handling a timeout error:
-     * ```js
-     * try {
-     *   await page.waitForSelector('.foo');
-     * } catch (e) {
-     *   if (e instanceof puppeteer.errors.TimeoutError) {
-     *     // Do something if this is a timeout.
-     *   }
-     * }
-     * ```
-     */
-    get errors() {
-        return Errors_1.puppeteerErrors;
-    }
-    /**
-     *
-     * @param options - Set of configurable options to set on the browser.
-     * @returns The default flags that Chromium will be launched with.
-     */
-    defaultArgs(options = {}) {
-        return this._launcher.defaultArgs(options);
-    }
-    /**
-     *
-     * @param options - Set of configurable options to specify the settings
-     * of the BrowserFetcher.
-     * @returns A new BrowserFetcher instance.
-     */
-    createBrowserFetcher(options) {
-        return new BrowserFetcher_1.BrowserFetcher(this._projectRoot, options);
-    }
-    /**
-     * @internal
-     */
-    // eslint-disable-next-line @typescript-eslint/camelcase
-    __experimental_registerCustomQueryHandler(name, queryHandler) {
-        QueryHandler_1.registerCustomQueryHandler(name, queryHandler);
-    }
-    /**
-     * @internal
-     */
-    // eslint-disable-next-line @typescript-eslint/camelcase
-    __experimental_unregisterCustomQueryHandler(name) {
-        QueryHandler_1.unregisterCustomQueryHandler(name);
-    }
-    /**
-     * @internal
-     */
-    // eslint-disable-next-line @typescript-eslint/camelcase
-    __experimental_customQueryHandlers() {
-        return QueryHandler_1.customQueryHandlers();
-    }
-    /**
-     * @internal
-     */
-    // eslint-disable-next-line @typescript-eslint/camelcase
-    __experimental_clearQueryHandlers() {
-        QueryHandler_1.clearQueryHandlers();
-    }
-}
-exports.Puppeteer = Puppeteer;
-
-
-/***/ }),
+/* 718 */,
 /* 719 */,
 /* 720 */,
 /* 721 */,
@@ -29927,77 +31534,7 @@ exports.Puppeteer = Puppeteer;
 /* 726 */,
 /* 727 */,
 /* 728 */,
-/* 729 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.PipeTransport = void 0;
-/**
- * Copyright 2018 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-const helper_1 = __webpack_require__(758);
-class PipeTransport {
-    constructor(pipeWrite, pipeRead) {
-        this._pipeWrite = pipeWrite;
-        this._pendingMessage = '';
-        this._eventListeners = [
-            helper_1.helper.addEventListener(pipeRead, 'data', (buffer) => this._dispatch(buffer)),
-            helper_1.helper.addEventListener(pipeRead, 'close', () => {
-                if (this.onclose)
-                    this.onclose.call(null);
-            }),
-            helper_1.helper.addEventListener(pipeRead, 'error', helper_1.debugError),
-            helper_1.helper.addEventListener(pipeWrite, 'error', helper_1.debugError),
-        ];
-        this.onmessage = null;
-        this.onclose = null;
-    }
-    send(message) {
-        this._pipeWrite.write(message);
-        this._pipeWrite.write('\0');
-    }
-    _dispatch(buffer) {
-        let end = buffer.indexOf('\0');
-        if (end === -1) {
-            this._pendingMessage += buffer.toString();
-            return;
-        }
-        const message = this._pendingMessage + buffer.toString(undefined, 0, end);
-        if (this.onmessage)
-            this.onmessage.call(null, message);
-        let start = end + 1;
-        end = buffer.indexOf('\0', start);
-        while (end !== -1) {
-            if (this.onmessage)
-                this.onmessage.call(null, buffer.toString(undefined, start, end));
-            start = end + 1;
-            end = buffer.indexOf('\0', start);
-        }
-        this._pendingMessage = buffer.toString(undefined, start);
-    }
-    close() {
-        this._pipeWrite = null;
-        helper_1.helper.removeEventListeners(this._eventListeners);
-    }
-}
-exports.PipeTransport = PipeTransport;
-
-
-/***/ }),
+/* 729 */,
 /* 730 */,
 /* 731 */,
 /* 732 */,
@@ -30239,7 +31776,373 @@ module.exports = require("fs");
 /***/ }),
 /* 748 */,
 /* 749 */,
-/* 750 */,
+/* 750 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+/**
+ * Copyright 2018 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the 'License');
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an 'AS IS' BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Accessibility = void 0;
+/**
+ * The Accessibility class provides methods for inspecting Chromium's
+ * accessibility tree. The accessibility tree is used by assistive technology
+ * such as {@link https://en.wikipedia.org/wiki/Screen_reader | screen readers} or
+ * {@link https://en.wikipedia.org/wiki/Switch_access | switches}.
+ *
+ * @remarks
+ *
+ * Accessibility is a very platform-specific thing. On different platforms,
+ * there are different screen readers that might have wildly different output.
+ *
+ * Blink - Chrome's rendering engine - has a concept of "accessibility tree",
+ * which is then translated into different platform-specific APIs. Accessibility
+ * namespace gives users access to the Blink Accessibility Tree.
+ *
+ * Most of the accessibility tree gets filtered out when converting from Blink
+ * AX Tree to Platform-specific AX-Tree or by assistive technologies themselves.
+ * By default, Puppeteer tries to approximate this filtering, exposing only
+ * the "interesting" nodes of the tree.
+ *
+ * @public
+ */
+class Accessibility {
+    /**
+     * @internal
+     */
+    constructor(client) {
+        this._client = client;
+    }
+    /**
+     * Captures the current state of the accessibility tree.
+     * The returned object represents the root accessible node of the page.
+     *
+     * @remarks
+     *
+     * **NOTE** The Chromium accessibility tree contains nodes that go unused on
+     * most platforms and by most screen readers. Puppeteer will discard them as
+     * well for an easier to process tree, unless `interestingOnly` is set to
+     * `false`.
+     *
+     * @example
+     * An example of dumping the entire accessibility tree:
+     * ```js
+     * const snapshot = await page.accessibility.snapshot();
+     * console.log(snapshot);
+     * ```
+     *
+     * @example
+     * An example of logging the focused node's name:
+     * ```js
+     * const snapshot = await page.accessibility.snapshot();
+     * const node = findFocusedNode(snapshot);
+     * console.log(node && node.name);
+     *
+     * function findFocusedNode(node) {
+     *   if (node.focused)
+     *     return node;
+     *   for (const child of node.children || []) {
+     *     const foundNode = findFocusedNode(child);
+     *     return foundNode;
+     *   }
+     *   return null;
+     * }
+     * ```
+     *
+     * @returns An AXNode object representing the snapshot.
+     *
+     */
+    async snapshot(options = {}) {
+        const { interestingOnly = true, root = null } = options;
+        const { nodes } = await this._client.send('Accessibility.getFullAXTree');
+        let backendNodeId = null;
+        if (root) {
+            const { node } = await this._client.send('DOM.describeNode', {
+                objectId: root._remoteObject.objectId,
+            });
+            backendNodeId = node.backendNodeId;
+        }
+        const defaultRoot = AXNode.createTree(nodes);
+        let needle = defaultRoot;
+        if (backendNodeId) {
+            needle = defaultRoot.find((node) => node.payload.backendDOMNodeId === backendNodeId);
+            if (!needle)
+                return null;
+        }
+        if (!interestingOnly)
+            return this.serializeTree(needle)[0];
+        const interestingNodes = new Set();
+        this.collectInterestingNodes(interestingNodes, defaultRoot, false);
+        if (!interestingNodes.has(needle))
+            return null;
+        return this.serializeTree(needle, interestingNodes)[0];
+    }
+    serializeTree(node, interestingNodes) {
+        const children = [];
+        for (const child of node.children)
+            children.push(...this.serializeTree(child, interestingNodes));
+        if (interestingNodes && !interestingNodes.has(node))
+            return children;
+        const serializedNode = node.serialize();
+        if (children.length)
+            serializedNode.children = children;
+        return [serializedNode];
+    }
+    collectInterestingNodes(collection, node, insideControl) {
+        if (node.isInteresting(insideControl))
+            collection.add(node);
+        if (node.isLeafNode())
+            return;
+        insideControl = insideControl || node.isControl();
+        for (const child of node.children)
+            this.collectInterestingNodes(collection, child, insideControl);
+    }
+}
+exports.Accessibility = Accessibility;
+class AXNode {
+    constructor(payload) {
+        this.children = [];
+        this._richlyEditable = false;
+        this._editable = false;
+        this._focusable = false;
+        this._hidden = false;
+        this.payload = payload;
+        this._name = this.payload.name ? this.payload.name.value : '';
+        this._role = this.payload.role ? this.payload.role.value : 'Unknown';
+        this._ignored = this.payload.ignored;
+        for (const property of this.payload.properties || []) {
+            if (property.name === 'editable') {
+                this._richlyEditable = property.value.value === 'richtext';
+                this._editable = true;
+            }
+            if (property.name === 'focusable')
+                this._focusable = property.value.value;
+            if (property.name === 'hidden')
+                this._hidden = property.value.value;
+        }
+    }
+    _isPlainTextField() {
+        if (this._richlyEditable)
+            return false;
+        if (this._editable)
+            return true;
+        return this._role === 'textbox' || this._role === 'searchbox';
+    }
+    _isTextOnlyObject() {
+        const role = this._role;
+        return role === 'LineBreak' || role === 'text' || role === 'InlineTextBox';
+    }
+    _hasFocusableChild() {
+        if (this._cachedHasFocusableChild === undefined) {
+            this._cachedHasFocusableChild = false;
+            for (const child of this.children) {
+                if (child._focusable || child._hasFocusableChild()) {
+                    this._cachedHasFocusableChild = true;
+                    break;
+                }
+            }
+        }
+        return this._cachedHasFocusableChild;
+    }
+    find(predicate) {
+        if (predicate(this))
+            return this;
+        for (const child of this.children) {
+            const result = child.find(predicate);
+            if (result)
+                return result;
+        }
+        return null;
+    }
+    isLeafNode() {
+        if (!this.children.length)
+            return true;
+        // These types of objects may have children that we use as internal
+        // implementation details, but we want to expose them as leaves to platform
+        // accessibility APIs because screen readers might be confused if they find
+        // any children.
+        if (this._isPlainTextField() || this._isTextOnlyObject())
+            return true;
+        // Roles whose children are only presentational according to the ARIA and
+        // HTML5 Specs should be hidden from screen readers.
+        // (Note that whilst ARIA buttons can have only presentational children, HTML5
+        // buttons are allowed to have content.)
+        switch (this._role) {
+            case 'doc-cover':
+            case 'graphics-symbol':
+            case 'img':
+            case 'Meter':
+            case 'scrollbar':
+            case 'slider':
+            case 'separator':
+            case 'progressbar':
+                return true;
+            default:
+                break;
+        }
+        // Here and below: Android heuristics
+        if (this._hasFocusableChild())
+            return false;
+        if (this._focusable && this._name)
+            return true;
+        if (this._role === 'heading' && this._name)
+            return true;
+        return false;
+    }
+    isControl() {
+        switch (this._role) {
+            case 'button':
+            case 'checkbox':
+            case 'ColorWell':
+            case 'combobox':
+            case 'DisclosureTriangle':
+            case 'listbox':
+            case 'menu':
+            case 'menubar':
+            case 'menuitem':
+            case 'menuitemcheckbox':
+            case 'menuitemradio':
+            case 'radio':
+            case 'scrollbar':
+            case 'searchbox':
+            case 'slider':
+            case 'spinbutton':
+            case 'switch':
+            case 'tab':
+            case 'textbox':
+            case 'tree':
+            case 'treeitem':
+                return true;
+            default:
+                return false;
+        }
+    }
+    isInteresting(insideControl) {
+        const role = this._role;
+        if (role === 'Ignored' || this._hidden || this._ignored)
+            return false;
+        if (this._focusable || this._richlyEditable)
+            return true;
+        // If it's not focusable but has a control role, then it's interesting.
+        if (this.isControl())
+            return true;
+        // A non focusable child of a control is not interesting
+        if (insideControl)
+            return false;
+        return this.isLeafNode() && !!this._name;
+    }
+    serialize() {
+        const properties = new Map();
+        for (const property of this.payload.properties || [])
+            properties.set(property.name.toLowerCase(), property.value.value);
+        if (this.payload.name)
+            properties.set('name', this.payload.name.value);
+        if (this.payload.value)
+            properties.set('value', this.payload.value.value);
+        if (this.payload.description)
+            properties.set('description', this.payload.description.value);
+        const node = {
+            role: this._role,
+        };
+        const userStringProperties = [
+            'name',
+            'value',
+            'description',
+            'keyshortcuts',
+            'roledescription',
+            'valuetext',
+        ];
+        const getUserStringPropertyValue = (key) => properties.get(key);
+        for (const userStringProperty of userStringProperties) {
+            if (!properties.has(userStringProperty))
+                continue;
+            node[userStringProperty] = getUserStringPropertyValue(userStringProperty);
+        }
+        const booleanProperties = [
+            'disabled',
+            'expanded',
+            'focused',
+            'modal',
+            'multiline',
+            'multiselectable',
+            'readonly',
+            'required',
+            'selected',
+        ];
+        const getBooleanPropertyValue = (key) => properties.get(key);
+        for (const booleanProperty of booleanProperties) {
+            // WebArea's treat focus differently than other nodes. They report whether
+            // their frame  has focus, not whether focus is specifically on the root
+            // node.
+            if (booleanProperty === 'focused' && this._role === 'WebArea')
+                continue;
+            const value = getBooleanPropertyValue(booleanProperty);
+            if (!value)
+                continue;
+            node[booleanProperty] = getBooleanPropertyValue(booleanProperty);
+        }
+        const tristateProperties = ['checked', 'pressed'];
+        for (const tristateProperty of tristateProperties) {
+            if (!properties.has(tristateProperty))
+                continue;
+            const value = properties.get(tristateProperty);
+            node[tristateProperty] =
+                value === 'mixed' ? 'mixed' : value === 'true' ? true : false;
+        }
+        const numericalProperties = [
+            'level',
+            'valuemax',
+            'valuemin',
+        ];
+        const getNumericalPropertyValue = (key) => properties.get(key);
+        for (const numericalProperty of numericalProperties) {
+            if (!properties.has(numericalProperty))
+                continue;
+            node[numericalProperty] = getNumericalPropertyValue(numericalProperty);
+        }
+        const tokenProperties = [
+            'autocomplete',
+            'haspopup',
+            'invalid',
+            'orientation',
+        ];
+        const getTokenPropertyValue = (key) => properties.get(key);
+        for (const tokenProperty of tokenProperties) {
+            const value = getTokenPropertyValue(tokenProperty);
+            if (!value || value === 'false')
+                continue;
+            node[tokenProperty] = getTokenPropertyValue(tokenProperty);
+        }
+        return node;
+    }
+    static createTree(payloads) {
+        const nodeById = new Map();
+        for (const payload of payloads)
+            nodeById.set(payload.nodeId, new AXNode(payload));
+        for (const node of nodeById.values()) {
+            for (const childId of node.payload.childIds || [])
+                node.children.push(nodeById.get(childId));
+        }
+        return nodeById.values().next().value;
+    }
+}
+
+
+/***/ }),
 /* 751 */,
 /* 752 */,
 /* 753 */
@@ -30401,246 +32304,7 @@ exports.request = request;
 /* 755 */,
 /* 756 */,
 /* 757 */,
-/* 758 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.helper = exports.debugError = void 0;
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-const Errors_1 = __webpack_require__(24);
-const Debug_1 = __webpack_require__(145);
-const fs = __importStar(__webpack_require__(747));
-const util_1 = __webpack_require__(669);
-const assert_1 = __webpack_require__(327);
-const openAsync = util_1.promisify(fs.open);
-const writeAsync = util_1.promisify(fs.write);
-const closeAsync = util_1.promisify(fs.close);
-exports.debugError = Debug_1.debug('puppeteer:error');
-function getExceptionMessage(exceptionDetails) {
-    if (exceptionDetails.exception)
-        return (exceptionDetails.exception.description || exceptionDetails.exception.value);
-    let message = exceptionDetails.text;
-    if (exceptionDetails.stackTrace) {
-        for (const callframe of exceptionDetails.stackTrace.callFrames) {
-            const location = callframe.url +
-                ':' +
-                callframe.lineNumber +
-                ':' +
-                callframe.columnNumber;
-            const functionName = callframe.functionName || '<anonymous>';
-            message += `\n    at ${functionName} (${location})`;
-        }
-    }
-    return message;
-}
-function valueFromRemoteObject(remoteObject) {
-    assert_1.assert(!remoteObject.objectId, 'Cannot extract value when objectId is given');
-    if (remoteObject.unserializableValue) {
-        if (remoteObject.type === 'bigint' && typeof BigInt !== 'undefined')
-            return BigInt(remoteObject.unserializableValue.replace('n', ''));
-        switch (remoteObject.unserializableValue) {
-            case '-0':
-                return -0;
-            case 'NaN':
-                return NaN;
-            case 'Infinity':
-                return Infinity;
-            case '-Infinity':
-                return -Infinity;
-            default:
-                throw new Error('Unsupported unserializable value: ' +
-                    remoteObject.unserializableValue);
-        }
-    }
-    return remoteObject.value;
-}
-async function releaseObject(client, remoteObject) {
-    if (!remoteObject.objectId)
-        return;
-    await client
-        .send('Runtime.releaseObject', { objectId: remoteObject.objectId })
-        .catch((error) => {
-        // Exceptions might happen in case of a page been navigated or closed.
-        // Swallow these since they are harmless and we don't leak anything in this case.
-        exports.debugError(error);
-    });
-}
-function installAsyncStackHooks(classType) {
-    for (const methodName of Reflect.ownKeys(classType.prototype)) {
-        const method = Reflect.get(classType.prototype, methodName);
-        if (methodName === 'constructor' ||
-            typeof methodName !== 'string' ||
-            methodName.startsWith('_') ||
-            typeof method !== 'function' ||
-            method.constructor.name !== 'AsyncFunction')
-            continue;
-        Reflect.set(classType.prototype, methodName, function (...args) {
-            const syncStack = {
-                stack: '',
-            };
-            Error.captureStackTrace(syncStack);
-            return method.call(this, ...args).catch((error) => {
-                const stack = syncStack.stack.substring(syncStack.stack.indexOf('\n') + 1);
-                const clientStack = stack.substring(stack.indexOf('\n'));
-                if (error instanceof Error &&
-                    error.stack &&
-                    !error.stack.includes(clientStack))
-                    error.stack += '\n  -- ASYNC --\n' + stack;
-                throw error;
-            });
-        });
-    }
-}
-function addEventListener(emitter, eventName, handler) {
-    emitter.on(eventName, handler);
-    return { emitter, eventName, handler };
-}
-function removeEventListeners(listeners) {
-    for (const listener of listeners)
-        listener.emitter.removeListener(listener.eventName, listener.handler);
-    listeners.length = 0;
-}
-function isString(obj) {
-    return typeof obj === 'string' || obj instanceof String;
-}
-function isNumber(obj) {
-    return typeof obj === 'number' || obj instanceof Number;
-}
-async function waitForEvent(emitter, eventName, predicate, timeout, abortPromise) {
-    let eventTimeout, resolveCallback, rejectCallback;
-    const promise = new Promise((resolve, reject) => {
-        resolveCallback = resolve;
-        rejectCallback = reject;
-    });
-    const listener = addEventListener(emitter, eventName, (event) => {
-        if (!predicate(event))
-            return;
-        resolveCallback(event);
-    });
-    if (timeout) {
-        eventTimeout = setTimeout(() => {
-            rejectCallback(new Errors_1.TimeoutError('Timeout exceeded while waiting for event'));
-        }, timeout);
-    }
-    function cleanup() {
-        removeEventListeners([listener]);
-        clearTimeout(eventTimeout);
-    }
-    const result = await Promise.race([promise, abortPromise]).then((r) => {
-        cleanup();
-        return r;
-    }, (error) => {
-        cleanup();
-        throw error;
-    });
-    if (result instanceof Error)
-        throw result;
-    return result;
-}
-function evaluationString(fun, ...args) {
-    if (isString(fun)) {
-        assert_1.assert(args.length === 0, 'Cannot evaluate a string with arguments');
-        return fun;
-    }
-    function serializeArgument(arg) {
-        if (Object.is(arg, undefined))
-            return 'undefined';
-        return JSON.stringify(arg);
-    }
-    return `(${fun})(${args.map(serializeArgument).join(',')})`;
-}
-async function waitWithTimeout(promise, taskName, timeout) {
-    let reject;
-    const timeoutError = new Errors_1.TimeoutError(`waiting for ${taskName} failed: timeout ${timeout}ms exceeded`);
-    const timeoutPromise = new Promise((resolve, x) => (reject = x));
-    let timeoutTimer = null;
-    if (timeout)
-        timeoutTimer = setTimeout(() => reject(timeoutError), timeout);
-    try {
-        return await Promise.race([promise, timeoutPromise]);
-    }
-    finally {
-        if (timeoutTimer)
-            clearTimeout(timeoutTimer);
-    }
-}
-async function readProtocolStream(client, handle, path) {
-    let eof = false;
-    let file;
-    if (path)
-        file = await openAsync(path, 'w');
-    const bufs = [];
-    while (!eof) {
-        const response = await client.send('IO.read', { handle });
-        eof = response.eof;
-        const buf = Buffer.from(response.data, response.base64Encoded ? 'base64' : undefined);
-        bufs.push(buf);
-        if (path)
-            await writeAsync(file, buf);
-    }
-    if (path)
-        await closeAsync(file);
-    await client.send('IO.close', { handle });
-    let resultBuffer = null;
-    try {
-        resultBuffer = Buffer.concat(bufs);
-    }
-    finally {
-        return resultBuffer;
-    }
-}
-exports.helper = {
-    evaluationString,
-    readProtocolStream,
-    waitWithTimeout,
-    waitForEvent,
-    isString,
-    isNumber,
-    addEventListener,
-    removeEventListeners,
-    valueFromRemoteObject,
-    installAsyncStackHooks,
-    getExceptionMessage,
-    releaseObject,
-};
-
-
-/***/ }),
+/* 758 */,
 /* 759 */,
 /* 760 */,
 /* 761 */
@@ -30846,9 +32510,9 @@ var fd_slicer = __webpack_require__(324);
 var crc32 = __webpack_require__(538);
 var util = __webpack_require__(669);
 var EventEmitter = __webpack_require__(614).EventEmitter;
-var Transform = __webpack_require__(418).Transform;
-var PassThrough = __webpack_require__(418).PassThrough;
-var Writable = __webpack_require__(418).Writable;
+var Transform = __webpack_require__(413).Transform;
+var PassThrough = __webpack_require__(413).PassThrough;
+var Writable = __webpack_require__(413).Writable;
 
 exports.open = open;
 exports.fromFd = fromFd;
@@ -32093,67 +33757,58 @@ module.exports = {
 /* 811 */,
 /* 812 */,
 /* 813 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/***/ (function(__unusedmodule, exports) {
 
 "use strict";
 
-const pump = __webpack_require__(453);
-const bufferStream = __webpack_require__(158);
 
-class MaxBufferError extends Error {
-	constructor() {
-		super('maxBuffer exceeded');
-		this.name = 'MaxBufferError';
-	}
+Object.defineProperty(exports, '__esModule', { value: true });
+
+async function auth(token) {
+  const tokenType = token.split(/\./).length === 3 ? "app" : /^v\d+\./.test(token) ? "installation" : "oauth";
+  return {
+    type: "token",
+    token: token,
+    tokenType
+  };
 }
 
-async function getStream(inputStream, options) {
-	if (!inputStream) {
-		return Promise.reject(new Error('Expected a stream'));
-	}
+/**
+ * Prefix token for usage in the Authorization header
+ *
+ * @param token OAuth token or JSON Web Token
+ */
+function withAuthorizationPrefix(token) {
+  if (token.split(/\./).length === 3) {
+    return `bearer ${token}`;
+  }
 
-	options = {
-		maxBuffer: Infinity,
-		...options
-	};
-
-	const {maxBuffer} = options;
-
-	let stream;
-	await new Promise((resolve, reject) => {
-		const rejectPromise = error => {
-			if (error) { // A null check
-				error.bufferedData = stream.getBufferedValue();
-			}
-
-			reject(error);
-		};
-
-		stream = pump(inputStream, bufferStream(options), error => {
-			if (error) {
-				rejectPromise(error);
-				return;
-			}
-
-			resolve();
-		});
-
-		stream.on('data', () => {
-			if (stream.getBufferedLength() > maxBuffer) {
-				rejectPromise(new MaxBufferError());
-			}
-		});
-	});
-
-	return stream.getBufferedValue();
+  return `token ${token}`;
 }
 
-module.exports = getStream;
-// TODO: Remove this for the next major release
-module.exports.default = getStream;
-module.exports.buffer = (stream, options) => getStream(stream, {...options, encoding: 'buffer'});
-module.exports.array = (stream, options) => getStream(stream, {...options, array: true});
-module.exports.MaxBufferError = MaxBufferError;
+async function hook(token, request, route, parameters) {
+  const endpoint = request.endpoint.merge(route, parameters);
+  endpoint.headers.authorization = withAuthorizationPrefix(token);
+  return request(endpoint);
+}
+
+const createTokenAuth = function createTokenAuth(token) {
+  if (!token) {
+    throw new Error("[@octokit/auth-token] No token passed to createTokenAuth");
+  }
+
+  if (typeof token !== "string") {
+    throw new Error("[@octokit/auth-token] Token passed to createTokenAuth is not a string");
+  }
+
+  token = token.replace(/^(token|bearer) +/i, "");
+  return Object.assign(auth.bind(null, token), {
+    hook: hook.bind(null, token)
+  });
+};
+
+exports.createTokenAuth = createTokenAuth;
+//# sourceMappingURL=index.js.map
 
 
 /***/ }),
@@ -32308,7 +33963,60 @@ module.exports = /^#!.*/;
 
 
 /***/ }),
-/* 817 */,
+/* 817 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+/**
+ * Copyright 2019 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.TimeoutSettings = void 0;
+const DEFAULT_TIMEOUT = 30000;
+/**
+ * @internal
+ */
+class TimeoutSettings {
+    constructor() {
+        this._defaultTimeout = null;
+        this._defaultNavigationTimeout = null;
+    }
+    setDefaultTimeout(timeout) {
+        this._defaultTimeout = timeout;
+    }
+    setDefaultNavigationTimeout(timeout) {
+        this._defaultNavigationTimeout = timeout;
+    }
+    navigationTimeout() {
+        if (this._defaultNavigationTimeout !== null)
+            return this._defaultNavigationTimeout;
+        if (this._defaultTimeout !== null)
+            return this._defaultTimeout;
+        return DEFAULT_TIMEOUT;
+    }
+    timeout() {
+        if (this._defaultTimeout !== null)
+            return this._defaultTimeout;
+        return DEFAULT_TIMEOUT;
+    }
+}
+exports.TimeoutSettings = TimeoutSettings;
+
+
+/***/ }),
 /* 818 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -32357,23 +34065,15 @@ function sync (path, options) {
 
 
 /***/ }),
-/* 819 */,
-/* 820 */,
-/* 821 */,
-/* 822 */,
-/* 823 */,
-/* 824 */,
-/* 825 */,
-/* 826 */,
-/* 827 */,
-/* 828 */,
-/* 829 */
+/* 819 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.PipeTransport = void 0;
 /**
- * Copyright 2020 Google Inc. All rights reserved.
+ * Copyright 2018 Google Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32387,63 +34087,65 @@ function sync (path, options) {
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.FileChooser = void 0;
-const assert_1 = __webpack_require__(327);
-/**
- * File choosers let you react to the page requesting for a file.
- * @remarks
- * `FileChooser` objects are returned via the `page.waitForFileChooser` method.
- * @example
- * An example of using `FileChooser`:
- * ```js
- * const [fileChooser] = await Promise.all([
- *   page.waitForFileChooser(),
- *   page.click('#upload-file-button'), // some button that triggers file selection
- * ]);
- * await fileChooser.accept(['/tmp/myfile.pdf']);
- * ```
- * **NOTE** In browsers, only one file chooser can be opened at a time.
- * All file choosers must be accepted or canceled. Not doing so will prevent
- * subsequent file choosers from appearing.
- */
-class FileChooser {
-    /**
-     * @internal
-     */
-    constructor(element, event) {
-        this._handled = false;
-        this._element = element;
-        this._multiple = event.mode !== 'selectSingle';
+const helper_js_1 = __webpack_require__(405);
+class PipeTransport {
+    constructor(pipeWrite, pipeRead) {
+        this._pipeWrite = pipeWrite;
+        this._pendingMessage = '';
+        this._eventListeners = [
+            helper_js_1.helper.addEventListener(pipeRead, 'data', (buffer) => this._dispatch(buffer)),
+            helper_js_1.helper.addEventListener(pipeRead, 'close', () => {
+                if (this.onclose)
+                    this.onclose.call(null);
+            }),
+            helper_js_1.helper.addEventListener(pipeRead, 'error', helper_js_1.debugError),
+            helper_js_1.helper.addEventListener(pipeWrite, 'error', helper_js_1.debugError),
+        ];
+        this.onmessage = null;
+        this.onclose = null;
     }
-    /**
-     * Whether file chooser allow for {@link https://developer.mozilla.org/en-US/docs/Web/HTML/Element/input/file#attr-multiple | multiple} file selection.
-     */
-    isMultiple() {
-        return this._multiple;
+    send(message) {
+        this._pipeWrite.write(message);
+        this._pipeWrite.write('\0');
     }
-    /**
-     * Accept the file chooser request with given paths.
-     * @param filePaths - If some of the  `filePaths` are relative paths,
-     * then they are resolved relative to the {@link https://nodejs.org/api/process.html#process_process_cwd | current working directory}.
-     */
-    async accept(filePaths) {
-        assert_1.assert(!this._handled, 'Cannot accept FileChooser which is already handled!');
-        this._handled = true;
-        await this._element.uploadFile(...filePaths);
+    _dispatch(buffer) {
+        let end = buffer.indexOf('\0');
+        if (end === -1) {
+            this._pendingMessage += buffer.toString();
+            return;
+        }
+        const message = this._pendingMessage + buffer.toString(undefined, 0, end);
+        if (this.onmessage)
+            this.onmessage.call(null, message);
+        let start = end + 1;
+        end = buffer.indexOf('\0', start);
+        while (end !== -1) {
+            if (this.onmessage)
+                this.onmessage.call(null, buffer.toString(undefined, start, end));
+            start = end + 1;
+            end = buffer.indexOf('\0', start);
+        }
+        this._pendingMessage = buffer.toString(undefined, start);
     }
-    /**
-     * Closes the file chooser without selecting any files.
-     */
-    async cancel() {
-        assert_1.assert(!this._handled, 'Cannot cancel FileChooser which is already handled!');
-        this._handled = true;
+    close() {
+        this._pipeWrite = null;
+        helper_js_1.helper.removeEventListeners(this._eventListeners);
     }
 }
-exports.FileChooser = FileChooser;
+exports.PipeTransport = PipeTransport;
 
 
 /***/ }),
+/* 820 */,
+/* 821 */,
+/* 822 */,
+/* 823 */,
+/* 824 */,
+/* 825 */,
+/* 826 */,
+/* 827 */,
+/* 828 */,
+/* 829 */,
 /* 830 */,
 /* 831 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
@@ -32600,406 +34302,110 @@ module.exports = require("url");
 
 /***/ }),
 /* 836 */,
-/* 837 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/* 837 */,
+/* 838 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
-
-const { randomFillSync } = __webpack_require__(417);
-
-const PerMessageDeflate = __webpack_require__(301);
-const { EMPTY_BUFFER } = __webpack_require__(799);
-const { isValidStatusCode } = __webpack_require__(562);
-const { mask: applyMask, toBuffer } = __webpack_require__(349);
-
-const mask = Buffer.alloc(4);
-
 /**
- * HyBi Sender implementation.
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
-class Sender {
-  /**
-   * Creates a Sender instance.
-   *
-   * @param {net.Socket} socket The connection socket
-   * @param {Object} extensions An object containing the negotiated extensions
-   */
-  constructor(socket, extensions) {
-    this._extensions = extensions || {};
-    this._socket = socket;
-
-    this._firstFragment = true;
-    this._compress = false;
-
-    this._bufferedBytes = 0;
-    this._deflating = false;
-    this._queue = [];
-  }
-
-  /**
-   * Frames a piece of data according to the HyBi WebSocket protocol.
-   *
-   * @param {Buffer} data The data to frame
-   * @param {Object} options Options object
-   * @param {Number} options.opcode The opcode
-   * @param {Boolean} options.readOnly Specifies whether `data` can be modified
-   * @param {Boolean} options.fin Specifies whether or not to set the FIN bit
-   * @param {Boolean} options.mask Specifies whether or not to mask `data`
-   * @param {Boolean} options.rsv1 Specifies whether or not to set the RSV1 bit
-   * @return {Buffer[]} The framed data as a list of `Buffer` instances
-   * @public
-   */
-  static frame(data, options) {
-    const merge = options.mask && options.readOnly;
-    let offset = options.mask ? 6 : 2;
-    let payloadLength = data.length;
-
-    if (data.length >= 65536) {
-      offset += 8;
-      payloadLength = 127;
-    } else if (data.length > 125) {
-      offset += 2;
-      payloadLength = 126;
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.Dialog = void 0;
+const assert_js_1 = __webpack_require__(716);
+/**
+ * Dialog instances are dispatched by the {@link Page} via the `dialog` event.
+ *
+ * @remarks
+ *
+ * @example
+ * ```js
+ * const puppeteer = require('puppeteer');
+ *
+ * (async () => {
+ *   const browser = await puppeteer.launch();
+ *   const page = await browser.newPage();
+ *   page.on('dialog', async dialog => {
+ *     console.log(dialog.message());
+ *     await dialog.dismiss();
+ *     await browser.close();
+ *   });
+ *   page.evaluate(() => alert('1'));
+ * })();
+ * ```
+ */
+class Dialog {
+    /**
+     * @internal
+     */
+    constructor(client, type, message, defaultValue = '') {
+        this._handled = false;
+        this._client = client;
+        this._type = type;
+        this._message = message;
+        this._defaultValue = defaultValue;
     }
-
-    const target = Buffer.allocUnsafe(merge ? data.length + offset : offset);
-
-    target[0] = options.fin ? options.opcode | 0x80 : options.opcode;
-    if (options.rsv1) target[0] |= 0x40;
-
-    target[1] = payloadLength;
-
-    if (payloadLength === 126) {
-      target.writeUInt16BE(data.length, 2);
-    } else if (payloadLength === 127) {
-      target.writeUInt32BE(0, 2);
-      target.writeUInt32BE(data.length, 6);
+    /**
+     * @returns The type of the dialog.
+     */
+    type() {
+        return this._type;
     }
-
-    if (!options.mask) return [target, data];
-
-    randomFillSync(mask, 0, 4);
-
-    target[1] |= 0x80;
-    target[offset - 4] = mask[0];
-    target[offset - 3] = mask[1];
-    target[offset - 2] = mask[2];
-    target[offset - 1] = mask[3];
-
-    if (merge) {
-      applyMask(data, mask, target, offset, data.length);
-      return [target];
+    /**
+     * @returns The message displayed in the dialog.
+     */
+    message() {
+        return this._message;
     }
-
-    applyMask(data, mask, data, 0, data.length);
-    return [target, data];
-  }
-
-  /**
-   * Sends a close message to the other peer.
-   *
-   * @param {(Number|undefined)} code The status code component of the body
-   * @param {String} data The message component of the body
-   * @param {Boolean} mask Specifies whether or not to mask the message
-   * @param {Function} cb Callback
-   * @public
-   */
-  close(code, data, mask, cb) {
-    let buf;
-
-    if (code === undefined) {
-      buf = EMPTY_BUFFER;
-    } else if (typeof code !== 'number' || !isValidStatusCode(code)) {
-      throw new TypeError('First argument must be a valid error code number');
-    } else if (data === undefined || data === '') {
-      buf = Buffer.allocUnsafe(2);
-      buf.writeUInt16BE(code, 0);
-    } else {
-      const length = Buffer.byteLength(data);
-
-      if (length > 123) {
-        throw new RangeError('The message must not be greater than 123 bytes');
-      }
-
-      buf = Buffer.allocUnsafe(2 + length);
-      buf.writeUInt16BE(code, 0);
-      buf.write(data, 2);
+    /**
+     * @returns The default value of the prompt, or an empty string if the dialog
+     * is not a `prompt`.
+     */
+    defaultValue() {
+        return this._defaultValue;
     }
-
-    if (this._deflating) {
-      this.enqueue([this.doClose, buf, mask, cb]);
-    } else {
-      this.doClose(buf, mask, cb);
+    /**
+     * @param promptText - optional text that will be entered in the dialog
+     * prompt. Has no effect if the dialog's type is not `prompt`.
+     *
+     * @returns A promise that resolves when the dialog has been accepted.
+     */
+    async accept(promptText) {
+        assert_js_1.assert(!this._handled, 'Cannot accept dialog which is already handled!');
+        this._handled = true;
+        await this._client.send('Page.handleJavaScriptDialog', {
+            accept: true,
+            promptText: promptText,
+        });
     }
-  }
-
-  /**
-   * Frames and sends a close message.
-   *
-   * @param {Buffer} data The message to send
-   * @param {Boolean} mask Specifies whether or not to mask `data`
-   * @param {Function} cb Callback
-   * @private
-   */
-  doClose(data, mask, cb) {
-    this.sendFrame(
-      Sender.frame(data, {
-        fin: true,
-        rsv1: false,
-        opcode: 0x08,
-        mask,
-        readOnly: false
-      }),
-      cb
-    );
-  }
-
-  /**
-   * Sends a ping message to the other peer.
-   *
-   * @param {*} data The message to send
-   * @param {Boolean} mask Specifies whether or not to mask `data`
-   * @param {Function} cb Callback
-   * @public
-   */
-  ping(data, mask, cb) {
-    const buf = toBuffer(data);
-
-    if (buf.length > 125) {
-      throw new RangeError('The data size must not be greater than 125 bytes');
+    /**
+     * @returns A promise which will resolve once the dialog has been dismissed
+     */
+    async dismiss() {
+        assert_js_1.assert(!this._handled, 'Cannot dismiss dialog which is already handled!');
+        this._handled = true;
+        await this._client.send('Page.handleJavaScriptDialog', {
+            accept: false,
+        });
     }
-
-    if (this._deflating) {
-      this.enqueue([this.doPing, buf, mask, toBuffer.readOnly, cb]);
-    } else {
-      this.doPing(buf, mask, toBuffer.readOnly, cb);
-    }
-  }
-
-  /**
-   * Frames and sends a ping message.
-   *
-   * @param {Buffer} data The message to send
-   * @param {Boolean} mask Specifies whether or not to mask `data`
-   * @param {Boolean} readOnly Specifies whether `data` can be modified
-   * @param {Function} cb Callback
-   * @private
-   */
-  doPing(data, mask, readOnly, cb) {
-    this.sendFrame(
-      Sender.frame(data, {
-        fin: true,
-        rsv1: false,
-        opcode: 0x09,
-        mask,
-        readOnly
-      }),
-      cb
-    );
-  }
-
-  /**
-   * Sends a pong message to the other peer.
-   *
-   * @param {*} data The message to send
-   * @param {Boolean} mask Specifies whether or not to mask `data`
-   * @param {Function} cb Callback
-   * @public
-   */
-  pong(data, mask, cb) {
-    const buf = toBuffer(data);
-
-    if (buf.length > 125) {
-      throw new RangeError('The data size must not be greater than 125 bytes');
-    }
-
-    if (this._deflating) {
-      this.enqueue([this.doPong, buf, mask, toBuffer.readOnly, cb]);
-    } else {
-      this.doPong(buf, mask, toBuffer.readOnly, cb);
-    }
-  }
-
-  /**
-   * Frames and sends a pong message.
-   *
-   * @param {Buffer} data The message to send
-   * @param {Boolean} mask Specifies whether or not to mask `data`
-   * @param {Boolean} readOnly Specifies whether `data` can be modified
-   * @param {Function} cb Callback
-   * @private
-   */
-  doPong(data, mask, readOnly, cb) {
-    this.sendFrame(
-      Sender.frame(data, {
-        fin: true,
-        rsv1: false,
-        opcode: 0x0a,
-        mask,
-        readOnly
-      }),
-      cb
-    );
-  }
-
-  /**
-   * Sends a data message to the other peer.
-   *
-   * @param {*} data The message to send
-   * @param {Object} options Options object
-   * @param {Boolean} options.compress Specifies whether or not to compress `data`
-   * @param {Boolean} options.binary Specifies whether `data` is binary or text
-   * @param {Boolean} options.fin Specifies whether the fragment is the last one
-   * @param {Boolean} options.mask Specifies whether or not to mask `data`
-   * @param {Function} cb Callback
-   * @public
-   */
-  send(data, options, cb) {
-    const buf = toBuffer(data);
-    const perMessageDeflate = this._extensions[PerMessageDeflate.extensionName];
-    let opcode = options.binary ? 2 : 1;
-    let rsv1 = options.compress;
-
-    if (this._firstFragment) {
-      this._firstFragment = false;
-      if (rsv1 && perMessageDeflate) {
-        rsv1 = buf.length >= perMessageDeflate._threshold;
-      }
-      this._compress = rsv1;
-    } else {
-      rsv1 = false;
-      opcode = 0;
-    }
-
-    if (options.fin) this._firstFragment = true;
-
-    if (perMessageDeflate) {
-      const opts = {
-        fin: options.fin,
-        rsv1,
-        opcode,
-        mask: options.mask,
-        readOnly: toBuffer.readOnly
-      };
-
-      if (this._deflating) {
-        this.enqueue([this.dispatch, buf, this._compress, opts, cb]);
-      } else {
-        this.dispatch(buf, this._compress, opts, cb);
-      }
-    } else {
-      this.sendFrame(
-        Sender.frame(buf, {
-          fin: options.fin,
-          rsv1: false,
-          opcode,
-          mask: options.mask,
-          readOnly: toBuffer.readOnly
-        }),
-        cb
-      );
-    }
-  }
-
-  /**
-   * Dispatches a data message.
-   *
-   * @param {Buffer} data The message to send
-   * @param {Boolean} compress Specifies whether or not to compress `data`
-   * @param {Object} options Options object
-   * @param {Number} options.opcode The opcode
-   * @param {Boolean} options.readOnly Specifies whether `data` can be modified
-   * @param {Boolean} options.fin Specifies whether or not to set the FIN bit
-   * @param {Boolean} options.mask Specifies whether or not to mask `data`
-   * @param {Boolean} options.rsv1 Specifies whether or not to set the RSV1 bit
-   * @param {Function} cb Callback
-   * @private
-   */
-  dispatch(data, compress, options, cb) {
-    if (!compress) {
-      this.sendFrame(Sender.frame(data, options), cb);
-      return;
-    }
-
-    const perMessageDeflate = this._extensions[PerMessageDeflate.extensionName];
-
-    this._bufferedBytes += data.length;
-    this._deflating = true;
-    perMessageDeflate.compress(data, options.fin, (_, buf) => {
-      if (this._socket.destroyed) {
-        const err = new Error(
-          'The socket was closed while data was being compressed'
-        );
-
-        if (typeof cb === 'function') cb(err);
-
-        for (let i = 0; i < this._queue.length; i++) {
-          const callback = this._queue[i][4];
-
-          if (typeof callback === 'function') callback(err);
-        }
-
-        return;
-      }
-
-      this._bufferedBytes -= data.length;
-      this._deflating = false;
-      options.readOnly = false;
-      this.sendFrame(Sender.frame(buf, options), cb);
-      this.dequeue();
-    });
-  }
-
-  /**
-   * Executes queued send operations.
-   *
-   * @private
-   */
-  dequeue() {
-    while (!this._deflating && this._queue.length) {
-      const params = this._queue.shift();
-
-      this._bufferedBytes -= params[1].length;
-      Reflect.apply(params[0], this, params.slice(1));
-    }
-  }
-
-  /**
-   * Enqueues a send operation.
-   *
-   * @param {Array} params Send operation parameters.
-   * @private
-   */
-  enqueue(params) {
-    this._bufferedBytes += params[1].length;
-    this._queue.push(params);
-  }
-
-  /**
-   * Sends a frame.
-   *
-   * @param {Buffer[]} list The frame to send
-   * @param {Function} cb Callback
-   * @private
-   */
-  sendFrame(list, cb) {
-    if (list.length === 2) {
-      this._socket.cork();
-      this._socket.write(list[0]);
-      this._socket.write(list[1], cb);
-      this._socket.uncork();
-    } else {
-      this._socket.write(list[0], cb);
-    }
-  }
 }
-
-module.exports = Sender;
+exports.Dialog = Dialog;
 
 
 /***/ }),
-/* 838 */,
 /* 839 */,
 /* 840 */,
 /* 841 */,
@@ -34301,7 +35707,65 @@ function unbzip2Stream() {
 /* 851 */,
 /* 852 */,
 /* 853 */,
-/* 854 */,
+/* 854 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+"use strict";
+
+const os = __webpack_require__(87);
+const execa = __webpack_require__(955);
+
+// Reference: https://www.gaijin.at/en/lstwinver.php
+const names = new Map([
+	['10.0', '10'],
+	['6.3', '8.1'],
+	['6.2', '8'],
+	['6.1', '7'],
+	['6.0', 'Vista'],
+	['5.2', 'Server 2003'],
+	['5.1', 'XP'],
+	['5.0', '2000'],
+	['4.9', 'ME'],
+	['4.1', '98'],
+	['4.0', '95']
+]);
+
+const windowsRelease = release => {
+	const version = /\d+\.\d/.exec(release || os.release());
+
+	if (release && !version) {
+		throw new Error('`release` argument doesn\'t match `n.n`');
+	}
+
+	const ver = (version || [])[0];
+
+	// Server 2008, 2012, 2016, and 2019 versions are ambiguous with desktop versions and must be detected at runtime.
+	// If `release` is omitted or we're on a Windows system, and the version number is an ambiguous version
+	// then use `wmic` to get the OS caption: https://msdn.microsoft.com/en-us/library/aa394531(v=vs.85).aspx
+	// If `wmic` is obsoloete (later versions of Windows 10), use PowerShell instead.
+	// If the resulting caption contains the year 2008, 2012, 2016 or 2019, it is a server version, so return a server OS name.
+	if ((!release || release === os.release()) && ['6.1', '6.2', '6.3', '10.0'].includes(ver)) {
+		let stdout;
+		try {
+			stdout = execa.sync('wmic', ['os', 'get', 'Caption']).stdout || '';
+		} catch (_) {
+			stdout = execa.sync('powershell', ['(Get-CimInstance -ClassName Win32_OperatingSystem).caption']).stdout || '';
+		}
+
+		const year = (stdout.match(/2008|2012|2016|2019/) || [])[0];
+
+		if (year) {
+			return `Server ${year}`;
+		}
+	}
+
+	return names.get(ver);
+};
+
+module.exports = windowsRelease;
+
+
+/***/ }),
 /* 855 */,
 /* 856 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
@@ -34600,117 +36064,11 @@ module.exports = require("tty");
 /* 869 */,
 /* 870 */,
 /* 871 */,
-/* 872 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-/**
- * Copyright 2019 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Events = void 0;
-exports.Events = {
-    Page: {
-        Close: 'close',
-        Console: 'console',
-        Dialog: 'dialog',
-        DOMContentLoaded: 'domcontentloaded',
-        Error: 'error',
-        // Can't use just 'error' due to node.js special treatment of error events.
-        // @see https://nodejs.org/api/events.html#events_error_events
-        PageError: 'pageerror',
-        Request: 'request',
-        Response: 'response',
-        RequestFailed: 'requestfailed',
-        RequestFinished: 'requestfinished',
-        FrameAttached: 'frameattached',
-        FrameDetached: 'framedetached',
-        FrameNavigated: 'framenavigated',
-        Load: 'load',
-        Metrics: 'metrics',
-        Popup: 'popup',
-        WorkerCreated: 'workercreated',
-        WorkerDestroyed: 'workerdestroyed',
-    },
-    Browser: {
-        TargetCreated: 'targetcreated',
-        TargetDestroyed: 'targetdestroyed',
-        TargetChanged: 'targetchanged',
-        Disconnected: 'disconnected',
-    },
-    BrowserContext: {
-        TargetCreated: 'targetcreated',
-        TargetDestroyed: 'targetdestroyed',
-        TargetChanged: 'targetchanged',
-    },
-    NetworkManager: {
-        Request: Symbol('Events.NetworkManager.Request'),
-        Response: Symbol('Events.NetworkManager.Response'),
-        RequestFailed: Symbol('Events.NetworkManager.RequestFailed'),
-        RequestFinished: Symbol('Events.NetworkManager.RequestFinished'),
-    },
-    FrameManager: {
-        FrameAttached: Symbol('Events.FrameManager.FrameAttached'),
-        FrameNavigated: Symbol('Events.FrameManager.FrameNavigated'),
-        FrameDetached: Symbol('Events.FrameManager.FrameDetached'),
-        LifecycleEvent: Symbol('Events.FrameManager.LifecycleEvent'),
-        FrameNavigatedWithinDocument: Symbol('Events.FrameManager.FrameNavigatedWithinDocument'),
-        ExecutionContextCreated: Symbol('Events.FrameManager.ExecutionContextCreated'),
-        ExecutionContextDestroyed: Symbol('Events.FrameManager.ExecutionContextDestroyed'),
-    },
-    Connection: {
-        Disconnected: Symbol('Events.Connection.Disconnected'),
-    },
-    CDPSession: {
-        Disconnected: Symbol('Events.CDPSession.Disconnected'),
-    },
-};
-
-
-/***/ }),
+/* 872 */,
 /* 873 */,
 /* 874 */,
 /* 875 */,
-/* 876 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
-
-"use strict";
-
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-const initialize_1 = __webpack_require__(187);
-const puppeteer = initialize_1.initializePuppeteer('puppeteer-core');
-exports.default = puppeteer;
-
-
-/***/ }),
+/* 876 */,
 /* 877 */,
 /* 878 */,
 /* 879 */,
@@ -34835,62 +36193,7 @@ PassThrough.prototype._transform = function (chunk, encoding, cb) {
 /* 889 */,
 /* 890 */,
 /* 891 */,
-/* 892 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-/**
- * Copyright 2019 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-// @ts-nocheck
-/* This file is used in two places:
- * 1) the coverage-utils use it to gain a list of all methods we check for test
- *    coverage on
- * 2) index.js uses it to iterate through all methods and call
- *    helper.installAsyncStackHooks on
- */
-module.exports = {
-    Accessibility: __webpack_require__(662).Accessibility,
-    Browser: __webpack_require__(26).Browser,
-    BrowserContext: __webpack_require__(26).BrowserContext,
-    BrowserFetcher: __webpack_require__(529).BrowserFetcher,
-    CDPSession: __webpack_require__(433).CDPSession,
-    ConsoleMessage: __webpack_require__(976).ConsoleMessage,
-    Coverage: __webpack_require__(376).Coverage,
-    Dialog: __webpack_require__(476).Dialog,
-    ElementHandle: __webpack_require__(661).ElementHandle,
-    ExecutionContext: __webpack_require__(317).ExecutionContext,
-    EventEmitter: __webpack_require__(304).EventEmitter,
-    FileChooser: __webpack_require__(829).FileChooser,
-    Frame: __webpack_require__(32).Frame,
-    JSHandle: __webpack_require__(661).JSHandle,
-    Keyboard: __webpack_require__(966).Keyboard,
-    Mouse: __webpack_require__(966).Mouse,
-    Page: __webpack_require__(398).Page,
-    Puppeteer: __webpack_require__(718).Puppeteer,
-    HTTPRequest: __webpack_require__(401).HTTPRequest,
-    HTTPResponse: __webpack_require__(413).HTTPResponse,
-    SecurityDetails: __webpack_require__(910).SecurityDetails,
-    Target: __webpack_require__(679).Target,
-    TimeoutError: __webpack_require__(24).TimeoutError,
-    Touchscreen: __webpack_require__(966).Touchscreen,
-    Tracing: __webpack_require__(329).Tracing,
-    WebWorker: __webpack_require__(10).WebWorker,
-};
-
-
-/***/ }),
+/* 892 */,
 /* 893 */,
 /* 894 */,
 /* 895 */,
@@ -35022,89 +36325,7 @@ module.exports = require("zlib");
 /* 907 */,
 /* 908 */,
 /* 909 */,
-/* 910 */
-/***/ (function(__unusedmodule, exports) {
-
-"use strict";
-
-/**
- * Copyright 2020 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.SecurityDetails = void 0;
-/**
- * The SecurityDetails class represents the security details of a
- * response that was received over a secure connection.
- *
- * @public
- */
-class SecurityDetails {
-    /**
-     * @internal
-     */
-    constructor(securityPayload) {
-        this._subjectName = securityPayload.subjectName;
-        this._issuer = securityPayload.issuer;
-        this._validFrom = securityPayload.validFrom;
-        this._validTo = securityPayload.validTo;
-        this._protocol = securityPayload.protocol;
-        this._sanList = securityPayload.sanList;
-    }
-    /**
-     * @returns The name of the issuer of the certificate.
-     */
-    issuer() {
-        return this._issuer;
-    }
-    /**
-     * @returns {@link https://en.wikipedia.org/wiki/Unix_time | Unix timestamp}
-     * marking the start of the certificate's validity.
-     */
-    validFrom() {
-        return this._validFrom;
-    }
-    /**
-     * @returns {@link https://en.wikipedia.org/wiki/Unix_time | Unix timestamp}
-     * marking the end of the certificate's validity.
-     */
-    validTo() {
-        return this._validTo;
-    }
-    /**
-     * @returns The security protocol being used, e.g. "TLS 1.2".
-     */
-    protocol() {
-        return this._protocol;
-    }
-    /**
-     * @returns The name of the subject to which the certificate was issued.
-     */
-    subjectName() {
-        return this._subjectName;
-    }
-    /**
-     * @returns The list of {@link https://en.wikipedia.org/wiki/Subject_Alternative_Name | subject alternative names (SANs)} of the certificate.
-     */
-    subjectAlternativeNames() {
-        return this._sanList;
-    }
-}
-exports.SecurityDetails = SecurityDetails;
-
-
-/***/ }),
+/* 910 */,
 /* 911 */,
 /* 912 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
@@ -35559,10 +36780,8 @@ function done(stream, er, data) {
 /* 930 */,
 /* 931 */,
 /* 932 */,
-/* 933 */,
-/* 934 */,
-/* 935 */
-/***/ (function(__unusedmodule, exports) {
+/* 933 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
@@ -35582,39 +36801,740 @@ function done(stream, er, data) {
  * limitations under the License.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.TimeoutSettings = void 0;
-const DEFAULT_TIMEOUT = 30000;
-class TimeoutSettings {
-    constructor() {
-        this._defaultTimeout = null;
-        this._defaultNavigationTimeout = null;
+exports.ElementHandle = exports.JSHandle = exports.createJSHandle = void 0;
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const QueryHandler_js_1 = __webpack_require__(647);
+/**
+ * @internal
+ */
+function createJSHandle(context, remoteObject) {
+    const frame = context.frame();
+    if (remoteObject.subtype === 'node' && frame) {
+        const frameManager = frame._frameManager;
+        return new ElementHandle(context, context._client, remoteObject, frameManager.page(), frameManager);
     }
-    setDefaultTimeout(timeout) {
-        this._defaultTimeout = timeout;
+    return new JSHandle(context, context._client, remoteObject);
+}
+exports.createJSHandle = createJSHandle;
+/**
+ * Represents an in-page JavaScript object. JSHandles can be created with the
+ * {@link Page.evaluateHandle | page.evaluateHandle} method.
+ *
+ * @example
+ * ```js
+ * const windowHandle = await page.evaluateHandle(() => window);
+ * ```
+ *
+ * JSHandle prevents the referenced JavaScript object from being garbage-collected
+ * unless the handle is {@link JSHandle.dispose | disposed}. JSHandles are auto-
+ * disposed when their origin frame gets navigated or the parent context gets destroyed.
+ *
+ * JSHandle instances can be used as arguments for {@link Page.$eval},
+ * {@link Page.evaluate}, and {@link Page.evaluateHandle}.
+ *
+ * @public
+ */
+class JSHandle {
+    /**
+     * @internal
+     */
+    constructor(context, client, remoteObject) {
+        /**
+         * @internal
+         */
+        this._disposed = false;
+        this._context = context;
+        this._client = client;
+        this._remoteObject = remoteObject;
+    }
+    /** Returns the execution context the handle belongs to.
+     */
+    executionContext() {
+        return this._context;
     }
     /**
-     * @param {number} timeout
+     * This method passes this handle as the first argument to `pageFunction`.
+     * If `pageFunction` returns a Promise, then `handle.evaluate` would wait
+     * for the promise to resolve and return its value.
+     *
+     * @example
+     * ```js
+     * const tweetHandle = await page.$('.tweet .retweets');
+     * expect(await tweetHandle.evaluate(node => node.innerText)).toBe('10');
+     * ```
      */
-    setDefaultNavigationTimeout(timeout) {
-        this._defaultNavigationTimeout = timeout;
+    async evaluate(pageFunction, ...args) {
+        return await this.executionContext().evaluate(pageFunction, this, ...args);
     }
-    navigationTimeout() {
-        if (this._defaultNavigationTimeout !== null)
-            return this._defaultNavigationTimeout;
-        if (this._defaultTimeout !== null)
-            return this._defaultTimeout;
-        return DEFAULT_TIMEOUT;
+    /**
+     * This method passes this handle as the first argument to `pageFunction`.
+     *
+     * @remarks
+     *
+     * The only difference between `jsHandle.evaluate` and
+     * `jsHandle.evaluateHandle` is that `jsHandle.evaluateHandle`
+     * returns an in-page object (JSHandle).
+     *
+     * If the function passed to `jsHandle.evaluateHandle` returns a Promise,
+     * then `evaluateHandle.evaluateHandle` waits for the promise to resolve and
+     * returns its value.
+     *
+     * See {@link Page.evaluateHandle} for more details.
+     */
+    async evaluateHandle(pageFunction, ...args) {
+        return await this.executionContext().evaluateHandle(pageFunction, this, ...args);
     }
-    timeout() {
-        if (this._defaultTimeout !== null)
-            return this._defaultTimeout;
-        return DEFAULT_TIMEOUT;
+    /** Fetches a single property from the referenced object.
+     */
+    async getProperty(propertyName) {
+        const objectHandle = await this.evaluateHandle((object, propertyName) => {
+            const result = { __proto__: null };
+            result[propertyName] = object[propertyName];
+            return result;
+        }, propertyName);
+        const properties = await objectHandle.getProperties();
+        const result = properties.get(propertyName) || null;
+        await objectHandle.dispose();
+        return result;
+    }
+    /**
+     * The method returns a map with property names as keys and JSHandle
+     * instances for the property values.
+     *
+     * @example
+     * ```js
+     * const listHandle = await page.evaluateHandle(() => document.body.children);
+     * const properties = await listHandle.getProperties();
+     * const children = [];
+     * for (const property of properties.values()) {
+     *   const element = property.asElement();
+     *   if (element)
+     *     children.push(element);
+     * }
+     * children; // holds elementHandles to all children of document.body
+     * ```
+     */
+    async getProperties() {
+        const response = await this._client.send('Runtime.getProperties', {
+            objectId: this._remoteObject.objectId,
+            ownProperties: true,
+        });
+        const result = new Map();
+        for (const property of response.result) {
+            if (!property.enumerable)
+                continue;
+            result.set(property.name, createJSHandle(this._context, property.value));
+        }
+        return result;
+    }
+    /**
+     * Returns a JSON representation of the object.
+     *
+     * @remarks
+     *
+     * The JSON is generated by running {@link https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/stringify | JSON.stringify}
+     * on the object in page and consequent {@link https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/JSON/parse | JSON.parse} in puppeteer.
+     * **NOTE** The method throws if the referenced object is not stringifiable.
+     */
+    async jsonValue() {
+        if (this._remoteObject.objectId) {
+            const response = await this._client.send('Runtime.callFunctionOn', {
+                functionDeclaration: 'function() { return this; }',
+                objectId: this._remoteObject.objectId,
+                returnByValue: true,
+                awaitPromise: true,
+            });
+            return helper_js_1.helper.valueFromRemoteObject(response.result);
+        }
+        return helper_js_1.helper.valueFromRemoteObject(this._remoteObject);
+    }
+    /**
+     * Returns either `null` or the object handle itself, if the object handle is
+     * an instance of {@link ElementHandle}.
+     */
+    asElement() {
+        // This always returns null, but subclasses can override this and return an
+        // ElementHandle.
+        return null;
+    }
+    /**
+     * Stops referencing the element handle, and resolves when the object handle is
+     * successfully disposed of.
+     */
+    async dispose() {
+        if (this._disposed)
+            return;
+        this._disposed = true;
+        await helper_js_1.helper.releaseObject(this._client, this._remoteObject);
+    }
+    /**
+     * Returns a string representation of the JSHandle.
+     *
+     * @remarks Useful during debugging.
+     */
+    toString() {
+        if (this._remoteObject.objectId) {
+            const type = this._remoteObject.subtype || this._remoteObject.type;
+            return 'JSHandle@' + type;
+        }
+        return 'JSHandle:' + helper_js_1.helper.valueFromRemoteObject(this._remoteObject);
     }
 }
-exports.TimeoutSettings = TimeoutSettings;
+exports.JSHandle = JSHandle;
+/**
+ * ElementHandle represents an in-page DOM element.
+ *
+ * @remarks
+ *
+ * ElementHandles can be created with the {@link Page.$} method.
+ *
+ * ```js
+ * const puppeteer = require('puppeteer');
+ *
+ * (async () => {
+ *  const browser = await puppeteer.launch();
+ *  const page = await browser.newPage();
+ *  await page.goto('https://example.com');
+ *  const hrefElement = await page.$('a');
+ *  await hrefElement.click();
+ *  // ...
+ * })();
+ * ```
+ *
+ * ElementHandle prevents the DOM element from being garbage-collected unless the
+ * handle is {@link JSHandle.dispose | disposed}. ElementHandles are auto-disposed
+ * when their origin frame gets navigated.
+ *
+ * ElementHandle instances can be used as arguments in {@link Page.$eval} and
+ * {@link Page.evaluate} methods.
+ *
+ * If you're using TypeScript, ElementHandle takes a generic argument that
+ * denotes the type of element the handle is holding within. For example, if you
+ * have a handle to a `<select>` element, you can type it as
+ * `ElementHandle<HTMLSelectElement>` and you get some nicer type checks.
+ *
+ * @public
+ */
+class ElementHandle extends JSHandle {
+    /**
+     * @internal
+     */
+    constructor(context, client, remoteObject, page, frameManager) {
+        super(context, client, remoteObject);
+        this._client = client;
+        this._remoteObject = remoteObject;
+        this._page = page;
+        this._frameManager = frameManager;
+    }
+    asElement() {
+        return this;
+    }
+    /**
+     * Resolves to the content frame for element handles referencing
+     * iframe nodes, or null otherwise
+     */
+    async contentFrame() {
+        const nodeInfo = await this._client.send('DOM.describeNode', {
+            objectId: this._remoteObject.objectId,
+        });
+        if (typeof nodeInfo.node.frameId !== 'string')
+            return null;
+        return this._frameManager.frame(nodeInfo.node.frameId);
+    }
+    async _scrollIntoViewIfNeeded() {
+        const error = await this.evaluate(async (element, pageJavascriptEnabled) => {
+            if (!element.isConnected)
+                return 'Node is detached from document';
+            if (element.nodeType !== Node.ELEMENT_NODE)
+                return 'Node is not of type HTMLElement';
+            // force-scroll if page's javascript is disabled.
+            if (!pageJavascriptEnabled) {
+                element.scrollIntoView({
+                    block: 'center',
+                    inline: 'center',
+                    // Chrome still supports behavior: instant but it's not in the spec
+                    // so TS shouts We don't want to make this breaking change in
+                    // Puppeteer yet so we'll ignore the line.
+                    // @ts-ignore
+                    behavior: 'instant',
+                });
+                return false;
+            }
+            const visibleRatio = await new Promise((resolve) => {
+                const observer = new IntersectionObserver((entries) => {
+                    resolve(entries[0].intersectionRatio);
+                    observer.disconnect();
+                });
+                observer.observe(element);
+            });
+            if (visibleRatio !== 1.0) {
+                element.scrollIntoView({
+                    block: 'center',
+                    inline: 'center',
+                    // Chrome still supports behavior: instant but it's not in the spec
+                    // so TS shouts We don't want to make this breaking change in
+                    // Puppeteer yet so we'll ignore the line.
+                    // @ts-ignore
+                    behavior: 'instant',
+                });
+            }
+            return false;
+        }, this._page.isJavaScriptEnabled());
+        if (error)
+            throw new Error(error);
+    }
+    async _clickablePoint() {
+        const [result, layoutMetrics] = await Promise.all([
+            this._client
+                .send('DOM.getContentQuads', {
+                objectId: this._remoteObject.objectId,
+            })
+                .catch(helper_js_1.debugError),
+            this._client.send('Page.getLayoutMetrics'),
+        ]);
+        if (!result || !result.quads.length)
+            throw new Error('Node is either not visible or not an HTMLElement');
+        // Filter out quads that have too small area to click into.
+        const { clientWidth, clientHeight } = layoutMetrics.layoutViewport;
+        const quads = result.quads
+            .map((quad) => this._fromProtocolQuad(quad))
+            .map((quad) => this._intersectQuadWithViewport(quad, clientWidth, clientHeight))
+            .filter((quad) => computeQuadArea(quad) > 1);
+        if (!quads.length)
+            throw new Error('Node is either not visible or not an HTMLElement');
+        // Return the middle point of the first quad.
+        const quad = quads[0];
+        let x = 0;
+        let y = 0;
+        for (const point of quad) {
+            x += point.x;
+            y += point.y;
+        }
+        return {
+            x: x / 4,
+            y: y / 4,
+        };
+    }
+    _getBoxModel() {
+        const params = {
+            objectId: this._remoteObject.objectId,
+        };
+        return this._client
+            .send('DOM.getBoxModel', params)
+            .catch((error) => helper_js_1.debugError(error));
+    }
+    _fromProtocolQuad(quad) {
+        return [
+            { x: quad[0], y: quad[1] },
+            { x: quad[2], y: quad[3] },
+            { x: quad[4], y: quad[5] },
+            { x: quad[6], y: quad[7] },
+        ];
+    }
+    _intersectQuadWithViewport(quad, width, height) {
+        return quad.map((point) => ({
+            x: Math.min(Math.max(point.x, 0), width),
+            y: Math.min(Math.max(point.y, 0), height),
+        }));
+    }
+    /**
+     * This method scrolls element into view if needed, and then
+     * uses {@link Page.mouse} to hover over the center of the element.
+     * If the element is detached from DOM, the method throws an error.
+     */
+    async hover() {
+        await this._scrollIntoViewIfNeeded();
+        const { x, y } = await this._clickablePoint();
+        await this._page.mouse.move(x, y);
+    }
+    /**
+     * This method scrolls element into view if needed, and then
+     * uses {@link Page.mouse} to click in the center of the element.
+     * If the element is detached from DOM, the method throws an error.
+     */
+    async click(options = {}) {
+        await this._scrollIntoViewIfNeeded();
+        const { x, y } = await this._clickablePoint();
+        await this._page.mouse.click(x, y, options);
+    }
+    /**
+     * Triggers a `change` and `input` event once all the provided options have been
+     * selected. If there's no `<select>` element matching `selector`, the method
+     * throws an error.
+     *
+     * @example
+     * ```js
+     * handle.select('blue'); // single selection
+     * handle.select('red', 'green', 'blue'); // multiple selections
+     * ```
+     * @param values - Values of options to select. If the `<select>` has the
+     *    `multiple` attribute, all values are considered, otherwise only the first
+     *    one is taken into account.
+     */
+    async select(...values) {
+        for (const value of values)
+            assert_js_1.assert(helper_js_1.helper.isString(value), 'Values must be strings. Found value "' +
+                value +
+                '" of type "' +
+                typeof value +
+                '"');
+        return this.evaluate((element, values) => {
+            if (element.nodeName.toLowerCase() !== 'select')
+                throw new Error('Element is not a <select> element.');
+            const options = Array.from(element.options);
+            element.value = undefined;
+            for (const option of options) {
+                option.selected = values.includes(option.value);
+                if (option.selected && !element.multiple)
+                    break;
+            }
+            element.dispatchEvent(new Event('input', { bubbles: true }));
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+            return options
+                .filter((option) => option.selected)
+                .map((option) => option.value);
+        }, values);
+    }
+    /**
+     * This method expects `elementHandle` to point to an
+     * {@link https://developer.mozilla.org/en-US/docs/Web/HTML/Element/input | input element}.
+     * @param filePaths - Sets the value of the file input to these paths.
+     *    If some of the  `filePaths` are relative paths, then they are resolved
+     *    relative to the {@link https://nodejs.org/api/process.html#process_process_cwd | current working directory}
+     */
+    async uploadFile(...filePaths) {
+        const isMultiple = await this.evaluate((element) => element.multiple);
+        assert_js_1.assert(filePaths.length <= 1 || isMultiple, 'Multiple file uploads only work with <input type=file multiple>');
+        // This import is only needed for `uploadFile`, so keep it scoped here to avoid paying
+        // the cost unnecessarily.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const path = __webpack_require__(622);
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const fs = __webpack_require__(747);
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const { promisify } = __webpack_require__(669);
+        const access = promisify(fs.access);
+        // Locate all files and confirm that they exist.
+        const files = await Promise.all(filePaths.map(async (filePath) => {
+            const resolvedPath = path.resolve(filePath);
+            try {
+                await access(resolvedPath, fs.constants.R_OK);
+            }
+            catch (error) {
+                if (error.code === 'ENOENT')
+                    throw new Error(`${filePath} does not exist or is not readable`);
+            }
+            return resolvedPath;
+        }));
+        const { objectId } = this._remoteObject;
+        const { node } = await this._client.send('DOM.describeNode', { objectId });
+        const { backendNodeId } = node;
+        // The zero-length array is a special case, it seems that DOM.setFileInputFiles does
+        // not actually update the files in that case, so the solution is to eval the element
+        // value to a new FileList directly.
+        if (files.length === 0) {
+            await this.evaluate((element) => {
+                element.files = new DataTransfer().files;
+                // Dispatch events for this case because it should behave akin to a user action.
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+        }
+        else {
+            await this._client.send('DOM.setFileInputFiles', {
+                objectId,
+                files,
+                backendNodeId,
+            });
+        }
+    }
+    /**
+     * This method scrolls element into view if needed, and then uses
+     * {@link Touchscreen.tap} to tap in the center of the element.
+     * If the element is detached from DOM, the method throws an error.
+     */
+    async tap() {
+        await this._scrollIntoViewIfNeeded();
+        const { x, y } = await this._clickablePoint();
+        await this._page.touchscreen.tap(x, y);
+    }
+    /**
+     * Calls {@link https://developer.mozilla.org/en-US/docs/Web/API/HTMLElement/focus | focus} on the element.
+     */
+    async focus() {
+        await this.evaluate((element) => element.focus());
+    }
+    /**
+     * Focuses the element, and then sends a `keydown`, `keypress`/`input`, and
+     * `keyup` event for each character in the text.
+     *
+     * To press a special key, like `Control` or `ArrowDown`,
+     * use {@link ElementHandle.press}.
+     *
+     * @example
+     * ```js
+     * await elementHandle.type('Hello'); // Types instantly
+     * await elementHandle.type('World', {delay: 100}); // Types slower, like a user
+     * ```
+     *
+     * @example
+     * An example of typing into a text field and then submitting the form:
+     *
+     * ```js
+     * const elementHandle = await page.$('input');
+     * await elementHandle.type('some text');
+     * await elementHandle.press('Enter');
+     * ```
+     */
+    async type(text, options) {
+        await this.focus();
+        await this._page.keyboard.type(text, options);
+    }
+    /**
+     * Focuses the element, and then uses {@link Keyboard.down} and {@link Keyboard.up}.
+     *
+     * @remarks
+     * If `key` is a single character and no modifier keys besides `Shift`
+     * are being held down, a `keypress`/`input` event will also be generated.
+     * The `text` option can be specified to force an input event to be generated.
+     *
+     * **NOTE** Modifier keys DO affect `elementHandle.press`. Holding down `Shift`
+     * will type the text in upper case.
+     *
+     * @param key - Name of key to press, such as `ArrowLeft`.
+     *    See {@link KeyInput} for a list of all key names.
+     */
+    async press(key, options) {
+        await this.focus();
+        await this._page.keyboard.press(key, options);
+    }
+    /**
+     * This method returns the bounding box of the element (relative to the main frame),
+     * or `null` if the element is not visible.
+     */
+    async boundingBox() {
+        const result = await this._getBoxModel();
+        if (!result)
+            return null;
+        const quad = result.model.border;
+        const x = Math.min(quad[0], quad[2], quad[4], quad[6]);
+        const y = Math.min(quad[1], quad[3], quad[5], quad[7]);
+        const width = Math.max(quad[0], quad[2], quad[4], quad[6]) - x;
+        const height = Math.max(quad[1], quad[3], quad[5], quad[7]) - y;
+        return { x, y, width, height };
+    }
+    /**
+     * This method returns boxes of the element, or `null` if the element is not visible.
+     *
+     * @remarks
+     *
+     * Boxes are represented as an array of points;
+     * Each Point is an object `{x, y}`. Box points are sorted clock-wise.
+     */
+    async boxModel() {
+        const result = await this._getBoxModel();
+        if (!result)
+            return null;
+        const { content, padding, border, margin, width, height } = result.model;
+        return {
+            content: this._fromProtocolQuad(content),
+            padding: this._fromProtocolQuad(padding),
+            border: this._fromProtocolQuad(border),
+            margin: this._fromProtocolQuad(margin),
+            width,
+            height,
+        };
+    }
+    /**
+     * This method scrolls element into view if needed, and then uses
+     * {@link Page.screenshot} to take a screenshot of the element.
+     * If the element is detached from DOM, the method throws an error.
+     */
+    async screenshot(options = {}) {
+        let needsViewportReset = false;
+        let boundingBox = await this.boundingBox();
+        assert_js_1.assert(boundingBox, 'Node is either not visible or not an HTMLElement');
+        const viewport = this._page.viewport();
+        if (viewport &&
+            (boundingBox.width > viewport.width ||
+                boundingBox.height > viewport.height)) {
+            const newViewport = {
+                width: Math.max(viewport.width, Math.ceil(boundingBox.width)),
+                height: Math.max(viewport.height, Math.ceil(boundingBox.height)),
+            };
+            await this._page.setViewport(Object.assign({}, viewport, newViewport));
+            needsViewportReset = true;
+        }
+        await this._scrollIntoViewIfNeeded();
+        boundingBox = await this.boundingBox();
+        assert_js_1.assert(boundingBox, 'Node is either not visible or not an HTMLElement');
+        assert_js_1.assert(boundingBox.width !== 0, 'Node has 0 width.');
+        assert_js_1.assert(boundingBox.height !== 0, 'Node has 0 height.');
+        const { layoutViewport: { pageX, pageY }, } = await this._client.send('Page.getLayoutMetrics');
+        const clip = Object.assign({}, boundingBox);
+        clip.x += pageX;
+        clip.y += pageY;
+        const imageData = await this._page.screenshot(Object.assign({}, {
+            clip,
+        }, options));
+        if (needsViewportReset)
+            await this._page.setViewport(viewport);
+        return imageData;
+    }
+    /**
+     * Runs `element.querySelector` within the page. If no element matches the selector,
+     * the return value resolves to `null`.
+     */
+    async $(selector) {
+        const { updatedSelector, queryHandler } = QueryHandler_js_1.getQueryHandlerAndSelector(selector);
+        const handle = await this.evaluateHandle(queryHandler.queryOne, updatedSelector);
+        const element = handle.asElement();
+        if (element)
+            return element;
+        await handle.dispose();
+        return null;
+    }
+    /**
+     * Runs `element.querySelectorAll` within the page. If no elements match the selector,
+     * the return value resolves to `[]`.
+     */
+    async $$(selector) {
+        const { updatedSelector, queryHandler } = QueryHandler_js_1.getQueryHandlerAndSelector(selector);
+        const handles = await this.evaluateHandle(queryHandler.queryAll, updatedSelector);
+        const properties = await handles.getProperties();
+        await handles.dispose();
+        const result = [];
+        for (const property of properties.values()) {
+            const elementHandle = property.asElement();
+            if (elementHandle)
+                result.push(elementHandle);
+        }
+        return result;
+    }
+    /**
+     * This method runs `document.querySelector` within the element and passes it as
+     * the first argument to `pageFunction`. If there's no element matching `selector`,
+     * the method throws an error.
+     *
+     * If `pageFunction` returns a Promise, then `frame.$eval` would wait for the promise
+     * to resolve and return its value.
+     *
+     * @example
+     * ```js
+     * const tweetHandle = await page.$('.tweet');
+     * expect(await tweetHandle.$eval('.like', node => node.innerText)).toBe('100');
+     * expect(await tweetHandle.$eval('.retweets', node => node.innerText)).toBe('10');
+     * ```
+     */
+    async $eval(selector, pageFunction, ...args) {
+        const elementHandle = await this.$(selector);
+        if (!elementHandle)
+            throw new Error(`Error: failed to find element matching selector "${selector}"`);
+        const result = await elementHandle.evaluate(pageFunction, ...args);
+        await elementHandle.dispose();
+        /**
+         * This `as` is a little unfortunate but helps TS understand the behavior of
+         * `elementHandle.evaluate`. If evaluate returns an element it will return an
+         * ElementHandle instance, rather than the plain object. All the
+         * WrapElementHandle type does is wrap ReturnType into
+         * ElementHandle<ReturnType> if it is an ElementHandle, or leave it alone as
+         * ReturnType if it isn't.
+         */
+        return result;
+    }
+    /**
+     * This method runs `document.querySelectorAll` within the element and passes it as
+     * the first argument to `pageFunction`. If there's no element matching `selector`,
+     * the method throws an error.
+     *
+     * If `pageFunction` returns a Promise, then `frame.$$eval` would wait for the
+     * promise to resolve and return its value.
+     *
+     * @example
+     * ```html
+     * <div class="feed">
+     *   <div class="tweet">Hello!</div>
+     *   <div class="tweet">Hi!</div>
+     * </div>
+     * ```
+     *
+     * @example
+     * ```js
+     * const feedHandle = await page.$('.feed');
+     * expect(await feedHandle.$$eval('.tweet', nodes => nodes.map(n => n.innerText)))
+     *  .toEqual(['Hello!', 'Hi!']);
+     * ```
+     */
+    async $$eval(selector, pageFunction, ...args) {
+        const { updatedSelector, queryHandler } = QueryHandler_js_1.getQueryHandlerAndSelector(selector);
+        const queryHandlerToArray = Function('element', 'selector', `return Array.from((${queryHandler.queryAll})(element, selector));`);
+        const arrayHandle = await this.evaluateHandle(queryHandlerToArray, updatedSelector);
+        const result = await arrayHandle.evaluate(pageFunction, ...args);
+        await arrayHandle.dispose();
+        /* This `as` exists for the same reason as the `as` in $eval above.
+         * See the comment there for a full explanation.
+         */
+        return result;
+    }
+    /**
+     * The method evaluates the XPath expression relative to the elementHandle.
+     * If there are no such elements, the method will resolve to an empty array.
+     * @param expression - Expression to {@link https://developer.mozilla.org/en-US/docs/Web/API/Document/evaluate | evaluate}
+     */
+    async $x(expression) {
+        const arrayHandle = await this.evaluateHandle((element, expression) => {
+            const document = element.ownerDocument || element;
+            const iterator = document.evaluate(expression, element, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE);
+            const array = [];
+            let item;
+            while ((item = iterator.iterateNext()))
+                array.push(item);
+            return array;
+        }, expression);
+        const properties = await arrayHandle.getProperties();
+        await arrayHandle.dispose();
+        const result = [];
+        for (const property of properties.values()) {
+            const elementHandle = property.asElement();
+            if (elementHandle)
+                result.push(elementHandle);
+        }
+        return result;
+    }
+    /**
+     * Resolves to true if the element is visible in the current viewport.
+     */
+    async isIntersectingViewport() {
+        return await this.evaluate(async (element) => {
+            const visibleRatio = await new Promise((resolve) => {
+                const observer = new IntersectionObserver((entries) => {
+                    resolve(entries[0].intersectionRatio);
+                    observer.disconnect();
+                });
+                observer.observe(element);
+            });
+            return visibleRatio > 0;
+        });
+    }
+}
+exports.ElementHandle = ElementHandle;
+function computeQuadArea(quad) {
+    // Compute sum of all directed areas of adjacent triangles
+    // https://en.wikipedia.org/wiki/Polygon#Simple_polygons
+    let area = 0;
+    for (let i = 0; i < quad.length; ++i) {
+        const p1 = quad[i];
+        const p2 = quad[(i + 1) % quad.length];
+        area += (p1.x * p2.y - p2.x * p1.y) / 2;
+    }
+    return Math.abs(area);
+}
 
 
 /***/ }),
+/* 934 */,
+/* 935 */,
 /* 936 */,
 /* 937 */,
 /* 938 */,
@@ -35801,572 +37721,173 @@ chownr.sync = chownrSync
 /* 946 */,
 /* 947 */,
 /* 948 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
 "use strict";
 
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
-    __setModuleDefault(result, mod);
-    return result;
-};
-Object.defineProperty(exports, "__esModule", { value: true });
+
+const { Duplex } = __webpack_require__(413);
+
 /**
- * Copyright 2017 Google Inc. All rights reserved.
+ * Emits the `'close'` event on a stream.
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * @param {stream.Duplex} The stream.
+ * @private
+ */
+function emitClose(stream) {
+  stream.emit('close');
+}
+
+/**
+ * The listener of the `'end'` event.
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ * @private
+ */
+function duplexOnEnd() {
+  if (!this.destroyed && this._writableState.finished) {
+    this.destroy();
+  }
+}
+
+/**
+ * The listener of the `'error'` event.
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * @private
  */
-const os = __importStar(__webpack_require__(87));
-const path = __importStar(__webpack_require__(622));
-const http = __importStar(__webpack_require__(605));
-const https = __importStar(__webpack_require__(211));
-const URL = __importStar(__webpack_require__(835));
-const fs = __importStar(__webpack_require__(747));
-const BrowserFetcher_1 = __webpack_require__(529);
-const Connection_1 = __webpack_require__(433);
-const Browser_1 = __webpack_require__(26);
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const WebSocketTransport_1 = __webpack_require__(714);
-const BrowserRunner_1 = __webpack_require__(410);
-const util_1 = __webpack_require__(669);
-const mkdtempAsync = util_1.promisify(fs.mkdtemp);
-const writeFileAsync = util_1.promisify(fs.writeFile);
+function duplexOnError(err) {
+  this.removeListener('error', duplexOnError);
+  this.destroy();
+  if (this.listenerCount('error') === 0) {
+    // Do not suppress the throwing behavior.
+    this.emit('error', err);
+  }
+}
+
 /**
- * @internal
+ * Wraps a `WebSocket` in a duplex stream.
+ *
+ * @param {WebSocket} ws The `WebSocket` to wrap
+ * @param {Object} options The options for the `Duplex` constructor
+ * @return {stream.Duplex} The duplex stream
+ * @public
  */
-class ChromeLauncher {
-    constructor(projectRoot, preferredRevision, isPuppeteerCore) {
-        this._projectRoot = projectRoot;
-        this._preferredRevision = preferredRevision;
-        this._isPuppeteerCore = isPuppeteerCore;
-    }
-    async launch(options = {}) {
-        const { ignoreDefaultArgs = false, args = [], dumpio = false, executablePath = null, pipe = false, env = process.env, handleSIGINT = true, handleSIGTERM = true, handleSIGHUP = true, ignoreHTTPSErrors = false, defaultViewport = { width: 800, height: 600 }, slowMo = 0, timeout = 30000, } = options;
-        const profilePath = path.join(os.tmpdir(), 'puppeteer_dev_chrome_profile-');
-        const chromeArguments = [];
-        if (!ignoreDefaultArgs)
-            chromeArguments.push(...this.defaultArgs(options));
-        else if (Array.isArray(ignoreDefaultArgs))
-            chromeArguments.push(...this.defaultArgs(options).filter((arg) => !ignoreDefaultArgs.includes(arg)));
-        else
-            chromeArguments.push(...args);
-        let temporaryUserDataDir = null;
-        if (!chromeArguments.some((argument) => argument.startsWith('--remote-debugging-')))
-            chromeArguments.push(pipe ? '--remote-debugging-pipe' : '--remote-debugging-port=0');
-        if (!chromeArguments.some((arg) => arg.startsWith('--user-data-dir'))) {
-            temporaryUserDataDir = await mkdtempAsync(profilePath);
-            chromeArguments.push(`--user-data-dir=${temporaryUserDataDir}`);
-        }
-        let chromeExecutable = executablePath;
-        if (os.arch() === 'arm64') {
-            chromeExecutable = '/usr/bin/chromium-browser';
-        }
-        else if (!executablePath) {
-            const { missingText, executablePath } = resolveExecutablePath(this);
-            if (missingText)
-                throw new Error(missingText);
-            chromeExecutable = executablePath;
-        }
-        const usePipe = chromeArguments.includes('--remote-debugging-pipe');
-        const runner = new BrowserRunner_1.BrowserRunner(chromeExecutable, chromeArguments, temporaryUserDataDir);
-        runner.start({
-            handleSIGHUP,
-            handleSIGTERM,
-            handleSIGINT,
-            dumpio,
-            env,
-            pipe: usePipe,
-        });
-        try {
-            const connection = await runner.setupConnection({
-                usePipe,
-                timeout,
-                slowMo,
-                preferredRevision: this._preferredRevision,
-            });
-            const browser = await Browser_1.Browser.create(connection, [], ignoreHTTPSErrors, defaultViewport, runner.proc, runner.close.bind(runner));
-            await browser.waitForTarget((t) => t.type() === 'page');
-            return browser;
-        }
-        catch (error) {
-            runner.kill();
-            throw error;
-        }
-    }
-    /**
-     * @param {!Launcher.ChromeArgOptions=} options
-     * @returns {!Array<string>}
-     */
-    defaultArgs(options = {}) {
-        const chromeArguments = [
-            '--disable-background-networking',
-            '--enable-features=NetworkService,NetworkServiceInProcess',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-breakpad',
-            '--disable-client-side-phishing-detection',
-            '--disable-component-extensions-with-background-pages',
-            '--disable-default-apps',
-            '--disable-dev-shm-usage',
-            '--disable-extensions',
-            '--disable-features=TranslateUI',
-            '--disable-hang-monitor',
-            '--disable-ipc-flooding-protection',
-            '--disable-popup-blocking',
-            '--disable-prompt-on-repost',
-            '--disable-renderer-backgrounding',
-            '--disable-sync',
-            '--force-color-profile=srgb',
-            '--metrics-recording-only',
-            '--no-first-run',
-            '--enable-automation',
-            '--password-store=basic',
-            '--use-mock-keychain',
-        ];
-        const { devtools = false, headless = !devtools, args = [], userDataDir = null, } = options;
-        if (userDataDir)
-            chromeArguments.push(`--user-data-dir=${userDataDir}`);
-        if (devtools)
-            chromeArguments.push('--auto-open-devtools-for-tabs');
-        if (headless) {
-            chromeArguments.push('--headless', '--hide-scrollbars', '--mute-audio');
-        }
-        if (args.every((arg) => arg.startsWith('-')))
-            chromeArguments.push('about:blank');
-        chromeArguments.push(...args);
-        return chromeArguments;
-    }
-    executablePath() {
-        return resolveExecutablePath(this).executablePath;
-    }
-    get product() {
-        return 'chrome';
-    }
-    async connect(options) {
-        const { browserWSEndpoint, browserURL, ignoreHTTPSErrors = false, defaultViewport = { width: 800, height: 600 }, transport, slowMo = 0, } = options;
-        assert_1.assert(Number(!!browserWSEndpoint) +
-            Number(!!browserURL) +
-            Number(!!transport) ===
-            1, 'Exactly one of browserWSEndpoint, browserURL or transport must be passed to puppeteer.connect');
-        let connection = null;
-        if (transport) {
-            connection = new Connection_1.Connection('', transport, slowMo);
-        }
-        else if (browserWSEndpoint) {
-            const connectionTransport = await WebSocketTransport_1.WebSocketTransport.create(browserWSEndpoint);
-            connection = new Connection_1.Connection(browserWSEndpoint, connectionTransport, slowMo);
-        }
-        else if (browserURL) {
-            const connectionURL = await getWSEndpoint(browserURL);
-            const connectionTransport = await WebSocketTransport_1.WebSocketTransport.create(connectionURL);
-            connection = new Connection_1.Connection(connectionURL, connectionTransport, slowMo);
-        }
-        const { browserContextIds } = await connection.send('Target.getBrowserContexts');
-        return Browser_1.Browser.create(connection, browserContextIds, ignoreHTTPSErrors, defaultViewport, null, () => connection.send('Browser.close').catch(helper_1.debugError));
-    }
-}
-/**
- * @internal
- */
-class FirefoxLauncher {
-    constructor(projectRoot, preferredRevision, isPuppeteerCore) {
-        this._projectRoot = projectRoot;
-        this._preferredRevision = preferredRevision;
-        this._isPuppeteerCore = isPuppeteerCore;
-    }
-    async launch(options = {}) {
-        const { ignoreDefaultArgs = false, args = [], dumpio = false, executablePath = null, pipe = false, env = process.env, handleSIGINT = true, handleSIGTERM = true, handleSIGHUP = true, ignoreHTTPSErrors = false, defaultViewport = { width: 800, height: 600 }, slowMo = 0, timeout = 30000, extraPrefsFirefox = {}, } = options;
-        const firefoxArguments = [];
-        if (!ignoreDefaultArgs)
-            firefoxArguments.push(...this.defaultArgs(options));
-        else if (Array.isArray(ignoreDefaultArgs))
-            firefoxArguments.push(...this.defaultArgs(options).filter((arg) => !ignoreDefaultArgs.includes(arg)));
-        else
-            firefoxArguments.push(...args);
-        if (!firefoxArguments.some((argument) => argument.startsWith('--remote-debugging-')))
-            firefoxArguments.push('--remote-debugging-port=0');
-        let temporaryUserDataDir = null;
-        if (!firefoxArguments.includes('-profile') &&
-            !firefoxArguments.includes('--profile')) {
-            temporaryUserDataDir = await this._createProfile(extraPrefsFirefox);
-            firefoxArguments.push('--profile');
-            firefoxArguments.push(temporaryUserDataDir);
-        }
-        await this._updateRevision();
-        let firefoxExecutable = executablePath;
-        if (!executablePath) {
-            const { missingText, executablePath } = resolveExecutablePath(this);
-            if (missingText)
-                throw new Error(missingText);
-            firefoxExecutable = executablePath;
-        }
-        const runner = new BrowserRunner_1.BrowserRunner(firefoxExecutable, firefoxArguments, temporaryUserDataDir);
-        runner.start({
-            handleSIGHUP,
-            handleSIGTERM,
-            handleSIGINT,
-            dumpio,
-            env,
-            pipe,
-        });
-        try {
-            const connection = await runner.setupConnection({
-                usePipe: pipe,
-                timeout,
-                slowMo,
-                preferredRevision: this._preferredRevision,
-            });
-            const browser = await Browser_1.Browser.create(connection, [], ignoreHTTPSErrors, defaultViewport, runner.proc, runner.close.bind(runner));
-            await browser.waitForTarget((t) => t.type() === 'page');
-            return browser;
-        }
-        catch (error) {
-            runner.kill();
-            throw error;
-        }
-    }
-    async connect(options) {
-        const { browserWSEndpoint, browserURL, ignoreHTTPSErrors = false, defaultViewport = { width: 800, height: 600 }, transport, slowMo = 0, } = options;
-        assert_1.assert(Number(!!browserWSEndpoint) +
-            Number(!!browserURL) +
-            Number(!!transport) ===
-            1, 'Exactly one of browserWSEndpoint, browserURL or transport must be passed to puppeteer.connect');
-        let connection = null;
-        if (transport) {
-            connection = new Connection_1.Connection('', transport, slowMo);
-        }
-        else if (browserWSEndpoint) {
-            const connectionTransport = await WebSocketTransport_1.WebSocketTransport.create(browserWSEndpoint);
-            connection = new Connection_1.Connection(browserWSEndpoint, connectionTransport, slowMo);
-        }
-        else if (browserURL) {
-            const connectionURL = await getWSEndpoint(browserURL);
-            const connectionTransport = await WebSocketTransport_1.WebSocketTransport.create(connectionURL);
-            connection = new Connection_1.Connection(connectionURL, connectionTransport, slowMo);
-        }
-        const { browserContextIds } = await connection.send('Target.getBrowserContexts');
-        return Browser_1.Browser.create(connection, browserContextIds, ignoreHTTPSErrors, defaultViewport, null, () => connection.send('Browser.close').catch(helper_1.debugError));
-    }
-    executablePath() {
-        return resolveExecutablePath(this).executablePath;
-    }
-    async _updateRevision() {
-        // replace 'latest' placeholder with actual downloaded revision
-        if (this._preferredRevision === 'latest') {
-            const browserFetcher = new BrowserFetcher_1.BrowserFetcher(this._projectRoot, {
-                product: this.product,
-            });
-            const localRevisions = await browserFetcher.localRevisions();
-            if (localRevisions[0])
-                this._preferredRevision = localRevisions[0];
-        }
-    }
-    get product() {
-        return 'firefox';
-    }
-    defaultArgs(options = {}) {
-        const firefoxArguments = ['--no-remote', '--foreground'];
-        const { devtools = false, headless = !devtools, args = [], userDataDir = null, } = options;
-        if (userDataDir) {
-            firefoxArguments.push('--profile');
-            firefoxArguments.push(userDataDir);
-        }
-        if (headless)
-            firefoxArguments.push('--headless');
-        if (devtools)
-            firefoxArguments.push('--devtools');
-        if (args.every((arg) => arg.startsWith('-')))
-            firefoxArguments.push('about:blank');
-        firefoxArguments.push(...args);
-        return firefoxArguments;
-    }
-    async _createProfile(extraPrefs) {
-        const profilePath = await mkdtempAsync(path.join(os.tmpdir(), 'puppeteer_dev_firefox_profile-'));
-        const prefsJS = [];
-        const userJS = [];
-        const server = 'dummy.test';
-        const defaultPreferences = {
-            // Make sure Shield doesn't hit the network.
-            'app.normandy.api_url': '',
-            // Disable Firefox old build background check
-            'app.update.checkInstallTime': false,
-            // Disable automatically upgrading Firefox
-            'app.update.disabledForTesting': true,
-            // Increase the APZ content response timeout to 1 minute
-            'apz.content_response_timeout': 60000,
-            // Prevent various error message on the console
-            // jest-puppeteer asserts that no error message is emitted by the console
-            'browser.contentblocking.features.standard': '-tp,tpPrivate,cookieBehavior0,-cm,-fp',
-            // Enable the dump function: which sends messages to the system
-            // console
-            // https://bugzilla.mozilla.org/show_bug.cgi?id=1543115
-            'browser.dom.window.dump.enabled': true,
-            // Disable topstories
-            'browser.newtabpage.activity-stream.feeds.section.topstories': false,
-            // Always display a blank page
-            'browser.newtabpage.enabled': false,
-            // Background thumbnails in particular cause grief: and disabling
-            // thumbnails in general cannot hurt
-            'browser.pagethumbnails.capturing_disabled': true,
-            // Disable safebrowsing components.
-            'browser.safebrowsing.blockedURIs.enabled': false,
-            'browser.safebrowsing.downloads.enabled': false,
-            'browser.safebrowsing.malware.enabled': false,
-            'browser.safebrowsing.passwords.enabled': false,
-            'browser.safebrowsing.phishing.enabled': false,
-            // Disable updates to search engines.
-            'browser.search.update': false,
-            // Do not restore the last open set of tabs if the browser has crashed
-            'browser.sessionstore.resume_from_crash': false,
-            // Skip check for default browser on startup
-            'browser.shell.checkDefaultBrowser': false,
-            // Disable newtabpage
-            'browser.startup.homepage': 'about:blank',
-            // Do not redirect user when a milstone upgrade of Firefox is detected
-            'browser.startup.homepage_override.mstone': 'ignore',
-            // Start with a blank page about:blank
-            'browser.startup.page': 0,
-            // Do not allow background tabs to be zombified on Android: otherwise for
-            // tests that open additional tabs: the test harness tab itself might get
-            // unloaded
-            'browser.tabs.disableBackgroundZombification': false,
-            // Do not warn when closing all other open tabs
-            'browser.tabs.warnOnCloseOtherTabs': false,
-            // Do not warn when multiple tabs will be opened
-            'browser.tabs.warnOnOpen': false,
-            // Disable the UI tour.
-            'browser.uitour.enabled': false,
-            // Turn off search suggestions in the location bar so as not to trigger
-            // network connections.
-            'browser.urlbar.suggest.searches': false,
-            // Disable first run splash page on Windows 10
-            'browser.usedOnWindows10.introURL': '',
-            // Do not warn on quitting Firefox
-            'browser.warnOnQuit': false,
-            // Do not show datareporting policy notifications which can
-            // interfere with tests
-            'datareporting.healthreport.about.reportUrl': `http://${server}/dummy/abouthealthreport/`,
-            'datareporting.healthreport.documentServerURI': `http://${server}/dummy/healthreport/`,
-            'datareporting.healthreport.logging.consoleEnabled': false,
-            'datareporting.healthreport.service.enabled': false,
-            'datareporting.healthreport.service.firstRun': false,
-            'datareporting.healthreport.uploadEnabled': false,
-            'datareporting.policy.dataSubmissionEnabled': false,
-            'datareporting.policy.dataSubmissionPolicyAccepted': false,
-            'datareporting.policy.dataSubmissionPolicyBypassNotification': true,
-            // DevTools JSONViewer sometimes fails to load dependencies with its require.js.
-            // This doesn't affect Puppeteer but spams console (Bug 1424372)
-            'devtools.jsonview.enabled': false,
-            // Disable popup-blocker
-            'dom.disable_open_during_load': false,
-            // Enable the support for File object creation in the content process
-            // Required for |Page.setFileInputFiles| protocol method.
-            'dom.file.createInChild': true,
-            // Disable the ProcessHangMonitor
-            'dom.ipc.reportProcessHangs': false,
-            // Disable slow script dialogues
-            'dom.max_chrome_script_run_time': 0,
-            'dom.max_script_run_time': 0,
-            // Only load extensions from the application and user profile
-            // AddonManager.SCOPE_PROFILE + AddonManager.SCOPE_APPLICATION
-            'extensions.autoDisableScopes': 0,
-            'extensions.enabledScopes': 5,
-            // Disable metadata caching for installed add-ons by default
-            'extensions.getAddons.cache.enabled': false,
-            // Disable installing any distribution extensions or add-ons.
-            'extensions.installDistroAddons': false,
-            // Disabled screenshots extension
-            'extensions.screenshots.disabled': true,
-            // Turn off extension updates so they do not bother tests
-            'extensions.update.enabled': false,
-            // Turn off extension updates so they do not bother tests
-            'extensions.update.notifyUser': false,
-            // Make sure opening about:addons will not hit the network
-            'extensions.webservice.discoverURL': `http://${server}/dummy/discoveryURL`,
-            // Allow the application to have focus even it runs in the background
-            'focusmanager.testmode': true,
-            // Disable useragent updates
-            'general.useragent.updates.enabled': false,
-            // Always use network provider for geolocation tests so we bypass the
-            // macOS dialog raised by the corelocation provider
-            'geo.provider.testing': true,
-            // Do not scan Wifi
-            'geo.wifi.scan': false,
-            // No hang monitor
-            'hangmonitor.timeout': 0,
-            // Show chrome errors and warnings in the error console
-            'javascript.options.showInConsole': true,
-            // Disable download and usage of OpenH264: and Widevine plugins
-            'media.gmp-manager.updateEnabled': false,
-            // Prevent various error message on the console
-            // jest-puppeteer asserts that no error message is emitted by the console
-            'network.cookie.cookieBehavior': 0,
-            // Do not prompt for temporary redirects
-            'network.http.prompt-temp-redirect': false,
-            // Disable speculative connections so they are not reported as leaking
-            // when they are hanging around
-            'network.http.speculative-parallel-limit': 0,
-            // Do not automatically switch between offline and online
-            'network.manage-offline-status': false,
-            // Make sure SNTP requests do not hit the network
-            'network.sntp.pools': server,
-            // Disable Flash.
-            'plugin.state.flash': 0,
-            'privacy.trackingprotection.enabled': false,
-            // Enable Remote Agent
-            // https://bugzilla.mozilla.org/show_bug.cgi?id=1544393
-            'remote.enabled': true,
-            // Don't do network connections for mitm priming
-            'security.certerrors.mitm.priming.enabled': false,
-            // Local documents have access to all other local documents,
-            // including directory listings
-            'security.fileuri.strict_origin_policy': false,
-            // Do not wait for the notification button security delay
-            'security.notification_enable_delay': 0,
-            // Ensure blocklist updates do not hit the network
-            'services.settings.server': `http://${server}/dummy/blocklist/`,
-            // Do not automatically fill sign-in forms with known usernames and
-            // passwords
-            'signon.autofillForms': false,
-            // Disable password capture, so that tests that include forms are not
-            // influenced by the presence of the persistent doorhanger notification
-            'signon.rememberSignons': false,
-            // Disable first-run welcome page
-            'startup.homepage_welcome_url': 'about:blank',
-            // Disable first-run welcome page
-            'startup.homepage_welcome_url.additional': '',
-            // Disable browser animations (tabs, fullscreen, sliding alerts)
-            'toolkit.cosmeticAnimations.enabled': false,
-            // We want to collect telemetry, but we don't want to send in the results
-            'toolkit.telemetry.server': `https://${server}/dummy/telemetry/`,
-            // Prevent starting into safe mode after application crashes
-            'toolkit.startup.max_resumed_crashes': -1,
-        };
-        Object.assign(defaultPreferences, extraPrefs);
-        for (const [key, value] of Object.entries(defaultPreferences))
-            userJS.push(`user_pref(${JSON.stringify(key)}, ${JSON.stringify(value)});`);
-        await writeFileAsync(path.join(profilePath, 'user.js'), userJS.join('\n'));
-        await writeFileAsync(path.join(profilePath, 'prefs.js'), prefsJS.join('\n'));
-        return profilePath;
-    }
-}
-function getWSEndpoint(browserURL) {
-    let resolve, reject;
-    const promise = new Promise((res, rej) => {
-        resolve = res;
-        reject = rej;
+function createWebSocketStream(ws, options) {
+  let resumeOnReceiverDrain = true;
+
+  function receiverOnDrain() {
+    if (resumeOnReceiverDrain) ws._socket.resume();
+  }
+
+  if (ws.readyState === ws.CONNECTING) {
+    ws.once('open', function open() {
+      ws._receiver.removeAllListeners('drain');
+      ws._receiver.on('drain', receiverOnDrain);
     });
-    const endpointURL = URL.resolve(browserURL, '/json/version');
-    const protocol = endpointURL.startsWith('https') ? https : http;
-    const requestOptions = Object.assign(URL.parse(endpointURL), {
-        method: 'GET',
-    });
-    const request = protocol.request(requestOptions, (res) => {
-        let data = '';
-        if (res.statusCode !== 200) {
-            // Consume response data to free up memory.
-            res.resume();
-            reject(new Error('HTTP ' + res.statusCode));
-            return;
-        }
-        res.setEncoding('utf8');
-        res.on('data', (chunk) => (data += chunk));
-        res.on('end', () => resolve(JSON.parse(data).webSocketDebuggerUrl));
-    });
-    request.on('error', reject);
-    request.end();
-    return promise.catch((error) => {
-        error.message =
-            `Failed to fetch browser webSocket url from ${endpointURL}: ` +
-                error.message;
-        throw error;
-    });
-}
-function resolveExecutablePath(launcher) {
-    // puppeteer-core doesn't take into account PUPPETEER_* env variables.
-    if (!launcher._isPuppeteerCore) {
-        const executablePath = process.env.PUPPETEER_EXECUTABLE_PATH ||
-            process.env.npm_config_puppeteer_executable_path ||
-            process.env.npm_package_config_puppeteer_executable_path;
-        if (executablePath) {
-            const missingText = !fs.existsSync(executablePath)
-                ? 'Tried to use PUPPETEER_EXECUTABLE_PATH env variable to launch browser but did not find any executable at: ' +
-                    executablePath
-                : null;
-            return { executablePath, missingText };
-        }
+  } else {
+    ws._receiver.removeAllListeners('drain');
+    ws._receiver.on('drain', receiverOnDrain);
+  }
+
+  const duplex = new Duplex({
+    ...options,
+    autoDestroy: false,
+    emitClose: false,
+    objectMode: false,
+    writableObjectMode: false
+  });
+
+  ws.on('message', function message(msg) {
+    if (!duplex.push(msg)) {
+      resumeOnReceiverDrain = false;
+      ws._socket.pause();
     }
-    const browserFetcher = new BrowserFetcher_1.BrowserFetcher(launcher._projectRoot, {
-        product: launcher.product,
+  });
+
+  ws.once('error', function error(err) {
+    if (duplex.destroyed) return;
+
+    duplex.destroy(err);
+  });
+
+  ws.once('close', function close() {
+    if (duplex.destroyed) return;
+
+    duplex.push(null);
+  });
+
+  duplex._destroy = function (err, callback) {
+    if (ws.readyState === ws.CLOSED) {
+      callback(err);
+      process.nextTick(emitClose, duplex);
+      return;
+    }
+
+    let called = false;
+
+    ws.once('error', function error(err) {
+      called = true;
+      callback(err);
     });
-    if (!launcher._isPuppeteerCore && launcher.product === 'chrome') {
-        const revision = process.env['PUPPETEER_CHROMIUM_REVISION'];
-        if (revision) {
-            const revisionInfo = browserFetcher.revisionInfo(revision);
-            const missingText = !revisionInfo.local
-                ? 'Tried to use PUPPETEER_CHROMIUM_REVISION env variable to launch browser but did not find executable at: ' +
-                    revisionInfo.executablePath
-                : null;
-            return { executablePath: revisionInfo.executablePath, missingText };
-        }
+
+    ws.once('close', function close() {
+      if (!called) callback(err);
+      process.nextTick(emitClose, duplex);
+    });
+    ws.terminate();
+  };
+
+  duplex._final = function (callback) {
+    if (ws.readyState === ws.CONNECTING) {
+      ws.once('open', function open() {
+        duplex._final(callback);
+      });
+      return;
     }
-    const revisionInfo = browserFetcher.revisionInfo(launcher._preferredRevision);
-    const missingText = !revisionInfo.local
-        ? `Could not find browser revision ${launcher._preferredRevision}. Run "npm install" or "yarn install" to download a browser binary.`
-        : null;
-    return { executablePath: revisionInfo.executablePath, missingText };
-}
-/**
- * @internal
- */
-function Launcher(projectRoot, preferredRevision, isPuppeteerCore, product) {
-    // puppeteer-core doesn't take into account PUPPETEER_* env variables.
-    if (!product && !isPuppeteerCore)
-        product =
-            process.env.PUPPETEER_PRODUCT ||
-                process.env.npm_config_puppeteer_product ||
-                process.env.npm_package_config_puppeteer_product;
-    switch (product) {
-        case 'firefox':
-            return new FirefoxLauncher(projectRoot, preferredRevision, isPuppeteerCore);
-        case 'chrome':
-        default:
-            if (typeof product !== 'undefined' && product !== 'chrome') {
-                /* The user gave us an incorrect product name
-                 * we'll default to launching Chrome, but log to the console
-                 * to let the user know (they've probably typoed).
-                 */
-                console.warn(`Warning: unknown product name ${product}. Falling back to chrome.`);
-            }
-            return new ChromeLauncher(projectRoot, preferredRevision, isPuppeteerCore);
+
+    // If the value of the `_socket` property is `null` it means that `ws` is a
+    // client websocket and the handshake failed. In fact, when this happens, a
+    // socket is never assigned to the websocket. Wait for the `'error'` event
+    // that will be emitted by the websocket.
+    if (ws._socket === null) return;
+
+    if (ws._socket._writableState.finished) {
+      callback();
+      if (duplex._readableState.endEmitted) duplex.destroy();
+    } else {
+      ws._socket.once('finish', function finish() {
+        // `duplex` is not destroyed here because the `'end'` event will be
+        // emitted on `duplex` after this `'finish'` event. The EOF signaling
+        // `null` chunk is, in fact, pushed when the websocket emits `'close'`.
+        callback();
+      });
+      ws.close();
     }
+  };
+
+  duplex._read = function () {
+    if (ws.readyState === ws.OPEN && !resumeOnReceiverDrain) {
+      resumeOnReceiverDrain = true;
+      if (!ws._receiver._writableState.needDrain) ws._socket.resume();
+    }
+  };
+
+  duplex._write = function (chunk, encoding, callback) {
+    if (ws.readyState === ws.CONNECTING) {
+      ws.once('open', function open() {
+        duplex._write(chunk, encoding, callback);
+      });
+      return;
+    }
+
+    ws.send(chunk, callback);
+  };
+
+  duplex.on('end', duplexOnEnd);
+  duplex.on('error', duplexOnError);
+  return duplex;
 }
-exports.default = Launcher;
+
+module.exports = createWebSocketStream;
 
 
 /***/ }),
@@ -36545,7 +38066,7 @@ const _getStream = __webpack_require__(79);
 const pFinally = __webpack_require__(697);
 const onExit = __webpack_require__(260);
 const errname = __webpack_require__(745);
-const stdio = __webpack_require__(78);
+const stdio = __webpack_require__(168);
 
 const TEN_MEGABYTES = 1000 * 1000 * 10;
 
@@ -36898,20 +38419,15 @@ module.exports.shellSync = (cmd, opts) => handleShell(module.exports.sync, cmd, 
 
 
 /***/ }),
-/* 956 */,
-/* 957 */,
-/* 958 */,
-/* 959 */,
-/* 960 */,
-/* 961 */,
-/* 962 */,
-/* 963 */
+/* 956 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.NetworkManager = exports.NetworkManagerEmittedEvents = void 0;
 /**
- * Copyright 2019 Google Inc. All rights reserved.
+ * Copyright 2017 Google Inc. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36925,536 +38441,263 @@ module.exports.shellSync = (cmd, opts) => handleShell(module.exports.sync, cmd, 
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.DOMWorld = void 0;
-const assert_1 = __webpack_require__(327);
-const helper_1 = __webpack_require__(758);
-const LifecycleWatcher_1 = __webpack_require__(660);
-const Errors_1 = __webpack_require__(24);
-const QueryHandler_1 = __webpack_require__(592);
-const environment_1 = __webpack_require__(629);
-class DOMWorld {
-    constructor(frameManager, frame, timeoutSettings) {
-        this._documentPromise = null;
-        this._contextPromise = null;
-        this._contextResolveCallback = null;
-        this._detached = false;
-        this._waitTasks = new Set();
+const EventEmitter_js_1 = __webpack_require__(258);
+const assert_js_1 = __webpack_require__(716);
+const helper_js_1 = __webpack_require__(405);
+const HTTPRequest_js_1 = __webpack_require__(320);
+const HTTPResponse_js_1 = __webpack_require__(303);
+/**
+ * We use symbols to prevent any external parties listening to these events.
+ * They are internal to Puppeteer.
+ *
+ * @internal
+ */
+exports.NetworkManagerEmittedEvents = {
+    Request: Symbol('NetworkManager.Request'),
+    Response: Symbol('NetworkManager.Response'),
+    RequestFailed: Symbol('NetworkManager.RequestFailed'),
+    RequestFinished: Symbol('NetworkManager.RequestFinished'),
+};
+/**
+ * @internal
+ */
+class NetworkManager extends EventEmitter_js_1.EventEmitter {
+    constructor(client, ignoreHTTPSErrors, frameManager) {
+        super();
+        this._requestIdToRequest = new Map();
+        this._requestIdToRequestWillBeSentEvent = new Map();
+        this._extraHTTPHeaders = {};
+        this._offline = false;
+        this._credentials = null;
+        this._attemptedAuthentications = new Set();
+        this._userRequestInterceptionEnabled = false;
+        this._protocolRequestInterceptionEnabled = false;
+        this._userCacheDisabled = false;
+        this._requestIdToInterceptionId = new Map();
+        this._client = client;
+        this._ignoreHTTPSErrors = ignoreHTTPSErrors;
         this._frameManager = frameManager;
-        this._frame = frame;
-        this._timeoutSettings = timeoutSettings;
-        this._setContext(null);
+        this._client.on('Fetch.requestPaused', this._onRequestPaused.bind(this));
+        this._client.on('Fetch.authRequired', this._onAuthRequired.bind(this));
+        this._client.on('Network.requestWillBeSent', this._onRequestWillBeSent.bind(this));
+        this._client.on('Network.requestServedFromCache', this._onRequestServedFromCache.bind(this));
+        this._client.on('Network.responseReceived', this._onResponseReceived.bind(this));
+        this._client.on('Network.loadingFinished', this._onLoadingFinished.bind(this));
+        this._client.on('Network.loadingFailed', this._onLoadingFailed.bind(this));
     }
-    frame() {
-        return this._frame;
+    async initialize() {
+        await this._client.send('Network.enable');
+        if (this._ignoreHTTPSErrors)
+            await this._client.send('Security.setIgnoreCertificateErrors', {
+                ignore: true,
+            });
     }
-    /**
-     * @param {?ExecutionContext} context
-     */
-    _setContext(context) {
-        if (context) {
-            this._contextResolveCallback.call(null, context);
-            this._contextResolveCallback = null;
-            for (const waitTask of this._waitTasks)
-                waitTask.rerun();
+    async authenticate(credentials) {
+        this._credentials = credentials;
+        await this._updateProtocolRequestInterception();
+    }
+    async setExtraHTTPHeaders(extraHTTPHeaders) {
+        this._extraHTTPHeaders = {};
+        for (const key of Object.keys(extraHTTPHeaders)) {
+            const value = extraHTTPHeaders[key];
+            assert_js_1.assert(helper_js_1.helper.isString(value), `Expected value of header "${key}" to be String, but "${typeof value}" is found.`);
+            this._extraHTTPHeaders[key.toLowerCase()] = value;
+        }
+        await this._client.send('Network.setExtraHTTPHeaders', {
+            headers: this._extraHTTPHeaders,
+        });
+    }
+    extraHTTPHeaders() {
+        return Object.assign({}, this._extraHTTPHeaders);
+    }
+    async setOfflineMode(value) {
+        if (this._offline === value)
+            return;
+        this._offline = value;
+        await this._client.send('Network.emulateNetworkConditions', {
+            offline: this._offline,
+            // values of 0 remove any active throttling. crbug.com/456324#c9
+            latency: 0,
+            downloadThroughput: -1,
+            uploadThroughput: -1,
+        });
+    }
+    async setUserAgent(userAgent) {
+        await this._client.send('Network.setUserAgentOverride', { userAgent });
+    }
+    async setCacheEnabled(enabled) {
+        this._userCacheDisabled = !enabled;
+        await this._updateProtocolCacheDisabled();
+    }
+    async setRequestInterception(value) {
+        this._userRequestInterceptionEnabled = value;
+        await this._updateProtocolRequestInterception();
+    }
+    async _updateProtocolRequestInterception() {
+        const enabled = this._userRequestInterceptionEnabled || !!this._credentials;
+        if (enabled === this._protocolRequestInterceptionEnabled)
+            return;
+        this._protocolRequestInterceptionEnabled = enabled;
+        if (enabled) {
+            await Promise.all([
+                this._updateProtocolCacheDisabled(),
+                this._client.send('Fetch.enable', {
+                    handleAuthRequests: true,
+                    patterns: [{ urlPattern: '*' }],
+                }),
+            ]);
         }
         else {
-            this._documentPromise = null;
-            this._contextPromise = new Promise((fulfill) => {
-                this._contextResolveCallback = fulfill;
-            });
+            await Promise.all([
+                this._updateProtocolCacheDisabled(),
+                this._client.send('Fetch.disable'),
+            ]);
         }
     }
-    _hasContext() {
-        return !this._contextResolveCallback;
-    }
-    _detach() {
-        this._detached = true;
-        for (const waitTask of this._waitTasks)
-            waitTask.terminate(new Error('waitForFunction failed: frame got detached.'));
-    }
-    /**
-     * @returns {!Promise<!ExecutionContext>}
-     */
-    executionContext() {
-        if (this._detached)
-            throw new Error(`Execution Context is not available in detached frame "${this._frame.url()}" (are you trying to evaluate?)`);
-        return this._contextPromise;
-    }
-    async evaluateHandle(pageFunction, ...args) {
-        const context = await this.executionContext();
-        return context.evaluateHandle(pageFunction, ...args);
-    }
-    /**
-     * @param {Function|string} pageFunction
-     * @param {!Array<*>} args
-     * @returns {!Promise<*>}
-     */
-    async evaluate(pageFunction, ...args) {
-        const context = await this.executionContext();
-        return context.evaluate(pageFunction, ...args);
-    }
-    /**
-     * @param {string} selector
-     * @returns {!Promise<?ElementHandle>}
-     */
-    async $(selector) {
-        const document = await this._document();
-        const value = await document.$(selector);
-        return value;
-    }
-    async _document() {
-        if (this._documentPromise)
-            return this._documentPromise;
-        this._documentPromise = this.executionContext().then(async (context) => {
-            const document = await context.evaluateHandle('document');
-            return document.asElement();
-        });
-        return this._documentPromise;
-    }
-    async $x(expression) {
-        const document = await this._document();
-        const value = await document.$x(expression);
-        return value;
-    }
-    async $eval(selector, pageFunction, ...args) {
-        const document = await this._document();
-        return document.$eval(selector, pageFunction, ...args);
-    }
-    async $$eval(selector, pageFunction, ...args) {
-        const document = await this._document();
-        const value = await document.$$eval(selector, pageFunction, ...args);
-        return value;
-    }
-    /**
-     * @param {string} selector
-     * @returns {!Promise<!Array<!ElementHandle>>}
-     */
-    async $$(selector) {
-        const document = await this._document();
-        const value = await document.$$(selector);
-        return value;
-    }
-    async content() {
-        return await this.evaluate(() => {
-            let retVal = '';
-            if (document.doctype)
-                retVal = new XMLSerializer().serializeToString(document.doctype);
-            if (document.documentElement)
-                retVal += document.documentElement.outerHTML;
-            return retVal;
+    async _updateProtocolCacheDisabled() {
+        await this._client.send('Network.setCacheDisabled', {
+            cacheDisabled: this._userCacheDisabled || this._protocolRequestInterceptionEnabled,
         });
     }
-    async setContent(html, options = {}) {
-        const { waitUntil = ['load'], timeout = this._timeoutSettings.navigationTimeout(), } = options;
-        // We rely upon the fact that document.open() will reset frame lifecycle with "init"
-        // lifecycle event. @see https://crrev.com/608658
-        await this.evaluate((html) => {
-            document.open();
-            document.write(html);
-            document.close();
-        }, html);
-        const watcher = new LifecycleWatcher_1.LifecycleWatcher(this._frameManager, this._frame, waitUntil, timeout);
-        const error = await Promise.race([
-            watcher.timeoutOrTerminationPromise(),
-            watcher.lifecyclePromise(),
-        ]);
-        watcher.dispose();
-        if (error)
-            throw error;
+    _onRequestWillBeSent(event) {
+        // Request interception doesn't happen for data URLs with Network Service.
+        if (this._protocolRequestInterceptionEnabled &&
+            !event.request.url.startsWith('data:')) {
+            const requestId = event.requestId;
+            const interceptionId = this._requestIdToInterceptionId.get(requestId);
+            if (interceptionId) {
+                this._onRequest(event, interceptionId);
+                this._requestIdToInterceptionId.delete(requestId);
+            }
+            else {
+                this._requestIdToRequestWillBeSentEvent.set(event.requestId, event);
+            }
+            return;
+        }
+        this._onRequest(event, null);
     }
-    /**
-     * Adds a script tag into the current context.
-     *
-     * @remarks
-     *
-     * You can pass a URL, filepath or string of contents. Note that when running Puppeteer
-     * in a browser environment you cannot pass a filepath and should use either
-     * `url` or `content`.
-     *
-     * @param options
-     */
-    async addScriptTag(options) {
-        const { url = null, path = null, content = null, type = '' } = options;
-        if (url !== null) {
-            try {
-                const context = await this.executionContext();
-                return (await context.evaluateHandle(addScriptUrl, url, type)).asElement();
-            }
-            catch (error) {
-                throw new Error(`Loading script from ${url} failed`);
-            }
+    _onAuthRequired(event) {
+        let response = 'Default';
+        if (this._attemptedAuthentications.has(event.requestId)) {
+            response = 'CancelAuth';
         }
-        if (path !== null) {
-            if (!environment_1.isNode) {
-                throw new Error('Cannot pass a filepath to addScriptTag in the browser environment.');
-            }
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const fs = __webpack_require__(747);
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const { promisify } = __webpack_require__(669);
-            const readFileAsync = promisify(fs.readFile);
-            let contents = await readFileAsync(path, 'utf8');
-            contents += '//# sourceURL=' + path.replace(/\n/g, '');
-            const context = await this.executionContext();
-            return (await context.evaluateHandle(addScriptContent, contents, type)).asElement();
+        else if (this._credentials) {
+            response = 'ProvideCredentials';
+            this._attemptedAuthentications.add(event.requestId);
         }
-        if (content !== null) {
-            const context = await this.executionContext();
-            return (await context.evaluateHandle(addScriptContent, content, type)).asElement();
+        const { username, password } = this._credentials || {
+            username: undefined,
+            password: undefined,
+        };
+        this._client
+            .send('Fetch.continueWithAuth', {
+            requestId: event.requestId,
+            authChallengeResponse: { response, username, password },
+        })
+            .catch(helper_js_1.debugError);
+    }
+    _onRequestPaused(event) {
+        if (!this._userRequestInterceptionEnabled &&
+            this._protocolRequestInterceptionEnabled) {
+            this._client
+                .send('Fetch.continueRequest', {
+                requestId: event.requestId,
+            })
+                .catch(helper_js_1.debugError);
         }
-        throw new Error('Provide an object with a `url`, `path` or `content` property');
-        async function addScriptUrl(url, type) {
-            const script = document.createElement('script');
-            script.src = url;
-            if (type)
-                script.type = type;
-            const promise = new Promise((res, rej) => {
-                script.onload = res;
-                script.onerror = rej;
-            });
-            document.head.appendChild(script);
-            await promise;
-            return script;
+        const requestId = event.networkId;
+        const interceptionId = event.requestId;
+        if (requestId && this._requestIdToRequestWillBeSentEvent.has(requestId)) {
+            const requestWillBeSentEvent = this._requestIdToRequestWillBeSentEvent.get(requestId);
+            this._onRequest(requestWillBeSentEvent, interceptionId);
+            this._requestIdToRequestWillBeSentEvent.delete(requestId);
         }
-        function addScriptContent(content, type = 'text/javascript') {
-            const script = document.createElement('script');
-            script.type = type;
-            script.text = content;
-            let error = null;
-            script.onerror = (e) => (error = e);
-            document.head.appendChild(script);
-            if (error)
-                throw error;
-            return script;
+        else {
+            this._requestIdToInterceptionId.set(requestId, interceptionId);
         }
     }
-    /**
-     * Adds a style tag into the current context.
-     *
-     * @remarks
-     *
-     * You can pass a URL, filepath or string of contents. Note that when running Puppeteer
-     * in a browser environment you cannot pass a filepath and should use either
-     * `url` or `content`.
-     *
-     * @param options
-     */
-    async addStyleTag(options) {
-        const { url = null, path = null, content = null } = options;
-        if (url !== null) {
-            try {
-                const context = await this.executionContext();
-                return (await context.evaluateHandle(addStyleUrl, url)).asElement();
-            }
-            catch (error) {
-                throw new Error(`Loading style from ${url} failed`);
+    _onRequest(event, interceptionId) {
+        let redirectChain = [];
+        if (event.redirectResponse) {
+            const request = this._requestIdToRequest.get(event.requestId);
+            // If we connect late to the target, we could have missed the
+            // requestWillBeSent event.
+            if (request) {
+                this._handleRequestRedirect(request, event.redirectResponse);
+                redirectChain = request._redirectChain;
             }
         }
-        if (path !== null) {
-            if (!environment_1.isNode) {
-                throw new Error('Cannot pass a filepath to addStyleTag in the browser environment.');
-            }
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const fs = __webpack_require__(747);
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const { promisify } = __webpack_require__(669);
-            const readFileAsync = promisify(fs.readFile);
-            let contents = await readFileAsync(path, 'utf8');
-            contents += '/*# sourceURL=' + path.replace(/\n/g, '') + '*/';
-            const context = await this.executionContext();
-            return (await context.evaluateHandle(addStyleContent, contents)).asElement();
-        }
-        if (content !== null) {
-            const context = await this.executionContext();
-            return (await context.evaluateHandle(addStyleContent, content)).asElement();
-        }
-        throw new Error('Provide an object with a `url`, `path` or `content` property');
-        async function addStyleUrl(url) {
-            const link = document.createElement('link');
-            link.rel = 'stylesheet';
-            link.href = url;
-            const promise = new Promise((res, rej) => {
-                link.onload = res;
-                link.onerror = rej;
-            });
-            document.head.appendChild(link);
-            await promise;
-            return link;
-        }
-        async function addStyleContent(content) {
-            const style = document.createElement('style');
-            style.type = 'text/css';
-            style.appendChild(document.createTextNode(content));
-            const promise = new Promise((res, rej) => {
-                style.onload = res;
-                style.onerror = rej;
-            });
-            document.head.appendChild(style);
-            await promise;
-            return style;
-        }
+        const frame = event.frameId
+            ? this._frameManager.frame(event.frameId)
+            : null;
+        const request = new HTTPRequest_js_1.HTTPRequest(this._client, frame, interceptionId, this._userRequestInterceptionEnabled, event, redirectChain);
+        this._requestIdToRequest.set(event.requestId, request);
+        this.emit(exports.NetworkManagerEmittedEvents.Request, request);
     }
-    async click(selector, options) {
-        const handle = await this.$(selector);
-        assert_1.assert(handle, 'No node found for selector: ' + selector);
-        await handle.click(options);
-        await handle.dispose();
+    _onRequestServedFromCache(event) {
+        const request = this._requestIdToRequest.get(event.requestId);
+        if (request)
+            request._fromMemoryCache = true;
     }
-    async focus(selector) {
-        const handle = await this.$(selector);
-        assert_1.assert(handle, 'No node found for selector: ' + selector);
-        await handle.focus();
-        await handle.dispose();
+    _handleRequestRedirect(request, responsePayload) {
+        const response = new HTTPResponse_js_1.HTTPResponse(this._client, request, responsePayload);
+        request._response = response;
+        request._redirectChain.push(request);
+        response._resolveBody(new Error('Response body is unavailable for redirect responses'));
+        this._requestIdToRequest.delete(request._requestId);
+        this._attemptedAuthentications.delete(request._interceptionId);
+        this.emit(exports.NetworkManagerEmittedEvents.Response, response);
+        this.emit(exports.NetworkManagerEmittedEvents.RequestFinished, request);
     }
-    async hover(selector) {
-        const handle = await this.$(selector);
-        assert_1.assert(handle, 'No node found for selector: ' + selector);
-        await handle.hover();
-        await handle.dispose();
+    _onResponseReceived(event) {
+        const request = this._requestIdToRequest.get(event.requestId);
+        // FileUpload sends a response without a matching request.
+        if (!request)
+            return;
+        const response = new HTTPResponse_js_1.HTTPResponse(this._client, request, event.response);
+        request._response = response;
+        this.emit(exports.NetworkManagerEmittedEvents.Response, response);
     }
-    async select(selector, ...values) {
-        const handle = await this.$(selector);
-        assert_1.assert(handle, 'No node found for selector: ' + selector);
-        const result = await handle.select(...values);
-        await handle.dispose();
-        return result;
+    _onLoadingFinished(event) {
+        const request = this._requestIdToRequest.get(event.requestId);
+        // For certain requestIds we never receive requestWillBeSent event.
+        // @see https://crbug.com/750469
+        if (!request)
+            return;
+        // Under certain conditions we never get the Network.responseReceived
+        // event from protocol. @see https://crbug.com/883475
+        if (request.response())
+            request.response()._resolveBody(null);
+        this._requestIdToRequest.delete(request._requestId);
+        this._attemptedAuthentications.delete(request._interceptionId);
+        this.emit(exports.NetworkManagerEmittedEvents.RequestFinished, request);
     }
-    async tap(selector) {
-        const handle = await this.$(selector);
-        assert_1.assert(handle, 'No node found for selector: ' + selector);
-        await handle.tap();
-        await handle.dispose();
-    }
-    async type(selector, text, options) {
-        const handle = await this.$(selector);
-        assert_1.assert(handle, 'No node found for selector: ' + selector);
-        await handle.type(text, options);
-        await handle.dispose();
-    }
-    waitForSelector(selector, options) {
-        return this._waitForSelectorOrXPath(selector, false, options);
-    }
-    waitForXPath(xpath, options) {
-        return this._waitForSelectorOrXPath(xpath, true, options);
-    }
-    waitForFunction(pageFunction, options = {}, ...args) {
-        const { polling = 'raf', timeout = this._timeoutSettings.timeout(), } = options;
-        return new WaitTask(this, pageFunction, undefined, 'function', polling, timeout, ...args).promise;
-    }
-    async title() {
-        return this.evaluate(() => document.title);
-    }
-    async _waitForSelectorOrXPath(selectorOrXPath, isXPath, options = {}) {
-        const { visible: waitForVisible = false, hidden: waitForHidden = false, timeout = this._timeoutSettings.timeout(), } = options;
-        const polling = waitForVisible || waitForHidden ? 'raf' : 'mutation';
-        const title = `${isXPath ? 'XPath' : 'selector'} "${selectorOrXPath}"${waitForHidden ? ' to be hidden' : ''}`;
-        const { updatedSelector, queryHandler, } = QueryHandler_1.getQueryHandlerAndSelector(selectorOrXPath, (element, selector) => document.querySelector(selector));
-        const waitTask = new WaitTask(this, predicate, queryHandler, title, polling, timeout, updatedSelector, isXPath, waitForVisible, waitForHidden);
-        const handle = await waitTask.promise;
-        if (!handle.asElement()) {
-            await handle.dispose();
-            return null;
-        }
-        return handle.asElement();
-        /**
-         * @param {string} selectorOrXPath
-         * @param {boolean} isXPath
-         * @param {boolean} waitForVisible
-         * @param {boolean} waitForHidden
-         * @returns {?Node|boolean}
-         */
-        function predicate(selectorOrXPath, isXPath, waitForVisible, waitForHidden) {
-            const node = isXPath
-                ? document.evaluate(selectorOrXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue
-                : predicateQueryHandler
-                    ? predicateQueryHandler(document, selectorOrXPath)
-                    : document.querySelector(selectorOrXPath);
-            if (!node)
-                return waitForHidden;
-            if (!waitForVisible && !waitForHidden)
-                return node;
-            const element = node.nodeType === Node.TEXT_NODE
-                ? node.parentElement
-                : node;
-            const style = window.getComputedStyle(element);
-            const isVisible = style && style.visibility !== 'hidden' && hasVisibleBoundingBox();
-            const success = waitForVisible === isVisible || waitForHidden === !isVisible;
-            return success ? node : null;
-            function hasVisibleBoundingBox() {
-                const rect = element.getBoundingClientRect();
-                return !!(rect.top || rect.bottom || rect.width || rect.height);
-            }
-        }
+    _onLoadingFailed(event) {
+        const request = this._requestIdToRequest.get(event.requestId);
+        // For certain requestIds we never receive requestWillBeSent event.
+        // @see https://crbug.com/750469
+        if (!request)
+            return;
+        request._failureText = event.errorText;
+        const response = request.response();
+        if (response)
+            response._resolveBody(null);
+        this._requestIdToRequest.delete(request._requestId);
+        this._attemptedAuthentications.delete(request._interceptionId);
+        this.emit(exports.NetworkManagerEmittedEvents.RequestFailed, request);
     }
 }
-exports.DOMWorld = DOMWorld;
-class WaitTask {
-    constructor(domWorld, predicateBody, predicateQueryHandlerBody, title, polling, timeout, ...args) {
-        this._runCount = 0;
-        this._terminated = false;
-        if (helper_1.helper.isString(polling))
-            assert_1.assert(polling === 'raf' || polling === 'mutation', 'Unknown polling option: ' + polling);
-        else if (helper_1.helper.isNumber(polling))
-            assert_1.assert(polling > 0, 'Cannot poll with non-positive interval: ' + polling);
-        else
-            throw new Error('Unknown polling options: ' + polling);
-        function getPredicateBody(predicateBody, predicateQueryHandlerBody) {
-            if (helper_1.helper.isString(predicateBody))
-                return `return (${predicateBody});`;
-            if (predicateQueryHandlerBody) {
-                return `
-          return (function wrapper(args) {
-            const predicateQueryHandler = ${predicateQueryHandlerBody};
-            return (${predicateBody})(...args);
-          })(args);`;
-            }
-            return `return (${predicateBody})(...args);`;
-        }
-        this._domWorld = domWorld;
-        this._polling = polling;
-        this._timeout = timeout;
-        this._predicateBody = getPredicateBody(predicateBody, predicateQueryHandlerBody);
-        this._args = args;
-        this._runCount = 0;
-        domWorld._waitTasks.add(this);
-        this.promise = new Promise((resolve, reject) => {
-            this._resolve = resolve;
-            this._reject = reject;
-        });
-        // Since page navigation requires us to re-install the pageScript, we should track
-        // timeout on our end.
-        if (timeout) {
-            const timeoutError = new Errors_1.TimeoutError(`waiting for ${title} failed: timeout ${timeout}ms exceeded`);
-            this._timeoutTimer = setTimeout(() => this.terminate(timeoutError), timeout);
-        }
-        this.rerun();
-    }
-    terminate(error) {
-        this._terminated = true;
-        this._reject(error);
-        this._cleanup();
-    }
-    async rerun() {
-        const runCount = ++this._runCount;
-        /** @type {?JSHandle} */
-        let success = null;
-        let error = null;
-        try {
-            success = await (await this._domWorld.executionContext()).evaluateHandle(waitForPredicatePageFunction, this._predicateBody, this._polling, this._timeout, ...this._args);
-        }
-        catch (error_) {
-            error = error_;
-        }
-        if (this._terminated || runCount !== this._runCount) {
-            if (success)
-                await success.dispose();
-            return;
-        }
-        // Ignore timeouts in pageScript - we track timeouts ourselves.
-        // If the frame's execution context has already changed, `frame.evaluate` will
-        // throw an error - ignore this predicate run altogether.
-        if (!error &&
-            (await this._domWorld.evaluate((s) => !s, success).catch(() => true))) {
-            await success.dispose();
-            return;
-        }
-        // When the page is navigated, the promise is rejected.
-        // We will try again in the new execution context.
-        if (error && error.message.includes('Execution context was destroyed'))
-            return;
-        // We could have tried to evaluate in a context which was already
-        // destroyed.
-        if (error &&
-            error.message.includes('Cannot find context with specified id'))
-            return;
-        if (error)
-            this._reject(error);
-        else
-            this._resolve(success);
-        this._cleanup();
-    }
-    _cleanup() {
-        clearTimeout(this._timeoutTimer);
-        this._domWorld._waitTasks.delete(this);
-    }
-}
-async function waitForPredicatePageFunction(predicateBody, polling, timeout, ...args) {
-    const predicate = new Function('...args', predicateBody);
-    let timedOut = false;
-    if (timeout)
-        setTimeout(() => (timedOut = true), timeout);
-    if (polling === 'raf')
-        return await pollRaf();
-    if (polling === 'mutation')
-        return await pollMutation();
-    if (typeof polling === 'number')
-        return await pollInterval(polling);
-    /**
-     * @returns {!Promise<*>}
-     */
-    async function pollMutation() {
-        const success = await predicate(...args);
-        if (success)
-            return Promise.resolve(success);
-        let fulfill;
-        const result = new Promise((x) => (fulfill = x));
-        const observer = new MutationObserver(async () => {
-            if (timedOut) {
-                observer.disconnect();
-                fulfill();
-            }
-            const success = await predicate(...args);
-            if (success) {
-                observer.disconnect();
-                fulfill(success);
-            }
-        });
-        observer.observe(document, {
-            childList: true,
-            subtree: true,
-            attributes: true,
-        });
-        return result;
-    }
-    async function pollRaf() {
-        let fulfill;
-        const result = new Promise((x) => (fulfill = x));
-        await onRaf();
-        return result;
-        async function onRaf() {
-            if (timedOut) {
-                fulfill();
-                return;
-            }
-            const success = await predicate(...args);
-            if (success)
-                fulfill(success);
-            else
-                requestAnimationFrame(onRaf);
-        }
-    }
-    async function pollInterval(pollInterval) {
-        let fulfill;
-        const result = new Promise((x) => (fulfill = x));
-        await onTimeout();
-        return result;
-        async function onTimeout() {
-            if (timedOut) {
-                fulfill();
-                return;
-            }
-            const success = await predicate(...args);
-            if (success)
-                fulfill(success);
-            else
-                setTimeout(onTimeout, pollInterval);
-        }
-    }
-}
+exports.NetworkManager = NetworkManager;
 
 
 /***/ }),
+/* 957 */,
+/* 958 */,
+/* 959 */,
+/* 960 */,
+/* 961 */,
+/* 962 */,
+/* 963 */,
 /* 964 */,
 /* 965 */
 /***/ (function(module) {
@@ -37518,454 +38761,61 @@ function pendGo(self, fn) {
 
 /***/ }),
 /* 966 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
 "use strict";
 
-/**
- * Copyright 2017 Google Inc. All rights reserved.
- *
- * Licensed under the Apache License, Version 2.0 (the 'License');
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an 'AS IS' BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.Touchscreen = exports.Mouse = exports.Keyboard = void 0;
-const assert_1 = __webpack_require__(327);
-const USKeyboardLayout_1 = __webpack_require__(254);
-/**
- * Keyboard provides an api for managing a virtual keyboard.
- * The high level api is {@link Keyboard."type"},
- * which takes raw characters and generates proper keydown, keypress/input,
- * and keyup events on your page.
- *
- * @remarks
- * For finer control, you can use {@link Keyboard.down},
- * {@link Keyboard.up}, and {@link Keyboard.sendCharacter}
- * to manually fire events as if they were generated from a real keyboard.
- *
- * On MacOS, keyboard shortcuts like `⌘ A` -\> Select All do not work.
- * See {@link https://github.com/puppeteer/puppeteer/issues/1313 | #1313}.
- *
- * @example
- * An example of holding down `Shift` in order to select and delete some text:
- * ```js
- * await page.keyboard.type('Hello World!');
- * await page.keyboard.press('ArrowLeft');
- *
- * await page.keyboard.down('Shift');
- * for (let i = 0; i < ' World'.length; i++)
- *   await page.keyboard.press('ArrowLeft');
- * await page.keyboard.up('Shift');
- *
- * await page.keyboard.press('Backspace');
- * // Result text will end up saying 'Hello!'
- * ```
- *
- * @example
- * An example of pressing `A`
- * ```js
- * await page.keyboard.down('Shift');
- * await page.keyboard.press('KeyA');
- * await page.keyboard.up('Shift');
- * ```
- *
- * @public
- */
-class Keyboard {
-    /** @internal */
-    constructor(client) {
-        /** @internal */
-        this._modifiers = 0;
-        this._pressedKeys = new Set();
-        this._client = client;
-    }
-    /**
-     * Dispatches a `keydown` event.
-     *
-     * @remarks
-     * If `key` is a single character and no modifier keys besides `Shift`
-     * are being held down, a `keypress`/`input` event will also generated.
-     * The `text` option can be specified to force an input event to be generated.
-     * If `key` is a modifier key, `Shift`, `Meta`, `Control`, or `Alt`,
-     * subsequent key presses will be sent with that modifier active.
-     * To release the modifier key, use {@link Keyboard.up}.
-     *
-     * After the key is pressed once, subsequent calls to
-     * {@link Keyboard.down} will have
-     * {@link https://developer.mozilla.org/en-US/docs/Web/API/KeyboardEvent/repeat | repeat}
-     * set to true. To release the key, use {@link Keyboard.up}.
-     *
-     * Modifier keys DO influence {@link Keyboard.down}.
-     * Holding down `Shift` will type the text in upper case.
-     *
-     * @param key - Name of key to press, such as `ArrowLeft`.
-     * See {@link KeyInput} for a list of all key names.
-     *
-     * @param options - An object of options. Accepts text which, if specified,
-     * generates an input event with this text.
-     */
-    async down(key, options = { text: undefined }) {
-        const description = this._keyDescriptionForString(key);
-        const autoRepeat = this._pressedKeys.has(description.code);
-        this._pressedKeys.add(description.code);
-        this._modifiers |= this._modifierBit(description.key);
-        const text = options.text === undefined ? description.text : options.text;
-        await this._client.send('Input.dispatchKeyEvent', {
-            type: text ? 'keyDown' : 'rawKeyDown',
-            modifiers: this._modifiers,
-            windowsVirtualKeyCode: description.keyCode,
-            code: description.code,
-            key: description.key,
-            text: text,
-            unmodifiedText: text,
-            autoRepeat,
-            location: description.location,
-            isKeypad: description.location === 3,
-        });
-    }
-    _modifierBit(key) {
-        if (key === 'Alt')
-            return 1;
-        if (key === 'Control')
-            return 2;
-        if (key === 'Meta')
-            return 4;
-        if (key === 'Shift')
-            return 8;
-        return 0;
-    }
-    _keyDescriptionForString(keyString) {
-        const shift = this._modifiers & 8;
-        const description = {
-            key: '',
-            keyCode: 0,
-            code: '',
-            text: '',
-            location: 0,
-        };
-        const definition = USKeyboardLayout_1.keyDefinitions[keyString];
-        assert_1.assert(definition, `Unknown key: "${keyString}"`);
-        if (definition.key)
-            description.key = definition.key;
-        if (shift && definition.shiftKey)
-            description.key = definition.shiftKey;
-        if (definition.keyCode)
-            description.keyCode = definition.keyCode;
-        if (shift && definition.shiftKeyCode)
-            description.keyCode = definition.shiftKeyCode;
-        if (definition.code)
-            description.code = definition.code;
-        if (definition.location)
-            description.location = definition.location;
-        if (description.key.length === 1)
-            description.text = description.key;
-        if (definition.text)
-            description.text = definition.text;
-        if (shift && definition.shiftText)
-            description.text = definition.shiftText;
-        // if any modifiers besides shift are pressed, no text should be sent
-        if (this._modifiers & ~8)
-            description.text = '';
-        return description;
-    }
-    /**
-     * Dispatches a `keyup` event.
-     *
-     * @param key - Name of key to release, such as `ArrowLeft`.
-     * See {@link KeyInput | KeyInput}
-     * for a list of all key names.
-     */
-    async up(key) {
-        const description = this._keyDescriptionForString(key);
-        this._modifiers &= ~this._modifierBit(description.key);
-        this._pressedKeys.delete(description.code);
-        await this._client.send('Input.dispatchKeyEvent', {
-            type: 'keyUp',
-            modifiers: this._modifiers,
-            key: description.key,
-            windowsVirtualKeyCode: description.keyCode,
-            code: description.code,
-            location: description.location,
-        });
-    }
-    /**
-     * Dispatches a `keypress` and `input` event.
-     * This does not send a `keydown` or `keyup` event.
-     *
-     * @remarks
-     * Modifier keys DO NOT effect {@link Keyboard.sendCharacter | Keyboard.sendCharacter}.
-     * Holding down `Shift` will not type the text in upper case.
-     *
-     * @example
-     * ```js
-     * page.keyboard.sendCharacter('嗨');
-     * ```
-     *
-     * @param char - Character to send into the page.
-     */
-    async sendCharacter(char) {
-        await this._client.send('Input.insertText', { text: char });
-    }
-    charIsKey(char) {
-        return !!USKeyboardLayout_1.keyDefinitions[char];
-    }
-    /**
-     * Sends a `keydown`, `keypress`/`input`,
-     * and `keyup` event for each character in the text.
-     *
-     * @remarks
-     * To press a special key, like `Control` or `ArrowDown`,
-     * use {@link Keyboard.press}.
-     *
-     * Modifier keys DO NOT effect `keyboard.type`.
-     * Holding down `Shift` will not type the text in upper case.
-     *
-     * @example
-     * ```js
-     * await page.keyboard.type('Hello'); // Types instantly
-     * await page.keyboard.type('World', {delay: 100}); // Types slower, like a user
-     * ```
-     *
-     * @param text - A text to type into a focused element.
-     * @param options - An object of options. Accepts delay which,
-     * if specified, is the time to wait between `keydown` and `keyup` in milliseconds.
-     * Defaults to 0.
-     */
-    async type(text, options = {}) {
-        const delay = options.delay || null;
-        for (const char of text) {
-            if (this.charIsKey(char)) {
-                await this.press(char, { delay });
-            }
-            else {
-                if (delay)
-                    await new Promise((f) => setTimeout(f, delay));
-                await this.sendCharacter(char);
-            }
-        }
-    }
-    /**
-     * Shortcut for {@link Keyboard.down}
-     * and {@link Keyboard.up}.
-     *
-     * @remarks
-     * If `key` is a single character and no modifier keys besides `Shift`
-     * are being held down, a `keypress`/`input` event will also generated.
-     * The `text` option can be specified to force an input event to be generated.
-     *
-     * Modifier keys DO effect {@link Keyboard.press}.
-     * Holding down `Shift` will type the text in upper case.
-     *
-     * @param key - Name of key to press, such as `ArrowLeft`.
-     * See {@link KeyInput} for a list of all key names.
-     *
-     * @param options - An object of options. Accepts text which, if specified,
-     * generates an input event with this text. Accepts delay which,
-     * if specified, is the time to wait between `keydown` and `keyup` in milliseconds.
-     * Defaults to 0.
-     */
-    async press(key, options = {}) {
-        const { delay = null } = options;
-        await this.down(key, options);
-        if (delay)
-            await new Promise((f) => setTimeout(f, options.delay));
-        await this.up(key);
-    }
-}
-exports.Keyboard = Keyboard;
-/**
- * The Mouse class operates in main-frame CSS pixels
- * relative to the top-left corner of the viewport.
- * @remarks
- * Every `page` object has its own Mouse, accessible with [`page.mouse`](#pagemouse).
- *
- * @example
- * ```js
- * // Using ‘page.mouse’ to trace a 100x100 square.
- * await page.mouse.move(0, 0);
- * await page.mouse.down();
- * await page.mouse.move(0, 100);
- * await page.mouse.move(100, 100);
- * await page.mouse.move(100, 0);
- * await page.mouse.move(0, 0);
- * await page.mouse.up();
- * ```
- *
- * **Note**: The mouse events trigger synthetic `MouseEvent`s.
- * This means that it does not fully replicate the functionality of what a normal user
- * would be able to do with their mouse.
- *
- * For example, dragging and selecting text is not possible using `page.mouse`.
- * Instead, you can use the {@link https://developer.mozilla.org/en-US/docs/Web/API/DocumentOrShadowRoot/getSelection | `DocumentOrShadowRoot.getSelection()`} functionality implemented in the platform.
- *
- * @example
- * For example, if you want to select all content between nodes:
- * ```js
- * await page.evaluate((from, to) => {
- *   const selection = from.getRootNode().getSelection();
- *   const range = document.createRange();
- *   range.setStartBefore(from);
- *   range.setEndAfter(to);
- *   selection.removeAllRanges();
- *   selection.addRange(range);
- * }, fromJSHandle, toJSHandle);
- * ```
- * If you then would want to copy-paste your selection, you can use the clipboard api:
- * ```js
- * // The clipboard api does not allow you to copy, unless the tab is focused.
- * await page.bringToFront();
- * await page.evaluate(() => {
- *   // Copy the selected content to the clipboard
- *   document.execCommand('copy');
- *   // Obtain the content of the clipboard as a string
- *   return navigator.clipboard.readText();
- * });
- * ```
- * **Note**: If you want access to the clipboard API,
- * you have to give it permission to do so:
- * ```js
- * await browser.defaultBrowserContext().overridePermissions(
- *   '<your origin>', ['clipboard-read', 'clipboard-write']
- * );
- * ```
- * @public
- */
-class Mouse {
-    /**
-     * @internal
-     */
-    constructor(client, keyboard) {
-        this._x = 0;
-        this._y = 0;
-        this._button = 'none';
-        this._client = client;
-        this._keyboard = keyboard;
-    }
-    /**
-     * Dispatches a `mousemove` event.
-     * @param x - Horizontal position of the mouse.
-     * @param y - Vertical position of the mouse.
-     * @param options - Optional object. If specified, the `steps` property
-     * sends intermediate `mousemove` events when set to `1` (default).
-     */
-    async move(x, y, options = {}) {
-        const { steps = 1 } = options;
-        const fromX = this._x, fromY = this._y;
-        this._x = x;
-        this._y = y;
-        for (let i = 1; i <= steps; i++) {
-            await this._client.send('Input.dispatchMouseEvent', {
-                type: 'mouseMoved',
-                button: this._button,
-                x: fromX + (this._x - fromX) * (i / steps),
-                y: fromY + (this._y - fromY) * (i / steps),
-                modifiers: this._keyboard._modifiers,
-            });
-        }
-    }
-    /**
-     * Shortcut for `mouse.move`, `mouse.down` and `mouse.up`.
-     * @param x - Horizontal position of the mouse.
-     * @param y - Vertical position of the mouse.
-     * @param options - Optional `MouseOptions`.
-     */
-    async click(x, y, options = {}) {
-        const { delay = null } = options;
-        if (delay !== null) {
-            await Promise.all([this.move(x, y), this.down(options)]);
-            await new Promise((f) => setTimeout(f, delay));
-            await this.up(options);
-        }
-        else {
-            await Promise.all([
-                this.move(x, y),
-                this.down(options),
-                this.up(options),
-            ]);
-        }
-    }
-    /**
-     * Dispatches a `mousedown` event.
-     * @param options - Optional `MouseOptions`.
-     */
-    async down(options = {}) {
-        const { button = 'left', clickCount = 1 } = options;
-        this._button = button;
-        await this._client.send('Input.dispatchMouseEvent', {
-            type: 'mousePressed',
-            button,
-            x: this._x,
-            y: this._y,
-            modifiers: this._keyboard._modifiers,
-            clickCount,
-        });
-    }
-    /**
-     * Dispatches a `mouseup` event.
-     * @param options - Optional `MouseOptions`.
-     */
-    async up(options = {}) {
-        const { button = 'left', clickCount = 1 } = options;
-        this._button = 'none';
-        await this._client.send('Input.dispatchMouseEvent', {
-            type: 'mouseReleased',
-            button,
-            x: this._x,
-            y: this._y,
-            modifiers: this._keyboard._modifiers,
-            clickCount,
-        });
-    }
-}
-exports.Mouse = Mouse;
-/**
- * The Touchscreen class exposes touchscreen events.
- * @public
- */
-class Touchscreen {
-    /**
-     * @internal
-     */
-    constructor(client, keyboard) {
-        this._client = client;
-        this._keyboard = keyboard;
-    }
-    /**
-     * Dispatches a `touchstart` and `touchend` event.
-     * @param x - Horizontal position of the tap.
-     * @param y - Vertical position of the tap.
-     */
-    async tap(x, y) {
-        // Touches appear to be lost during the first frame after navigation.
-        // This waits a frame before sending the tap.
-        // @see https://crbug.com/613219
-        await this._client.send('Runtime.evaluate', {
-            expression: 'new Promise(x => requestAnimationFrame(() => requestAnimationFrame(x)))',
-            awaitPromise: true,
-        });
-        const touchPoints = [{ x: Math.round(x), y: Math.round(y) }];
-        await this._client.send('Input.dispatchTouchEvent', {
-            type: 'touchStart',
-            touchPoints,
-            modifiers: this._keyboard._modifiers,
-        });
-        await this._client.send('Input.dispatchTouchEvent', {
-            type: 'touchEnd',
-            touchPoints: [],
-            modifiers: this._keyboard._modifiers,
-        });
-    }
-}
-exports.Touchscreen = Touchscreen;
+const {PassThrough: PassThroughStream} = __webpack_require__(413);
+
+module.exports = options => {
+	options = {...options};
+
+	const {array} = options;
+	let {encoding} = options;
+	const isBuffer = encoding === 'buffer';
+	let objectMode = false;
+
+	if (array) {
+		objectMode = !(encoding || isBuffer);
+	} else {
+		encoding = encoding || 'utf8';
+	}
+
+	if (isBuffer) {
+		encoding = null;
+	}
+
+	const stream = new PassThroughStream({objectMode});
+
+	if (encoding) {
+		stream.setEncoding(encoding);
+	}
+
+	let length = 0;
+	const chunks = [];
+
+	stream.on('data', chunk => {
+		chunks.push(chunk);
+
+		if (objectMode) {
+			length = chunks.length;
+		} else {
+			length += chunk.length;
+		}
+	});
+
+	stream.getBufferedValue = () => {
+		if (array) {
+			return chunks;
+		}
+
+		return isBuffer ? Buffer.concat(chunks, length) : chunks.join('');
+	};
+
+	stream.getBufferedLength = () => length;
+
+	return stream;
+};
 
 
 /***/ }),
@@ -37977,8 +38827,7 @@ exports.Touchscreen = Touchscreen;
 /* 972 */,
 /* 973 */,
 /* 974 */,
-/* 975 */,
-/* 976 */
+/* 975 */
 /***/ (function(__unusedmodule, exports) {
 
 "use strict";
@@ -37999,50 +38848,14 @@ exports.Touchscreen = Touchscreen;
  * limitations under the License.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.ConsoleMessage = void 0;
-/**
- * ConsoleMessage objects are dispatched by page via the 'console' event.
- * @public
- */
-class ConsoleMessage {
-    /**
-     * @public
-     */
-    constructor(type, text, args, location = {}) {
-        this._type = type;
-        this._text = text;
-        this._args = args;
-        this._location = location;
-    }
-    /**
-     * @returns The type of the console message.
-     */
-    type() {
-        return this._type;
-    }
-    /**
-     * @returns The text of the console message.
-     */
-    text() {
-        return this._text;
-    }
-    /**
-     * @returns An array of arguments passed to the console.
-     */
-    args() {
-        return this._args;
-    }
-    /**
-     * @returns The location of the console message.
-     */
-    location() {
-        return this._location;
-    }
-}
-exports.ConsoleMessage = ConsoleMessage;
+exports.isNode = void 0;
+exports.isNode = !!(typeof process !== 'undefined' &&
+    process.versions &&
+    process.versions.node);
 
 
 /***/ }),
+/* 976 */,
 /* 977 */,
 /* 978 */,
 /* 979 */,
@@ -38050,13 +38863,170 @@ exports.ConsoleMessage = ConsoleMessage;
 /* 981 */,
 /* 982 */,
 /* 983 */
-/***/ (function(module) {
+/***/ (function(__unusedmodule, exports) {
 
-module.exports = {"application/prs.cww":["cww"],"application/vnd.1000minds.decision-model+xml":["1km"],"application/vnd.3gpp.pic-bw-large":["plb"],"application/vnd.3gpp.pic-bw-small":["psb"],"application/vnd.3gpp.pic-bw-var":["pvb"],"application/vnd.3gpp2.tcap":["tcap"],"application/vnd.3m.post-it-notes":["pwn"],"application/vnd.accpac.simply.aso":["aso"],"application/vnd.accpac.simply.imp":["imp"],"application/vnd.acucobol":["acu"],"application/vnd.acucorp":["atc","acutc"],"application/vnd.adobe.air-application-installer-package+zip":["air"],"application/vnd.adobe.formscentral.fcdt":["fcdt"],"application/vnd.adobe.fxp":["fxp","fxpl"],"application/vnd.adobe.xdp+xml":["xdp"],"application/vnd.adobe.xfdf":["xfdf"],"application/vnd.ahead.space":["ahead"],"application/vnd.airzip.filesecure.azf":["azf"],"application/vnd.airzip.filesecure.azs":["azs"],"application/vnd.amazon.ebook":["azw"],"application/vnd.americandynamics.acc":["acc"],"application/vnd.amiga.ami":["ami"],"application/vnd.android.package-archive":["apk"],"application/vnd.anser-web-certificate-issue-initiation":["cii"],"application/vnd.anser-web-funds-transfer-initiation":["fti"],"application/vnd.antix.game-component":["atx"],"application/vnd.apple.installer+xml":["mpkg"],"application/vnd.apple.keynote":["keynote"],"application/vnd.apple.mpegurl":["m3u8"],"application/vnd.apple.numbers":["numbers"],"application/vnd.apple.pages":["pages"],"application/vnd.apple.pkpass":["pkpass"],"application/vnd.aristanetworks.swi":["swi"],"application/vnd.astraea-software.iota":["iota"],"application/vnd.audiograph":["aep"],"application/vnd.balsamiq.bmml+xml":["bmml"],"application/vnd.blueice.multipass":["mpm"],"application/vnd.bmi":["bmi"],"application/vnd.businessobjects":["rep"],"application/vnd.chemdraw+xml":["cdxml"],"application/vnd.chipnuts.karaoke-mmd":["mmd"],"application/vnd.cinderella":["cdy"],"application/vnd.citationstyles.style+xml":["csl"],"application/vnd.claymore":["cla"],"application/vnd.cloanto.rp9":["rp9"],"application/vnd.clonk.c4group":["c4g","c4d","c4f","c4p","c4u"],"application/vnd.cluetrust.cartomobile-config":["c11amc"],"application/vnd.cluetrust.cartomobile-config-pkg":["c11amz"],"application/vnd.commonspace":["csp"],"application/vnd.contact.cmsg":["cdbcmsg"],"application/vnd.cosmocaller":["cmc"],"application/vnd.crick.clicker":["clkx"],"application/vnd.crick.clicker.keyboard":["clkk"],"application/vnd.crick.clicker.palette":["clkp"],"application/vnd.crick.clicker.template":["clkt"],"application/vnd.crick.clicker.wordbank":["clkw"],"application/vnd.criticaltools.wbs+xml":["wbs"],"application/vnd.ctc-posml":["pml"],"application/vnd.cups-ppd":["ppd"],"application/vnd.curl.car":["car"],"application/vnd.curl.pcurl":["pcurl"],"application/vnd.dart":["dart"],"application/vnd.data-vision.rdz":["rdz"],"application/vnd.dece.data":["uvf","uvvf","uvd","uvvd"],"application/vnd.dece.ttml+xml":["uvt","uvvt"],"application/vnd.dece.unspecified":["uvx","uvvx"],"application/vnd.dece.zip":["uvz","uvvz"],"application/vnd.denovo.fcselayout-link":["fe_launch"],"application/vnd.dna":["dna"],"application/vnd.dolby.mlp":["mlp"],"application/vnd.dpgraph":["dpg"],"application/vnd.dreamfactory":["dfac"],"application/vnd.ds-keypoint":["kpxx"],"application/vnd.dvb.ait":["ait"],"application/vnd.dvb.service":["svc"],"application/vnd.dynageo":["geo"],"application/vnd.ecowin.chart":["mag"],"application/vnd.enliven":["nml"],"application/vnd.epson.esf":["esf"],"application/vnd.epson.msf":["msf"],"application/vnd.epson.quickanime":["qam"],"application/vnd.epson.salt":["slt"],"application/vnd.epson.ssf":["ssf"],"application/vnd.eszigno3+xml":["es3","et3"],"application/vnd.ezpix-album":["ez2"],"application/vnd.ezpix-package":["ez3"],"application/vnd.fdf":["fdf"],"application/vnd.fdsn.mseed":["mseed"],"application/vnd.fdsn.seed":["seed","dataless"],"application/vnd.flographit":["gph"],"application/vnd.fluxtime.clip":["ftc"],"application/vnd.framemaker":["fm","frame","maker","book"],"application/vnd.frogans.fnc":["fnc"],"application/vnd.frogans.ltf":["ltf"],"application/vnd.fsc.weblaunch":["fsc"],"application/vnd.fujitsu.oasys":["oas"],"application/vnd.fujitsu.oasys2":["oa2"],"application/vnd.fujitsu.oasys3":["oa3"],"application/vnd.fujitsu.oasysgp":["fg5"],"application/vnd.fujitsu.oasysprs":["bh2"],"application/vnd.fujixerox.ddd":["ddd"],"application/vnd.fujixerox.docuworks":["xdw"],"application/vnd.fujixerox.docuworks.binder":["xbd"],"application/vnd.fuzzysheet":["fzs"],"application/vnd.genomatix.tuxedo":["txd"],"application/vnd.geogebra.file":["ggb"],"application/vnd.geogebra.tool":["ggt"],"application/vnd.geometry-explorer":["gex","gre"],"application/vnd.geonext":["gxt"],"application/vnd.geoplan":["g2w"],"application/vnd.geospace":["g3w"],"application/vnd.gmx":["gmx"],"application/vnd.google-apps.document":["gdoc"],"application/vnd.google-apps.presentation":["gslides"],"application/vnd.google-apps.spreadsheet":["gsheet"],"application/vnd.google-earth.kml+xml":["kml"],"application/vnd.google-earth.kmz":["kmz"],"application/vnd.grafeq":["gqf","gqs"],"application/vnd.groove-account":["gac"],"application/vnd.groove-help":["ghf"],"application/vnd.groove-identity-message":["gim"],"application/vnd.groove-injector":["grv"],"application/vnd.groove-tool-message":["gtm"],"application/vnd.groove-tool-template":["tpl"],"application/vnd.groove-vcard":["vcg"],"application/vnd.hal+xml":["hal"],"application/vnd.handheld-entertainment+xml":["zmm"],"application/vnd.hbci":["hbci"],"application/vnd.hhe.lesson-player":["les"],"application/vnd.hp-hpgl":["hpgl"],"application/vnd.hp-hpid":["hpid"],"application/vnd.hp-hps":["hps"],"application/vnd.hp-jlyt":["jlt"],"application/vnd.hp-pcl":["pcl"],"application/vnd.hp-pclxl":["pclxl"],"application/vnd.hydrostatix.sof-data":["sfd-hdstx"],"application/vnd.ibm.minipay":["mpy"],"application/vnd.ibm.modcap":["afp","listafp","list3820"],"application/vnd.ibm.rights-management":["irm"],"application/vnd.ibm.secure-container":["sc"],"application/vnd.iccprofile":["icc","icm"],"application/vnd.igloader":["igl"],"application/vnd.immervision-ivp":["ivp"],"application/vnd.immervision-ivu":["ivu"],"application/vnd.insors.igm":["igm"],"application/vnd.intercon.formnet":["xpw","xpx"],"application/vnd.intergeo":["i2g"],"application/vnd.intu.qbo":["qbo"],"application/vnd.intu.qfx":["qfx"],"application/vnd.ipunplugged.rcprofile":["rcprofile"],"application/vnd.irepository.package+xml":["irp"],"application/vnd.is-xpr":["xpr"],"application/vnd.isac.fcs":["fcs"],"application/vnd.jam":["jam"],"application/vnd.jcp.javame.midlet-rms":["rms"],"application/vnd.jisp":["jisp"],"application/vnd.joost.joda-archive":["joda"],"application/vnd.kahootz":["ktz","ktr"],"application/vnd.kde.karbon":["karbon"],"application/vnd.kde.kchart":["chrt"],"application/vnd.kde.kformula":["kfo"],"application/vnd.kde.kivio":["flw"],"application/vnd.kde.kontour":["kon"],"application/vnd.kde.kpresenter":["kpr","kpt"],"application/vnd.kde.kspread":["ksp"],"application/vnd.kde.kword":["kwd","kwt"],"application/vnd.kenameaapp":["htke"],"application/vnd.kidspiration":["kia"],"application/vnd.kinar":["kne","knp"],"application/vnd.koan":["skp","skd","skt","skm"],"application/vnd.kodak-descriptor":["sse"],"application/vnd.las.las+xml":["lasxml"],"application/vnd.llamagraphics.life-balance.desktop":["lbd"],"application/vnd.llamagraphics.life-balance.exchange+xml":["lbe"],"application/vnd.lotus-1-2-3":["123"],"application/vnd.lotus-approach":["apr"],"application/vnd.lotus-freelance":["pre"],"application/vnd.lotus-notes":["nsf"],"application/vnd.lotus-organizer":["org"],"application/vnd.lotus-screencam":["scm"],"application/vnd.lotus-wordpro":["lwp"],"application/vnd.macports.portpkg":["portpkg"],"application/vnd.mcd":["mcd"],"application/vnd.medcalcdata":["mc1"],"application/vnd.mediastation.cdkey":["cdkey"],"application/vnd.mfer":["mwf"],"application/vnd.mfmp":["mfm"],"application/vnd.micrografx.flo":["flo"],"application/vnd.micrografx.igx":["igx"],"application/vnd.mif":["mif"],"application/vnd.mobius.daf":["daf"],"application/vnd.mobius.dis":["dis"],"application/vnd.mobius.mbk":["mbk"],"application/vnd.mobius.mqy":["mqy"],"application/vnd.mobius.msl":["msl"],"application/vnd.mobius.plc":["plc"],"application/vnd.mobius.txf":["txf"],"application/vnd.mophun.application":["mpn"],"application/vnd.mophun.certificate":["mpc"],"application/vnd.mozilla.xul+xml":["xul"],"application/vnd.ms-artgalry":["cil"],"application/vnd.ms-cab-compressed":["cab"],"application/vnd.ms-excel":["xls","xlm","xla","xlc","xlt","xlw"],"application/vnd.ms-excel.addin.macroenabled.12":["xlam"],"application/vnd.ms-excel.sheet.binary.macroenabled.12":["xlsb"],"application/vnd.ms-excel.sheet.macroenabled.12":["xlsm"],"application/vnd.ms-excel.template.macroenabled.12":["xltm"],"application/vnd.ms-fontobject":["eot"],"application/vnd.ms-htmlhelp":["chm"],"application/vnd.ms-ims":["ims"],"application/vnd.ms-lrm":["lrm"],"application/vnd.ms-officetheme":["thmx"],"application/vnd.ms-outlook":["msg"],"application/vnd.ms-pki.seccat":["cat"],"application/vnd.ms-pki.stl":["*stl"],"application/vnd.ms-powerpoint":["ppt","pps","pot"],"application/vnd.ms-powerpoint.addin.macroenabled.12":["ppam"],"application/vnd.ms-powerpoint.presentation.macroenabled.12":["pptm"],"application/vnd.ms-powerpoint.slide.macroenabled.12":["sldm"],"application/vnd.ms-powerpoint.slideshow.macroenabled.12":["ppsm"],"application/vnd.ms-powerpoint.template.macroenabled.12":["potm"],"application/vnd.ms-project":["mpp","mpt"],"application/vnd.ms-word.document.macroenabled.12":["docm"],"application/vnd.ms-word.template.macroenabled.12":["dotm"],"application/vnd.ms-works":["wps","wks","wcm","wdb"],"application/vnd.ms-wpl":["wpl"],"application/vnd.ms-xpsdocument":["xps"],"application/vnd.mseq":["mseq"],"application/vnd.musician":["mus"],"application/vnd.muvee.style":["msty"],"application/vnd.mynfc":["taglet"],"application/vnd.neurolanguage.nlu":["nlu"],"application/vnd.nitf":["ntf","nitf"],"application/vnd.noblenet-directory":["nnd"],"application/vnd.noblenet-sealer":["nns"],"application/vnd.noblenet-web":["nnw"],"application/vnd.nokia.n-gage.ac+xml":["*ac"],"application/vnd.nokia.n-gage.data":["ngdat"],"application/vnd.nokia.n-gage.symbian.install":["n-gage"],"application/vnd.nokia.radio-preset":["rpst"],"application/vnd.nokia.radio-presets":["rpss"],"application/vnd.novadigm.edm":["edm"],"application/vnd.novadigm.edx":["edx"],"application/vnd.novadigm.ext":["ext"],"application/vnd.oasis.opendocument.chart":["odc"],"application/vnd.oasis.opendocument.chart-template":["otc"],"application/vnd.oasis.opendocument.database":["odb"],"application/vnd.oasis.opendocument.formula":["odf"],"application/vnd.oasis.opendocument.formula-template":["odft"],"application/vnd.oasis.opendocument.graphics":["odg"],"application/vnd.oasis.opendocument.graphics-template":["otg"],"application/vnd.oasis.opendocument.image":["odi"],"application/vnd.oasis.opendocument.image-template":["oti"],"application/vnd.oasis.opendocument.presentation":["odp"],"application/vnd.oasis.opendocument.presentation-template":["otp"],"application/vnd.oasis.opendocument.spreadsheet":["ods"],"application/vnd.oasis.opendocument.spreadsheet-template":["ots"],"application/vnd.oasis.opendocument.text":["odt"],"application/vnd.oasis.opendocument.text-master":["odm"],"application/vnd.oasis.opendocument.text-template":["ott"],"application/vnd.oasis.opendocument.text-web":["oth"],"application/vnd.olpc-sugar":["xo"],"application/vnd.oma.dd2+xml":["dd2"],"application/vnd.openblox.game+xml":["obgx"],"application/vnd.openofficeorg.extension":["oxt"],"application/vnd.openstreetmap.data+xml":["osm"],"application/vnd.openxmlformats-officedocument.presentationml.presentation":["pptx"],"application/vnd.openxmlformats-officedocument.presentationml.slide":["sldx"],"application/vnd.openxmlformats-officedocument.presentationml.slideshow":["ppsx"],"application/vnd.openxmlformats-officedocument.presentationml.template":["potx"],"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":["xlsx"],"application/vnd.openxmlformats-officedocument.spreadsheetml.template":["xltx"],"application/vnd.openxmlformats-officedocument.wordprocessingml.document":["docx"],"application/vnd.openxmlformats-officedocument.wordprocessingml.template":["dotx"],"application/vnd.osgeo.mapguide.package":["mgp"],"application/vnd.osgi.dp":["dp"],"application/vnd.osgi.subsystem":["esa"],"application/vnd.palm":["pdb","pqa","oprc"],"application/vnd.pawaafile":["paw"],"application/vnd.pg.format":["str"],"application/vnd.pg.osasli":["ei6"],"application/vnd.picsel":["efif"],"application/vnd.pmi.widget":["wg"],"application/vnd.pocketlearn":["plf"],"application/vnd.powerbuilder6":["pbd"],"application/vnd.previewsystems.box":["box"],"application/vnd.proteus.magazine":["mgz"],"application/vnd.publishare-delta-tree":["qps"],"application/vnd.pvi.ptid1":["ptid"],"application/vnd.quark.quarkxpress":["qxd","qxt","qwd","qwt","qxl","qxb"],"application/vnd.realvnc.bed":["bed"],"application/vnd.recordare.musicxml":["mxl"],"application/vnd.recordare.musicxml+xml":["musicxml"],"application/vnd.rig.cryptonote":["cryptonote"],"application/vnd.rim.cod":["cod"],"application/vnd.rn-realmedia":["rm"],"application/vnd.rn-realmedia-vbr":["rmvb"],"application/vnd.route66.link66+xml":["link66"],"application/vnd.sailingtracker.track":["st"],"application/vnd.seemail":["see"],"application/vnd.sema":["sema"],"application/vnd.semd":["semd"],"application/vnd.semf":["semf"],"application/vnd.shana.informed.formdata":["ifm"],"application/vnd.shana.informed.formtemplate":["itp"],"application/vnd.shana.informed.interchange":["iif"],"application/vnd.shana.informed.package":["ipk"],"application/vnd.simtech-mindmapper":["twd","twds"],"application/vnd.smaf":["mmf"],"application/vnd.smart.teacher":["teacher"],"application/vnd.software602.filler.form+xml":["fo"],"application/vnd.solent.sdkm+xml":["sdkm","sdkd"],"application/vnd.spotfire.dxp":["dxp"],"application/vnd.spotfire.sfs":["sfs"],"application/vnd.stardivision.calc":["sdc"],"application/vnd.stardivision.draw":["sda"],"application/vnd.stardivision.impress":["sdd"],"application/vnd.stardivision.math":["smf"],"application/vnd.stardivision.writer":["sdw","vor"],"application/vnd.stardivision.writer-global":["sgl"],"application/vnd.stepmania.package":["smzip"],"application/vnd.stepmania.stepchart":["sm"],"application/vnd.sun.wadl+xml":["wadl"],"application/vnd.sun.xml.calc":["sxc"],"application/vnd.sun.xml.calc.template":["stc"],"application/vnd.sun.xml.draw":["sxd"],"application/vnd.sun.xml.draw.template":["std"],"application/vnd.sun.xml.impress":["sxi"],"application/vnd.sun.xml.impress.template":["sti"],"application/vnd.sun.xml.math":["sxm"],"application/vnd.sun.xml.writer":["sxw"],"application/vnd.sun.xml.writer.global":["sxg"],"application/vnd.sun.xml.writer.template":["stw"],"application/vnd.sus-calendar":["sus","susp"],"application/vnd.svd":["svd"],"application/vnd.symbian.install":["sis","sisx"],"application/vnd.syncml+xml":["xsm"],"application/vnd.syncml.dm+wbxml":["bdm"],"application/vnd.syncml.dm+xml":["xdm"],"application/vnd.syncml.dmddf+xml":["ddf"],"application/vnd.tao.intent-module-archive":["tao"],"application/vnd.tcpdump.pcap":["pcap","cap","dmp"],"application/vnd.tmobile-livetv":["tmo"],"application/vnd.trid.tpt":["tpt"],"application/vnd.triscape.mxs":["mxs"],"application/vnd.trueapp":["tra"],"application/vnd.ufdl":["ufd","ufdl"],"application/vnd.uiq.theme":["utz"],"application/vnd.umajin":["umj"],"application/vnd.unity":["unityweb"],"application/vnd.uoml+xml":["uoml"],"application/vnd.vcx":["vcx"],"application/vnd.visio":["vsd","vst","vss","vsw"],"application/vnd.visionary":["vis"],"application/vnd.vsf":["vsf"],"application/vnd.wap.wbxml":["wbxml"],"application/vnd.wap.wmlc":["wmlc"],"application/vnd.wap.wmlscriptc":["wmlsc"],"application/vnd.webturbo":["wtb"],"application/vnd.wolfram.player":["nbp"],"application/vnd.wordperfect":["wpd"],"application/vnd.wqd":["wqd"],"application/vnd.wt.stf":["stf"],"application/vnd.xara":["xar"],"application/vnd.xfdl":["xfdl"],"application/vnd.yamaha.hv-dic":["hvd"],"application/vnd.yamaha.hv-script":["hvs"],"application/vnd.yamaha.hv-voice":["hvp"],"application/vnd.yamaha.openscoreformat":["osf"],"application/vnd.yamaha.openscoreformat.osfpvg+xml":["osfpvg"],"application/vnd.yamaha.smaf-audio":["saf"],"application/vnd.yamaha.smaf-phrase":["spf"],"application/vnd.yellowriver-custom-menu":["cmp"],"application/vnd.zul":["zir","zirz"],"application/vnd.zzazz.deck+xml":["zaz"],"application/x-7z-compressed":["7z"],"application/x-abiword":["abw"],"application/x-ace-compressed":["ace"],"application/x-apple-diskimage":["*dmg"],"application/x-arj":["arj"],"application/x-authorware-bin":["aab","x32","u32","vox"],"application/x-authorware-map":["aam"],"application/x-authorware-seg":["aas"],"application/x-bcpio":["bcpio"],"application/x-bdoc":["*bdoc"],"application/x-bittorrent":["torrent"],"application/x-blorb":["blb","blorb"],"application/x-bzip":["bz"],"application/x-bzip2":["bz2","boz"],"application/x-cbr":["cbr","cba","cbt","cbz","cb7"],"application/x-cdlink":["vcd"],"application/x-cfs-compressed":["cfs"],"application/x-chat":["chat"],"application/x-chess-pgn":["pgn"],"application/x-chrome-extension":["crx"],"application/x-cocoa":["cco"],"application/x-conference":["nsc"],"application/x-cpio":["cpio"],"application/x-csh":["csh"],"application/x-debian-package":["*deb","udeb"],"application/x-dgc-compressed":["dgc"],"application/x-director":["dir","dcr","dxr","cst","cct","cxt","w3d","fgd","swa"],"application/x-doom":["wad"],"application/x-dtbncx+xml":["ncx"],"application/x-dtbook+xml":["dtb"],"application/x-dtbresource+xml":["res"],"application/x-dvi":["dvi"],"application/x-envoy":["evy"],"application/x-eva":["eva"],"application/x-font-bdf":["bdf"],"application/x-font-ghostscript":["gsf"],"application/x-font-linux-psf":["psf"],"application/x-font-pcf":["pcf"],"application/x-font-snf":["snf"],"application/x-font-type1":["pfa","pfb","pfm","afm"],"application/x-freearc":["arc"],"application/x-futuresplash":["spl"],"application/x-gca-compressed":["gca"],"application/x-glulx":["ulx"],"application/x-gnumeric":["gnumeric"],"application/x-gramps-xml":["gramps"],"application/x-gtar":["gtar"],"application/x-hdf":["hdf"],"application/x-httpd-php":["php"],"application/x-install-instructions":["install"],"application/x-iso9660-image":["*iso"],"application/x-java-archive-diff":["jardiff"],"application/x-java-jnlp-file":["jnlp"],"application/x-keepass2":["kdbx"],"application/x-latex":["latex"],"application/x-lua-bytecode":["luac"],"application/x-lzh-compressed":["lzh","lha"],"application/x-makeself":["run"],"application/x-mie":["mie"],"application/x-mobipocket-ebook":["prc","mobi"],"application/x-ms-application":["application"],"application/x-ms-shortcut":["lnk"],"application/x-ms-wmd":["wmd"],"application/x-ms-wmz":["wmz"],"application/x-ms-xbap":["xbap"],"application/x-msaccess":["mdb"],"application/x-msbinder":["obd"],"application/x-mscardfile":["crd"],"application/x-msclip":["clp"],"application/x-msdos-program":["*exe"],"application/x-msdownload":["*exe","*dll","com","bat","*msi"],"application/x-msmediaview":["mvb","m13","m14"],"application/x-msmetafile":["*wmf","*wmz","*emf","emz"],"application/x-msmoney":["mny"],"application/x-mspublisher":["pub"],"application/x-msschedule":["scd"],"application/x-msterminal":["trm"],"application/x-mswrite":["wri"],"application/x-netcdf":["nc","cdf"],"application/x-ns-proxy-autoconfig":["pac"],"application/x-nzb":["nzb"],"application/x-perl":["pl","pm"],"application/x-pilot":["*prc","*pdb"],"application/x-pkcs12":["p12","pfx"],"application/x-pkcs7-certificates":["p7b","spc"],"application/x-pkcs7-certreqresp":["p7r"],"application/x-rar-compressed":["rar"],"application/x-redhat-package-manager":["rpm"],"application/x-research-info-systems":["ris"],"application/x-sea":["sea"],"application/x-sh":["sh"],"application/x-shar":["shar"],"application/x-shockwave-flash":["swf"],"application/x-silverlight-app":["xap"],"application/x-sql":["sql"],"application/x-stuffit":["sit"],"application/x-stuffitx":["sitx"],"application/x-subrip":["srt"],"application/x-sv4cpio":["sv4cpio"],"application/x-sv4crc":["sv4crc"],"application/x-t3vm-image":["t3"],"application/x-tads":["gam"],"application/x-tar":["tar"],"application/x-tcl":["tcl","tk"],"application/x-tex":["tex"],"application/x-tex-tfm":["tfm"],"application/x-texinfo":["texinfo","texi"],"application/x-tgif":["*obj"],"application/x-ustar":["ustar"],"application/x-virtualbox-hdd":["hdd"],"application/x-virtualbox-ova":["ova"],"application/x-virtualbox-ovf":["ovf"],"application/x-virtualbox-vbox":["vbox"],"application/x-virtualbox-vbox-extpack":["vbox-extpack"],"application/x-virtualbox-vdi":["vdi"],"application/x-virtualbox-vhd":["vhd"],"application/x-virtualbox-vmdk":["vmdk"],"application/x-wais-source":["src"],"application/x-web-app-manifest+json":["webapp"],"application/x-x509-ca-cert":["der","crt","pem"],"application/x-xfig":["fig"],"application/x-xliff+xml":["*xlf"],"application/x-xpinstall":["xpi"],"application/x-xz":["xz"],"application/x-zmachine":["z1","z2","z3","z4","z5","z6","z7","z8"],"audio/vnd.dece.audio":["uva","uvva"],"audio/vnd.digital-winds":["eol"],"audio/vnd.dra":["dra"],"audio/vnd.dts":["dts"],"audio/vnd.dts.hd":["dtshd"],"audio/vnd.lucent.voice":["lvp"],"audio/vnd.ms-playready.media.pya":["pya"],"audio/vnd.nuera.ecelp4800":["ecelp4800"],"audio/vnd.nuera.ecelp7470":["ecelp7470"],"audio/vnd.nuera.ecelp9600":["ecelp9600"],"audio/vnd.rip":["rip"],"audio/x-aac":["aac"],"audio/x-aiff":["aif","aiff","aifc"],"audio/x-caf":["caf"],"audio/x-flac":["flac"],"audio/x-m4a":["*m4a"],"audio/x-matroska":["mka"],"audio/x-mpegurl":["m3u"],"audio/x-ms-wax":["wax"],"audio/x-ms-wma":["wma"],"audio/x-pn-realaudio":["ram","ra"],"audio/x-pn-realaudio-plugin":["rmp"],"audio/x-realaudio":["*ra"],"audio/x-wav":["*wav"],"chemical/x-cdx":["cdx"],"chemical/x-cif":["cif"],"chemical/x-cmdf":["cmdf"],"chemical/x-cml":["cml"],"chemical/x-csml":["csml"],"chemical/x-xyz":["xyz"],"image/prs.btif":["btif"],"image/prs.pti":["pti"],"image/vnd.adobe.photoshop":["psd"],"image/vnd.airzip.accelerator.azv":["azv"],"image/vnd.dece.graphic":["uvi","uvvi","uvg","uvvg"],"image/vnd.djvu":["djvu","djv"],"image/vnd.dvb.subtitle":["*sub"],"image/vnd.dwg":["dwg"],"image/vnd.dxf":["dxf"],"image/vnd.fastbidsheet":["fbs"],"image/vnd.fpx":["fpx"],"image/vnd.fst":["fst"],"image/vnd.fujixerox.edmics-mmr":["mmr"],"image/vnd.fujixerox.edmics-rlc":["rlc"],"image/vnd.microsoft.icon":["ico"],"image/vnd.ms-dds":["dds"],"image/vnd.ms-modi":["mdi"],"image/vnd.ms-photo":["wdp"],"image/vnd.net-fpx":["npx"],"image/vnd.tencent.tap":["tap"],"image/vnd.valve.source.texture":["vtf"],"image/vnd.wap.wbmp":["wbmp"],"image/vnd.xiff":["xif"],"image/vnd.zbrush.pcx":["pcx"],"image/x-3ds":["3ds"],"image/x-cmu-raster":["ras"],"image/x-cmx":["cmx"],"image/x-freehand":["fh","fhc","fh4","fh5","fh7"],"image/x-icon":["*ico"],"image/x-jng":["jng"],"image/x-mrsid-image":["sid"],"image/x-ms-bmp":["*bmp"],"image/x-pcx":["*pcx"],"image/x-pict":["pic","pct"],"image/x-portable-anymap":["pnm"],"image/x-portable-bitmap":["pbm"],"image/x-portable-graymap":["pgm"],"image/x-portable-pixmap":["ppm"],"image/x-rgb":["rgb"],"image/x-tga":["tga"],"image/x-xbitmap":["xbm"],"image/x-xpixmap":["xpm"],"image/x-xwindowdump":["xwd"],"message/vnd.wfa.wsc":["wsc"],"model/vnd.collada+xml":["dae"],"model/vnd.dwf":["dwf"],"model/vnd.gdl":["gdl"],"model/vnd.gtw":["gtw"],"model/vnd.mts":["mts"],"model/vnd.opengex":["ogex"],"model/vnd.parasolid.transmit.binary":["x_b"],"model/vnd.parasolid.transmit.text":["x_t"],"model/vnd.usdz+zip":["usdz"],"model/vnd.valve.source.compiled-map":["bsp"],"model/vnd.vtu":["vtu"],"text/prs.lines.tag":["dsc"],"text/vnd.curl":["curl"],"text/vnd.curl.dcurl":["dcurl"],"text/vnd.curl.mcurl":["mcurl"],"text/vnd.curl.scurl":["scurl"],"text/vnd.dvb.subtitle":["sub"],"text/vnd.fly":["fly"],"text/vnd.fmi.flexstor":["flx"],"text/vnd.graphviz":["gv"],"text/vnd.in3d.3dml":["3dml"],"text/vnd.in3d.spot":["spot"],"text/vnd.sun.j2me.app-descriptor":["jad"],"text/vnd.wap.wml":["wml"],"text/vnd.wap.wmlscript":["wmls"],"text/x-asm":["s","asm"],"text/x-c":["c","cc","cxx","cpp","h","hh","dic"],"text/x-component":["htc"],"text/x-fortran":["f","for","f77","f90"],"text/x-handlebars-template":["hbs"],"text/x-java-source":["java"],"text/x-lua":["lua"],"text/x-markdown":["mkd"],"text/x-nfo":["nfo"],"text/x-opml":["opml"],"text/x-org":["*org"],"text/x-pascal":["p","pas"],"text/x-processing":["pde"],"text/x-sass":["sass"],"text/x-scss":["scss"],"text/x-setext":["etx"],"text/x-sfv":["sfv"],"text/x-suse-ymp":["ymp"],"text/x-uuencode":["uu"],"text/x-vcalendar":["vcs"],"text/x-vcard":["vcf"],"video/vnd.dece.hd":["uvh","uvvh"],"video/vnd.dece.mobile":["uvm","uvvm"],"video/vnd.dece.pd":["uvp","uvvp"],"video/vnd.dece.sd":["uvs","uvvs"],"video/vnd.dece.video":["uvv","uvvv"],"video/vnd.dvb.file":["dvb"],"video/vnd.fvt":["fvt"],"video/vnd.mpegurl":["mxu","m4u"],"video/vnd.ms-playready.media.pyv":["pyv"],"video/vnd.uvvu.mp4":["uvu","uvvu"],"video/vnd.vivo":["viv"],"video/x-f4v":["f4v"],"video/x-fli":["fli"],"video/x-flv":["flv"],"video/x-m4v":["m4v"],"video/x-matroska":["mkv","mk3d","mks"],"video/x-mng":["mng"],"video/x-ms-asf":["asf","asx"],"video/x-ms-vob":["vob"],"video/x-ms-wm":["wm"],"video/x-ms-wmv":["wmv"],"video/x-ms-wmx":["wmx"],"video/x-ms-wvx":["wvx"],"video/x-msvideo":["avi"],"video/x-sgi-movie":["movie"],"video/x-smv":["smv"],"x-conference/x-cooltalk":["ice"]};
+"use strict";
+
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+const VERSION = "2.2.3";
+
+/**
+ * Some “list” response that can be paginated have a different response structure
+ *
+ * They have a `total_count` key in the response (search also has `incomplete_results`,
+ * /installation/repositories also has `repository_selection`), as well as a key with
+ * the list of the items which name varies from endpoint to endpoint.
+ *
+ * Octokit normalizes these responses so that paginated results are always returned following
+ * the same structure. One challenge is that if the list response has only one page, no Link
+ * header is provided, so this header alone is not sufficient to check wether a response is
+ * paginated or not.
+ *
+ * We check if a "total_count" key is present in the response data, but also make sure that
+ * a "url" property is not, as the "Get the combined status for a specific ref" endpoint would
+ * otherwise match: https://developer.github.com/v3/repos/statuses/#get-the-combined-status-for-a-specific-ref
+ */
+function normalizePaginatedListResponse(response) {
+  const responseNeedsNormalization = "total_count" in response.data && !("url" in response.data);
+  if (!responseNeedsNormalization) return response; // keep the additional properties intact as there is currently no other way
+  // to retrieve the same information.
+
+  const incompleteResults = response.data.incomplete_results;
+  const repositorySelection = response.data.repository_selection;
+  const totalCount = response.data.total_count;
+  delete response.data.incomplete_results;
+  delete response.data.repository_selection;
+  delete response.data.total_count;
+  const namespaceKey = Object.keys(response.data)[0];
+  const data = response.data[namespaceKey];
+  response.data = data;
+
+  if (typeof incompleteResults !== "undefined") {
+    response.data.incomplete_results = incompleteResults;
+  }
+
+  if (typeof repositorySelection !== "undefined") {
+    response.data.repository_selection = repositorySelection;
+  }
+
+  response.data.total_count = totalCount;
+  return response;
+}
+
+function iterator(octokit, route, parameters) {
+  const options = typeof route === "function" ? route.endpoint(parameters) : octokit.request.endpoint(route, parameters);
+  const requestMethod = typeof route === "function" ? route : octokit.request;
+  const method = options.method;
+  const headers = options.headers;
+  let url = options.url;
+  return {
+    [Symbol.asyncIterator]: () => ({
+      next() {
+        if (!url) {
+          return Promise.resolve({
+            done: true
+          });
+        }
+
+        return requestMethod({
+          method,
+          url,
+          headers
+        }).then(normalizePaginatedListResponse).then(response => {
+          // `response.headers.link` format:
+          // '<https://api.github.com/users/aseemk/followers?page=2>; rel="next", <https://api.github.com/users/aseemk/followers?page=2>; rel="last"'
+          // sets `url` to undefined if "next" URL is not present or `link` header is not set
+          url = ((response.headers.link || "").match(/<([^>]+)>;\s*rel="next"/) || [])[1];
+          return {
+            value: response
+          };
+        });
+      }
+
+    })
+  };
+}
+
+function paginate(octokit, route, parameters, mapFn) {
+  if (typeof parameters === "function") {
+    mapFn = parameters;
+    parameters = undefined;
+  }
+
+  return gather(octokit, [], iterator(octokit, route, parameters)[Symbol.asyncIterator](), mapFn);
+}
+
+function gather(octokit, results, iterator, mapFn) {
+  return iterator.next().then(result => {
+    if (result.done) {
+      return results;
+    }
+
+    let earlyExit = false;
+
+    function done() {
+      earlyExit = true;
+    }
+
+    results = results.concat(mapFn ? mapFn(result.value, done) : result.value.data);
+
+    if (earlyExit) {
+      return results;
+    }
+
+    return gather(octokit, results, iterator, mapFn);
+  });
+}
+
+/**
+ * @param octokit Octokit instance
+ * @param options Options passed to Octokit constructor
+ */
+
+function paginateRest(octokit) {
+  return {
+    paginate: Object.assign(paginate.bind(null, octokit), {
+      iterator: iterator.bind(null, octokit)
+    })
+  };
+}
+paginateRest.VERSION = VERSION;
+
+exports.paginateRest = paginateRest;
+//# sourceMappingURL=index.js.map
+
 
 /***/ }),
 /* 984 */,
-/* 985 */,
+/* 985 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/**
+ * Copyright 2017 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+Object.defineProperty(exports, "__esModule", { value: true });
+const initialize_js_1 = __webpack_require__(380);
+const puppeteer = initialize_js_1.initializePuppeteer('puppeteer-core');
+exports.default = puppeteer;
+
+
+/***/ }),
 /* 986 */,
 /* 987 */,
 /* 988 */
