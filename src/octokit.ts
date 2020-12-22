@@ -1,5 +1,4 @@
-import * as core from '@actions/core';
-import { GitHub, getOctokitOptions } from '@actions/github/lib/utils';
+import { Octokit } from '@octokit/action';
 // import multipleUpdatePlugin from "octokit-commit-multiple-files"
 
 // const Octokit = GitHub.plugin(
@@ -7,8 +6,6 @@ import { GitHub, getOctokitOptions } from '@actions/github/lib/utils';
 // )
 // const Octokit = GitHub;
 
-const githubToken = core.getInput('github_token');
-const octokitOptions = getOctokitOptions(githubToken);
-const octokit = new GitHub(octokitOptions) as InstanceType<typeof GitHub>;
+const octokit = new Octokit();
 
 export default octokit;

@@ -1,5 +1,7 @@
 import octokit from './octokit';
-import { context } from '@actions/github';
+import { components } from '@octokit/openapi-types'
+
+type GetRepoContentResponseDataFile = components["schemas"]["content-file"]
 
 interface CommitFileOptions {
   message: string;
@@ -7,25 +9,32 @@ interface CommitFileOptions {
   path: string;
 }
 
+const [owner, repo] = process.env.GITHUB_REPOSITORY!.split("/");
+
 const commitFile = async ({ message, content, path }: CommitFileOptions) => {
   const existingFile = await octokit.repos.getContent({
-    ...context.repo,
+    repo,
+    owner,
     path,
   });
 
   const base64Content = Buffer.from(content).toString('base64');
 
-  if (existingFile && existingFile.data.content === base64Content) {
+  // https://github.com/octokit/rest.js/issues/1971
+  const data = existingFile && existingFile.data as GetRepoContentResponseDataFile;
+
+  if (existingFile?.data && data.content === base64Content) {
     console.log(`File ${path} didn't change. Skipping.`);
     return;
   }
 
   return await octokit.repos.createOrUpdateFileContents({
-    ...context.repo,
+    repo,
+    owner,
     path,
     message,
     content: base64Content,
-    sha: existingFile && existingFile.data.sha,
+    sha: existingFile && data.sha,
   });
 };
 

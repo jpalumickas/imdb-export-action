@@ -12,7 +12,7 @@
   "repository": "jpalumickas/imdb-export-action",
   "dependencies": {
     "@actions/core": "^1.2.6",
-    "@actions/github": "^4.0.0",
+    "@octokit/action": "^3.1.6",
     "octokit-commit-multiple-files": "^3.2.0",
     "puppeteer-core": "^5.5.0"
   },
