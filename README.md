@@ -17,11 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Export from IMDb
-        uses: jpalumickas/imdb-export-action@v1.0.0
+        uses: jpalumickas/imdb-export-action@v1.1.0
         with:
           imdb_email: ${{ secrets.IMDB_EMAIL }}
           imdb_password: ${{ secrets.IMDB_PASSWORD }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 ## Reference

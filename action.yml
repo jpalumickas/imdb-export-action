@@ -7,7 +7,7 @@ inputs:
   imdb_password:
     description: 'IMDb Password'
     required: true
-  github_token:
+  GITHUB_TOKEN:
     description: 'GitHub Token'
     required: true
   ratings_path:
