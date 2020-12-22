@@ -32,7 +32,7 @@ Here are all the inputs available through `with`:
 | -------------------------- | -------------------------------------------------------------- | ----------------------- | -------- |
 | `imdb_email`               | Your IMDb email address                                        |                         | ✔        |
 | `imdb_password`            | Your IMDb password                                             |                         | ✔        |
-| `github_token`             | The GitHub Token to be used to authenticate to your repository |                         | ✔        |
+| `GITHUB_TOKEN`             | The GitHub Token to be used to authenticate to your repository |                         | ✔        |
 | `ratings_path`             | Ratings file path in repository                                | `imdb_ratings.csv`      |          |
 | `ratings_commit_message`   | Commit message when updating ratings file                      | `Update IMDb Ratings`   |          |
 | `watchlist_path`           | Watchlist file path in repository                              | `imdb_watchlist.csv`    |          |
