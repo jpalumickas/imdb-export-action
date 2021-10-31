@@ -2,7 +2,7 @@
   "compilerOptions": {
     "removeComments": true,
     "module": "ESNext",
-    "target": "ES2019", // Node 12
+    "target": "ES2019",
     "strict": true,
     "newLine": "lf",
     "noImplicitReturns": true,
