@@ -2,8 +2,8 @@ import * as core from '@actions/core';
 import puppeteer from 'puppeteer-core';
 import getChromePath from './getChromePath';
 
-const email = core.getInput('imdb_email');
-const password = core.getInput('imdb_password');
+const email = core.getInput('imdb_email',  { trimWhitespace: true });
+const password = core.getInput('imdb_password',  { trimWhitespace: true });
 const userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 11_0_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/87.0.4280.88 Safari/537.36';
 
 interface Result {
