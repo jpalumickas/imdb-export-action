@@ -30,7 +30,8 @@
   },
   "scripts": {
     "build": "ncc build src/index.ts -o dist",
-    "lint": "eslint src"
+    "lint": "eslint src",
+    "format": "prettier src --write"
   },
   "keywords": ["imdb", "github", "actions", "github-actions", "javascript"]
 }

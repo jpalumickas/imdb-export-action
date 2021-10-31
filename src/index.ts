@@ -15,16 +15,20 @@ import commitFile from './commitFile';
 
     if (data.ratings) {
       await commitFile({
-        path: core.getInput('ratings_path',  { trimWhitespace: true }),
-        message: core.getInput('ratings_commit_message',  { trimWhitespace: true }),
+        path: core.getInput('ratings_path', { trimWhitespace: true }),
+        message: core.getInput('ratings_commit_message', {
+          trimWhitespace: true,
+        }),
         content: data.ratings,
       });
     }
 
     if (data.watchlist) {
       await commitFile({
-        path: core.getInput('watchlist_path',  { trimWhitespace: true }),
-        message: core.getInput('watchlist_commit_message',  { trimWhitespace: true }),
+        path: core.getInput('watchlist_path', { trimWhitespace: true }),
+        message: core.getInput('watchlist_commit_message', {
+          trimWhitespace: true,
+        }),
         content: data.watchlist,
       });
     }

@@ -1,7 +1,7 @@
 import octokit from './octokit';
-import { components } from '@octokit/openapi-types'
+import { components } from '@octokit/openapi-types';
 
-type GetRepoContentResponseDataFile = components["schemas"]["content-file"]
+type GetRepoContentResponseDataFile = components['schemas']['content-file'];
 
 interface CommitFileOptions {
   message: string;
@@ -10,10 +10,10 @@ interface CommitFileOptions {
 }
 
 if (!process.env.GITHUB_REPOSITORY) {
-  throw new Error('Failed to get GitHub repository')
+  throw new Error('Failed to get GitHub repository');
 }
 
-const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
 
 const commitFile = async ({ message, content, path }: CommitFileOptions) => {
   const existingFile = await octokit.repos.getContent({
@@ -25,7 +25,8 @@ const commitFile = async ({ message, content, path }: CommitFileOptions) => {
   const base64Content = Buffer.from(content).toString('base64');
 
   // https://github.com/octokit/rest.js/issues/1971
-  const data = existingFile && existingFile.data as GetRepoContentResponseDataFile;
+  const data =
+    existingFile && (existingFile.data as GetRepoContentResponseDataFile);
 
   if (existingFile?.data && data.content === base64Content) {
     console.log(`File ${path} didn't change. Skipping.`);

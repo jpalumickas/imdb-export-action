@@ -17,7 +17,7 @@ const getChromePath = (): string => {
 
     browserPath = path.join(
       programFiles || '',
-      'Google/Chrome/Application/chrome.exe'
+      'Google/Chrome/Application/chrome.exe',
     );
   } else if (os.type() === 'Linux') {
     browserPath = '/usr/bin/google-chrome';

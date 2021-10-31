@@ -2,9 +2,10 @@ import * as core from '@actions/core';
 import puppeteer from 'puppeteer-core';
 import getChromePath from './getChromePath';
 
-const email = core.getInput('imdb_email',  { trimWhitespace: true });
-const password = core.getInput('imdb_password',  { trimWhitespace: true });
-const userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 12_0_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.69 Safari/537.36';
+const email = core.getInput('imdb_email', { trimWhitespace: true });
+const password = core.getInput('imdb_password', { trimWhitespace: true });
+const userAgent =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 12_0_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.69 Safari/537.36';
 
 interface Result {
   watchlist?: string;
@@ -35,13 +36,10 @@ const fetchData = async (): Promise<Result> => {
     console.log('Click on Sign in');
 
     // https://github.com/puppeteer/puppeteer/issues/1412#issuecomment-345482273
-    await Promise.all([
-      page.waitForNavigation(),
-      signIn.click(),
-    ]);
+    await Promise.all([page.waitForNavigation(), signIn.click()]);
 
     const [signInWithIMDb] = await page.$x(
-      "//a[contains(., 'Sign in with IMDb')]"
+      "//a[contains(., 'Sign in with IMDb')]",
     );
     if (!signInWithIMDb) {
       throw 'Unable to find Sign in with IMDb link';
@@ -49,10 +47,7 @@ const fetchData = async (): Promise<Result> => {
 
     core.debug('Click on Sign in with IMDB');
     console.log('Click on Sign in with IMDB');
-    await Promise.all([
-      page.waitForNavigation(),
-      signInWithIMDb.click(),
-    ]);
+    await Promise.all([page.waitForNavigation(), signInWithIMDb.click()]);
 
     core.debug('Enter email and password');
     console.log('Enter email and password');
@@ -75,7 +70,7 @@ const fetchData = async (): Promise<Result> => {
         document,
         null,
         XPathResult.FIRST_ORDERED_NODE_TYPE,
-        null
+        null,
       ).singleNodeValue as HTMLLinkElement;
 
       if (!link) {
@@ -96,7 +91,7 @@ const fetchData = async (): Promise<Result> => {
         document,
         null,
         XPathResult.FIRST_ORDERED_NODE_TYPE,
-        null
+        null,
       ).singleNodeValue as HTMLLinkElement;
 
       if (!link) {
