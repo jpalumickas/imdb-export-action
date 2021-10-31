@@ -9,7 +9,11 @@ interface CommitFileOptions {
   path: string;
 }
 
-const [owner, repo] = process.env.GITHUB_REPOSITORY!.split("/");
+if (!process.env.GITHUB_REPOSITORY) {
+  throw new Error('Failed to get GitHub repository')
+}
+
+const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
 
 const commitFile = async ({ message, content, path }: CommitFileOptions) => {
   const existingFile = await octokit.repos.getContent({
