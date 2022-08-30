@@ -1,5 +1,5 @@
-import octokit from './octokit';
 import { components } from '@octokit/openapi-types';
+import octokit from './octokit';
 
 type GetRepoContentResponseDataFile = components['schemas']['content-file'];
 

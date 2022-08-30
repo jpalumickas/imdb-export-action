@@ -2542,9 +2542,6 @@ _Tracing_client = new WeakMap(), _Tracing_recording = new WeakMap(), _Tracing_pa
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ariaHandler = void 0;
 const assert_js_1 = __webpack_require__(725);
-const ElementHandle_js_1 = __webpack_require__(978);
-const Frame_js_1 = __webpack_require__(819);
-const IsolatedWorld_js_1 = __webpack_require__(462);
 async function queryAXTree(client, element, accessibleName, role) {
     const { nodes } = await client.send('Accessibility.queryAXTree', {
         objectId: element.remoteObject().objectId,
@@ -2588,55 +2585,27 @@ function parseAriaSelector(selector) {
     }
     return queryOptions;
 }
-const queryOneId = async (element, selector) => {
+const queryOne = async (element, selector) => {
+    const exeCtx = element.executionContext();
     const { name, role } = parseAriaSelector(selector);
-    const res = await queryAXTree(element.client, element, name, role);
+    const res = await queryAXTree(exeCtx._client, element, name, role);
     if (!res[0] || !res[0].backendDOMNodeId) {
         return null;
     }
-    return res[0].backendDOMNodeId;
+    return (await exeCtx._world.adoptBackendNode(res[0].backendDOMNodeId));
 };
-const queryOne = async (element, selector) => {
-    const id = await queryOneId(element, selector);
-    if (!id) {
-        return null;
-    }
-    return (await element.frame.worlds[IsolatedWorld_js_1.MAIN_WORLD].adoptBackendNode(id));
-};
-const waitFor = async (elementOrFrame, selector, options) => {
-    let frame;
-    let element;
-    if (elementOrFrame instanceof Frame_js_1.Frame) {
-        frame = elementOrFrame;
-    }
-    else {
-        frame = elementOrFrame.frame;
-        element = await frame.worlds[IsolatedWorld_js_1.PUPPETEER_WORLD].adoptHandle(elementOrFrame);
-    }
+const waitFor = async (isolatedWorld, selector, options) => {
     const binding = {
         name: 'ariaQuerySelector',
         pptrFunction: async (selector) => {
-            const id = await queryOneId(element || (await frame.worlds[IsolatedWorld_js_1.PUPPETEER_WORLD].document()), selector);
-            if (!id) {
-                return null;
-            }
-            return (await frame.worlds[IsolatedWorld_js_1.PUPPETEER_WORLD].adoptBackendNode(id));
+            const root = options.root || (await isolatedWorld.document());
+            const element = await queryOne(root, selector);
+            return element;
         },
     };
-    const result = await frame.worlds[IsolatedWorld_js_1.PUPPETEER_WORLD]._waitForSelectorInPage((_, selector) => {
+    return (await isolatedWorld._waitForSelectorInPage((_, selector) => {
         return globalThis.ariaQuerySelector(selector);
-    }, element, selector, options, binding);
-    if (element) {
-        await element.dispose();
-    }
-    if (!result) {
-        return null;
-    }
-    if (!(result instanceof ElementHandle_js_1.ElementHandle)) {
-        await result.dispose();
-        return null;
-    }
-    return result.frame.worlds[IsolatedWorld_js_1.MAIN_WORLD].transferHandle(result);
+    }, selector, options, binding));
 };
 const queryAll = async (element, selector) => {
     const exeCtx = element.executionContext();
@@ -2647,6 +2616,14 @@ const queryAll = async (element, selector) => {
         return world.adoptBackendNode(axNode.backendDOMNodeId);
     }));
 };
+const queryAllArray = async (element, selector) => {
+    const elementHandles = await queryAll(element, selector);
+    const exeCtx = element.executionContext();
+    const jsHandle = exeCtx.evaluateHandle((...elements) => {
+        return elements;
+    }, ...elementHandles);
+    return jsHandle;
+};
 /**
  * @internal
  */
@@ -2654,6 +2631,7 @@ exports.ariaHandler = {
     queryOne,
     waitFor,
     queryAll,
+    queryAllArray,
 };
 //# sourceMappingURL=AriaQueryHandler.js.map
 
@@ -5433,7 +5411,13 @@ exports.realpath = function realpath(p, cache, cb) {
 
 /***/ }),
 /* 118 */,
-/* 119 */,
+/* 119 */
+/***/ (function(module) {
+
+module.exports = eval("require")("node:path");
+
+
+/***/ }),
 /* 120 */
 /***/ (function(module) {
 
@@ -6098,6 +6082,11 @@ class Page extends EventEmitter_js_1.EventEmitter {
      * This method iterates the JavaScript heap and finds all objects with the
      * given prototype.
      *
+     * @remarks
+     * Shortcut for
+     * {@link ExecutionContext.queryObjects |
+     * page.mainFrame().executionContext().queryObjects(prototypeHandle)}.
+     *
      * @example
      *
      * ```ts
@@ -6119,13 +6108,7 @@ class Page extends EventEmitter_js_1.EventEmitter {
      */
     async queryObjects(prototypeHandle) {
         const context = await this.mainFrame().executionContext();
-        (0, assert_js_1.assert)(!prototypeHandle.disposed, 'Prototype JSHandle is disposed!');
-        const remoteObject = prototypeHandle.remoteObject();
-        (0, assert_js_1.assert)(remoteObject.objectId, 'Prototype JSHandle must not be referencing primitive value');
-        const response = await context._client.send('Runtime.queryObjects', {
-            prototypeObjectId: remoteObject.objectId,
-        });
-        return (0, util_js_1.createJSHandle)(context, response.objects);
+        return context.queryObjects(prototypeHandle);
     }
     /**
      * This method runs `document.querySelector` within the page and passes the
@@ -8244,6 +8227,7 @@ var __classPrivateFieldGet = (this && this.__classPrivateFieldGet) || function (
 var _ExecutionContext_instances, _ExecutionContext_evaluate;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ExecutionContext = exports.EVALUATION_SCRIPT_URL = void 0;
+const assert_js_1 = __webpack_require__(725);
 const JSHandle_js_1 = __webpack_require__(933);
 const util_js_1 = __webpack_require__(802);
 /**
@@ -8252,6 +8236,8 @@ const util_js_1 = __webpack_require__(802);
 exports.EVALUATION_SCRIPT_URL = 'pptr://__puppeteer_evaluation_script__';
 const SOURCE_URL_REGEX = /^[\040\t]*\/\/[@#] sourceURL=\s*(\S*?)\s*$/m;
 /**
+ * @deprecated Do not use directly.
+ *
  * Represents a context for JavaScript execution.
  *
  * @example
@@ -8270,8 +8256,6 @@ const SOURCE_URL_REGEX = /^[\040\t]*\/\/[@#] sourceURL=\s*(\S*?)\s*$/m;
  * @remarks
  * Besides pages, execution contexts can be found in
  * {@link WebWorker | workers}.
- *
- * @internal
  */
 class ExecutionContext {
     /**
@@ -8283,6 +8267,17 @@ class ExecutionContext {
         this._world = world;
         this._contextId = contextPayload.id;
         this._contextName = contextPayload.name;
+    }
+    /**
+     * @returns The frame associated with this execution context.
+     *
+     * @remarks
+     * Not every execution context is associated with a frame. For example,
+     * {@link WebWorker | workers} have execution contexts that are not associated
+     * with frames.
+     */
+    frame() {
+        return this._world ? this._world.frame() : null;
     }
     /**
      * Evaluates the given function.
@@ -8378,6 +8373,37 @@ class ExecutionContext {
      */
     async evaluateHandle(pageFunction, ...args) {
         return __classPrivateFieldGet(this, _ExecutionContext_instances, "m", _ExecutionContext_evaluate).call(this, false, pageFunction, ...args);
+    }
+    /**
+     * Iterates through the JavaScript heap and finds all the objects with the
+     * given prototype.
+     *
+     * @example
+     *
+     * ```ts
+     * // Create a Map object
+     * await page.evaluate(() => (window.map = new Map()));
+     * // Get a handle to the Map object prototype
+     * const mapPrototype = await page.evaluateHandle(() => Map.prototype);
+     * // Query all map instances into an array
+     * const mapInstances = await page.queryObjects(mapPrototype);
+     * // Count amount of map objects in heap
+     * const count = await page.evaluate(maps => maps.length, mapInstances);
+     * await mapInstances.dispose();
+     * await mapPrototype.dispose();
+     * ```
+     *
+     * @param prototypeHandle - a handle to the object prototype
+     * @returns A handle to an array of objects with the given prototype.
+     */
+    async queryObjects(prototypeHandle) {
+        (0, assert_js_1.assert)(!prototypeHandle.disposed, 'Prototype JSHandle is disposed!');
+        const remoteObject = prototypeHandle.remoteObject();
+        (0, assert_js_1.assert)(remoteObject.objectId, 'Prototype JSHandle must not be referencing primitive value');
+        const response = await this._client.send('Runtime.queryObjects', {
+            prototypeObjectId: remoteObject.objectId,
+        });
+        return (0, util_js_1.createJSHandle)(this, response.objects);
     }
 }
 exports.ExecutionContext = ExecutionContext;
@@ -8489,19 +8515,19 @@ _ExecutionContext_instances = new WeakSet(), _ExecutionContext_evaluate = async 
         }
         return { value: arg };
     }
-};
-const rewriteError = (error) => {
-    if (error.message.includes('Object reference chain is too long')) {
-        return { result: { type: 'undefined' } };
+    function rewriteError(error) {
+        if (error.message.includes('Object reference chain is too long')) {
+            return { result: { type: 'undefined' } };
+        }
+        if (error.message.includes("Object couldn't be returned by value")) {
+            return { result: { type: 'undefined' } };
+        }
+        if (error.message.endsWith('Cannot find context with specified id') ||
+            error.message.endsWith('Inspected target navigated or closed')) {
+            throw new Error('Execution context was destroyed, most likely because of a navigation.');
+        }
+        throw error;
     }
-    if (error.message.includes("Object couldn't be returned by value")) {
-        return { result: { type: 'undefined' } };
-    }
-    if (error.message.endsWith('Cannot find context with specified id') ||
-        error.message.endsWith('Inspected target navigated or closed')) {
-        throw new Error('Execution context was destroyed, most likely because of a navigation.');
-    }
-    throw error;
 };
 //# sourceMappingURL=ExecutionContext.js.map
 
@@ -17463,7 +17489,7 @@ exports.packageVersion = void 0;
 /**
  * @internal
  */
-exports.packageVersion = '17.0.0';
+exports.packageVersion = '16.2.0';
 //# sourceMappingURL=version.js.map
 
 /***/ }),
@@ -24308,7 +24334,7 @@ class FrameManager extends EventEmitter_js_1.EventEmitter {
         var _a;
         try {
             if (!__classPrivateFieldGet(this, _FrameManager_framesPendingTargetInit, "f").has(targetId)) {
-                __classPrivateFieldGet(this, _FrameManager_framesPendingTargetInit, "f").set(targetId, (0, DeferredPromise_js_1.createDebuggableDeferredPromise)(`Waiting for target frame ${targetId} failed`));
+                __classPrivateFieldGet(this, _FrameManager_framesPendingTargetInit, "f").set(targetId, (0, DeferredPromise_js_1.createDeferredPromiseWithTimer)(`Waiting for target frame ${targetId} failed`));
             }
             const result = await Promise.all([
                 client.send('Page.enable'),
@@ -24436,7 +24462,7 @@ _FrameManager_page = new WeakMap(), _FrameManager_networkManager = new WeakMap()
     const frame = __classPrivateFieldGet(this, _FrameManager_framesPendingTargetInit, "f").get(parentFrameId);
     if (frame) {
         if (!__classPrivateFieldGet(this, _FrameManager_framesPendingAttachment, "f").has(frameId)) {
-            __classPrivateFieldGet(this, _FrameManager_framesPendingAttachment, "f").set(frameId, (0, DeferredPromise_js_1.createDebuggableDeferredPromise)(`Waiting for frame ${frameId} to attach failed`));
+            __classPrivateFieldGet(this, _FrameManager_framesPendingAttachment, "f").set(frameId, (0, DeferredPromise_js_1.createDeferredPromiseWithTimer)(`Waiting for frame ${frameId} to attach failed`));
         }
         frame.then(() => {
             var _a;
@@ -26588,14 +26614,15 @@ var __classPrivateFieldGet = (this && this.__classPrivateFieldGet) || function (
     if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
     return kind === "m" ? f : kind === "a" ? f.call(receiver) : f ? f.value : state.get(receiver);
 };
-var _IsolatedWorld_instances, _a, _IsolatedWorld_frame, _IsolatedWorld_document, _IsolatedWorld_contextPromise, _IsolatedWorld_detached, _IsolatedWorld_ctxBindings, _IsolatedWorld_boundFunctions, _IsolatedWorld_waitTasks, _IsolatedWorld_bindingIdentifier, _IsolatedWorld_client_get, _IsolatedWorld_frameManager_get, _IsolatedWorld_timeoutSettings_get, _IsolatedWorld_settingUpBinding, _IsolatedWorld_onBindingCalled, _WaitTask_instances, _WaitTask_isolatedWorld, _WaitTask_polling, _WaitTask_timeout, _WaitTask_predicateBody, _WaitTask_predicateAcceptsContextElement, _WaitTask_args, _WaitTask_binding, _WaitTask_runCount, _WaitTask_resolve, _WaitTask_reject, _WaitTask_timeoutTimer, _WaitTask_terminated, _WaitTask_root, _WaitTask_cleanup;
+var _a, _IsolatedWorld_frameManager, _IsolatedWorld_client, _IsolatedWorld_frame, _IsolatedWorld_timeoutSettings, _IsolatedWorld_documentPromise, _IsolatedWorld_contextPromise, _IsolatedWorld_detached, _IsolatedWorld_ctxBindings, _IsolatedWorld_boundFunctions, _IsolatedWorld_waitTasks, _IsolatedWorld_bindingIdentifier, _IsolatedWorld_settingUpBinding, _IsolatedWorld_onBindingCalled, _WaitTask_instances, _WaitTask_isolatedWorld, _WaitTask_polling, _WaitTask_timeout, _WaitTask_predicateBody, _WaitTask_predicateAcceptsContextElement, _WaitTask_args, _WaitTask_binding, _WaitTask_runCount, _WaitTask_resolve, _WaitTask_reject, _WaitTask_timeoutTimer, _WaitTask_terminated, _WaitTask_root, _WaitTask_cleanup;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.WaitTask = exports.IsolatedWorld = exports.PUPPETEER_WORLD = exports.MAIN_WORLD = void 0;
 const assert_js_1 = __webpack_require__(725);
-const DeferredPromise_js_1 = __webpack_require__(501);
 const Errors_js_1 = __webpack_require__(422);
 const LifecycleWatcher_js_1 = __webpack_require__(662);
+const QueryHandler_js_1 = __webpack_require__(647);
 const util_js_1 = __webpack_require__(802);
+const DeferredPromise_js_1 = __webpack_require__(501);
 /**
  * A unique key for {@link IsolatedWorldChart} to denote the default world.
  * Execution contexts are automatically created in the default world.
@@ -26614,10 +26641,12 @@ exports.PUPPETEER_WORLD = Symbol('puppeteerWorld');
  * @internal
  */
 class IsolatedWorld {
-    constructor(frame) {
-        _IsolatedWorld_instances.add(this);
+    constructor(client, frameManager, frame, timeoutSettings) {
+        _IsolatedWorld_frameManager.set(this, void 0);
+        _IsolatedWorld_client.set(this, void 0);
         _IsolatedWorld_frame.set(this, void 0);
-        _IsolatedWorld_document.set(this, void 0);
+        _IsolatedWorld_timeoutSettings.set(this, void 0);
+        _IsolatedWorld_documentPromise.set(this, null);
         _IsolatedWorld_contextPromise.set(this, (0, DeferredPromise_js_1.createDeferredPromise)());
         _IsolatedWorld_detached.set(this, false);
         // Set of bindings that have been registered in the current context.
@@ -26680,8 +26709,11 @@ class IsolatedWorld {
         });
         // Keep own reference to client because it might differ from the FrameManager's
         // client for OOP iframes.
+        __classPrivateFieldSet(this, _IsolatedWorld_client, client, "f");
+        __classPrivateFieldSet(this, _IsolatedWorld_frameManager, frameManager, "f");
         __classPrivateFieldSet(this, _IsolatedWorld_frame, frame, "f");
-        __classPrivateFieldGet(this, _IsolatedWorld_instances, "a", _IsolatedWorld_client_get).on('Runtime.bindingCalled', __classPrivateFieldGet(this, _IsolatedWorld_onBindingCalled, "f"));
+        __classPrivateFieldSet(this, _IsolatedWorld_timeoutSettings, timeoutSettings, "f");
+        __classPrivateFieldGet(this, _IsolatedWorld_client, "f").on('Runtime.bindingCalled', __classPrivateFieldGet(this, _IsolatedWorld_onBindingCalled, "f"));
     }
     get _waitTasks() {
         return __classPrivateFieldGet(this, _IsolatedWorld_waitTasks, "f");
@@ -26693,7 +26725,7 @@ class IsolatedWorld {
         return __classPrivateFieldGet(this, _IsolatedWorld_frame, "f");
     }
     clearContext() {
-        __classPrivateFieldSet(this, _IsolatedWorld_document, undefined, "f");
+        __classPrivateFieldSet(this, _IsolatedWorld_documentPromise, null, "f");
         __classPrivateFieldSet(this, _IsolatedWorld_contextPromise, (0, DeferredPromise_js_1.createDeferredPromise)(), "f");
     }
     setContext(context) {
@@ -26709,7 +26741,7 @@ class IsolatedWorld {
     }
     _detach() {
         __classPrivateFieldSet(this, _IsolatedWorld_detached, true, "f");
-        __classPrivateFieldGet(this, _IsolatedWorld_instances, "a", _IsolatedWorld_client_get).off('Runtime.bindingCalled', __classPrivateFieldGet(this, _IsolatedWorld_onBindingCalled, "f"));
+        __classPrivateFieldGet(this, _IsolatedWorld_client, "f").off('Runtime.bindingCalled', __classPrivateFieldGet(this, _IsolatedWorld_onBindingCalled, "f"));
         for (const waitTask of this._waitTasks) {
             waitTask.terminate(new Error('waitForFunction failed: frame got detached.'));
         }
@@ -26740,14 +26772,15 @@ class IsolatedWorld {
         return document.$$(selector);
     }
     async document() {
-        if (__classPrivateFieldGet(this, _IsolatedWorld_document, "f")) {
-            return __classPrivateFieldGet(this, _IsolatedWorld_document, "f");
+        if (__classPrivateFieldGet(this, _IsolatedWorld_documentPromise, "f")) {
+            return __classPrivateFieldGet(this, _IsolatedWorld_documentPromise, "f");
         }
-        const context = await this.executionContext();
-        __classPrivateFieldSet(this, _IsolatedWorld_document, await context.evaluateHandle(() => {
-            return document;
+        __classPrivateFieldSet(this, _IsolatedWorld_documentPromise, this.executionContext().then(async (context) => {
+            return await context.evaluateHandle(() => {
+                return document;
+            });
         }), "f");
-        return __classPrivateFieldGet(this, _IsolatedWorld_document, "f");
+        return __classPrivateFieldGet(this, _IsolatedWorld_documentPromise, "f");
     }
     async $x(expression) {
         const document = await this.document();
@@ -26760,6 +26793,11 @@ class IsolatedWorld {
     async $$eval(selector, pageFunction, ...args) {
         const document = await this.document();
         return document.$$eval(selector, pageFunction, ...args);
+    }
+    async waitForSelector(selector, options) {
+        const { updatedSelector, queryHandler } = (0, QueryHandler_js_1.getQueryHandlerAndSelector)(selector);
+        (0, assert_js_1.assert)(queryHandler.waitFor, 'Query handler does not support waiting');
+        return (await queryHandler.waitFor(this, updatedSelector, options));
     }
     async content() {
         return await this.evaluate(() => {
@@ -26774,7 +26812,7 @@ class IsolatedWorld {
         });
     }
     async setContent(html, options = {}) {
-        const { waitUntil = ['load'], timeout = __classPrivateFieldGet(this, _IsolatedWorld_instances, "a", _IsolatedWorld_timeoutSettings_get).navigationTimeout(), } = options;
+        const { waitUntil = ['load'], timeout = __classPrivateFieldGet(this, _IsolatedWorld_timeoutSettings, "f").navigationTimeout(), } = options;
         // We rely upon the fact that document.open() will reset frame lifecycle with "init"
         // lifecycle event. @see https://crrev.com/608658
         await this.evaluate(html => {
@@ -26782,7 +26820,7 @@ class IsolatedWorld {
             document.write(html);
             document.close();
         }, html);
-        const watcher = new LifecycleWatcher_js_1.LifecycleWatcher(__classPrivateFieldGet(this, _IsolatedWorld_instances, "a", _IsolatedWorld_frameManager_get), __classPrivateFieldGet(this, _IsolatedWorld_frame, "f"), waitUntil, timeout);
+        const watcher = new LifecycleWatcher_js_1.LifecycleWatcher(__classPrivateFieldGet(this, _IsolatedWorld_frameManager, "f"), __classPrivateFieldGet(this, _IsolatedWorld_frame, "f"), waitUntil, timeout);
         const error = await Promise.race([
             watcher.timeoutOrTerminationPromise(),
             watcher.lifecyclePromise(),
@@ -27010,8 +27048,8 @@ class IsolatedWorld {
         await __classPrivateFieldGet(this, _IsolatedWorld_settingUpBinding, "f");
         __classPrivateFieldSet(this, _IsolatedWorld_settingUpBinding, null, "f");
     }
-    async _waitForSelectorInPage(queryOne, root, selector, options, binding) {
-        const { visible: waitForVisible = false, hidden: waitForHidden = false, timeout = __classPrivateFieldGet(this, _IsolatedWorld_instances, "a", _IsolatedWorld_timeoutSettings_get).timeout(), } = options;
+    async _waitForSelectorInPage(queryOne, selector, options, binding) {
+        const { visible: waitForVisible = false, hidden: waitForHidden = false, timeout = __classPrivateFieldGet(this, _IsolatedWorld_timeoutSettings, "f").timeout(), } = options;
         const polling = waitForVisible || waitForHidden ? 'raf' : 'mutation';
         const title = `selector \`${selector}\`${waitForHidden ? ' to be hidden' : ''}`;
         async function predicate(root, selector, waitForVisible, waitForHidden) {
@@ -27027,13 +27065,19 @@ class IsolatedWorld {
             timeout,
             args: [selector, waitForVisible, waitForHidden],
             binding,
-            root,
+            root: options.root,
         };
         const waitTask = new WaitTask(waitTaskOptions);
-        return waitTask.promise;
+        const jsHandle = await waitTask.promise;
+        const elementHandle = jsHandle.asElement();
+        if (!elementHandle) {
+            await jsHandle.dispose();
+            return null;
+        }
+        return elementHandle;
     }
     waitForFunction(pageFunction, options = {}, ...args) {
-        const { polling = 'raf', timeout = __classPrivateFieldGet(this, _IsolatedWorld_instances, "a", _IsolatedWorld_timeoutSettings_get).timeout() } = options;
+        const { polling = 'raf', timeout = __classPrivateFieldGet(this, _IsolatedWorld_timeoutSettings, "f").timeout() } = options;
         const waitTaskOptions = {
             isolatedWorld: this,
             predicateBody: pageFunction,
@@ -27053,7 +27097,7 @@ class IsolatedWorld {
     }
     async adoptBackendNode(backendNodeId) {
         const executionContext = await this.executionContext();
-        const { object } = await __classPrivateFieldGet(this, _IsolatedWorld_instances, "a", _IsolatedWorld_client_get).send('DOM.resolveNode', {
+        const { object } = await __classPrivateFieldGet(this, _IsolatedWorld_client, "f").send('DOM.resolveNode', {
             backendNodeId: backendNodeId,
             executionContextId: executionContext._contextId,
         });
@@ -27062,25 +27106,14 @@ class IsolatedWorld {
     async adoptHandle(handle) {
         const executionContext = await this.executionContext();
         (0, assert_js_1.assert)(handle.executionContext() !== executionContext, 'Cannot adopt handle that already belongs to this execution context');
-        const nodeInfo = await __classPrivateFieldGet(this, _IsolatedWorld_instances, "a", _IsolatedWorld_client_get).send('DOM.describeNode', {
+        const nodeInfo = await __classPrivateFieldGet(this, _IsolatedWorld_client, "f").send('DOM.describeNode', {
             objectId: handle.remoteObject().objectId,
         });
         return (await this.adoptBackendNode(nodeInfo.node.backendNodeId));
     }
-    async transferHandle(handle) {
-        const result = await this.adoptHandle(handle);
-        await handle.dispose();
-        return result;
-    }
 }
 exports.IsolatedWorld = IsolatedWorld;
-_a = IsolatedWorld, _IsolatedWorld_frame = new WeakMap(), _IsolatedWorld_document = new WeakMap(), _IsolatedWorld_contextPromise = new WeakMap(), _IsolatedWorld_detached = new WeakMap(), _IsolatedWorld_ctxBindings = new WeakMap(), _IsolatedWorld_boundFunctions = new WeakMap(), _IsolatedWorld_waitTasks = new WeakMap(), _IsolatedWorld_settingUpBinding = new WeakMap(), _IsolatedWorld_onBindingCalled = new WeakMap(), _IsolatedWorld_instances = new WeakSet(), _IsolatedWorld_client_get = function _IsolatedWorld_client_get() {
-    return __classPrivateFieldGet(this, _IsolatedWorld_frame, "f")._client();
-}, _IsolatedWorld_frameManager_get = function _IsolatedWorld_frameManager_get() {
-    return __classPrivateFieldGet(this, _IsolatedWorld_frame, "f")._frameManager;
-}, _IsolatedWorld_timeoutSettings_get = function _IsolatedWorld_timeoutSettings_get() {
-    return __classPrivateFieldGet(this, _IsolatedWorld_instances, "a", _IsolatedWorld_frameManager_get).timeoutSettings;
-};
+_a = IsolatedWorld, _IsolatedWorld_frameManager = new WeakMap(), _IsolatedWorld_client = new WeakMap(), _IsolatedWorld_frame = new WeakMap(), _IsolatedWorld_timeoutSettings = new WeakMap(), _IsolatedWorld_documentPromise = new WeakMap(), _IsolatedWorld_contextPromise = new WeakMap(), _IsolatedWorld_detached = new WeakMap(), _IsolatedWorld_ctxBindings = new WeakMap(), _IsolatedWorld_boundFunctions = new WeakMap(), _IsolatedWorld_waitTasks = new WeakMap(), _IsolatedWorld_settingUpBinding = new WeakMap(), _IsolatedWorld_onBindingCalled = new WeakMap();
 _IsolatedWorld_bindingIdentifier = { value: (name, contextId) => {
         return `${name}_${contextId}`;
     } };
@@ -27458,6 +27491,8 @@ exports.NodeWebSocketTransport = void 0;
  */
 const ws_1 = __importDefault(__webpack_require__(237));
 const version_js_1 = __webpack_require__(319);
+const dns_1 = __webpack_require__(881);
+const url_1 = __webpack_require__(835);
 /**
  * @internal
  */
@@ -27478,7 +27513,19 @@ class NodeWebSocketTransport {
         // Silently ignore all errors - we don't know what to do with them.
         __classPrivateFieldGet(this, _NodeWebSocketTransport_ws, "f").addEventListener('error', () => { });
     }
-    static create(url) {
+    static async create(urlString) {
+        // TODO(jrandolf): Starting in Node 17, IPv6 is favoured over IPv4 due to a change
+        // in a default option:
+        // - https://github.com/nodejs/node/issues/40537,
+        // Due to this, for Firefox, we must parse and resolve the `localhost` hostname
+        // manually with the previous behavior according to:
+        // - https://nodejs.org/api/dns.html#dnslookuphostname-options-callback
+        // because of https://bugzilla.mozilla.org/show_bug.cgi?id=1769994.
+        const url = new url_1.URL(urlString);
+        if (url.hostname === 'localhost') {
+            const { address } = await dns_1.promises.lookup(url.hostname, { verbatim: false });
+            url.hostname = address;
+        }
         return new Promise((resolve, reject) => {
             const ws = new ws_1.default(url, [], {
                 followRedirects: true,
@@ -28778,39 +28825,39 @@ var core = __webpack_require__(470);
 var puppeteer_core = __webpack_require__(910);
 var puppeteer_core_default = /*#__PURE__*/__webpack_require__.n(puppeteer_core);
 
-// EXTERNAL MODULE: external "os"
-var external_os_ = __webpack_require__(87);
-var external_os_default = /*#__PURE__*/__webpack_require__.n(external_os_);
+// EXTERNAL MODULE: (webpack)/ncc/@@notfound.js?node:os
+var _notfoundnode_os = __webpack_require__(993);
+var _notfoundnode_os_default = /*#__PURE__*/__webpack_require__.n(_notfoundnode_os);
 
-// EXTERNAL MODULE: external "path"
-var external_path_ = __webpack_require__(622);
-var external_path_default = /*#__PURE__*/__webpack_require__.n(external_path_);
+// EXTERNAL MODULE: (webpack)/ncc/@@notfound.js?node:path
+var _notfoundnode_path = __webpack_require__(119);
+var _notfoundnode_path_default = /*#__PURE__*/__webpack_require__.n(_notfoundnode_path);
 
 // CONCATENATED MODULE: ./src/getChromePath.ts
 
 
 const getChromePath = () => {
     let browserPath;
-    if (external_os_default().type() === 'Windows_NT') {
+    if (_notfoundnode_os_default().type() === 'Windows_NT') {
         if (!process.env.PROGRAMFILES || !process.env['PROGRAMFILES(X86)']) {
             throw new Error('Missing Program Files path');
         }
-        const programFiles = external_os_default().arch() === 'x64'
+        const programFiles = _notfoundnode_os_default().arch() === 'x64'
             ? process.env['PROGRAMFILES(X86)']
             : process.env.PROGRAMFILES;
-        browserPath = external_path_default().join(programFiles || '', 'Google/Chrome/Application/chrome.exe');
+        browserPath = _notfoundnode_path_default().join(programFiles || '', 'Google/Chrome/Application/chrome.exe');
     }
-    else if (external_os_default().type() === 'Linux') {
+    else if (_notfoundnode_os_default().type() === 'Linux') {
         browserPath = '/usr/bin/google-chrome';
     }
-    else if (external_os_default().type() === 'Darwin') {
+    else if (_notfoundnode_os_default().type() === 'Darwin') {
         browserPath =
             '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
     }
     if (browserPath && browserPath.length > 0) {
-        return external_path_default().normalize(browserPath);
+        return _notfoundnode_path_default().normalize(browserPath);
     }
-    throw new TypeError(`Cannot run action. ${external_os_default.a.type} is not supported.`);
+    throw new TypeError(`Cannot run action. ${_notfoundnode_os_default.a.type} is not supported.`);
 };
 /* harmony default export */ var src_getChromePath = (getChromePath);
 
@@ -28820,7 +28867,7 @@ const getChromePath = () => {
 
 const email = Object(core.getInput)('imdb_email', { trimWhitespace: true });
 const fetchData_password = Object(core.getInput)('imdb_password', { trimWhitespace: true });
-const userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 12_0_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/95.0.4638.69 Safari/537.36';
+const userAgent = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 12_5_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/104.0.0.0 Safari/537.36';
 const fetchData = async () => {
     const browser = await puppeteer_core_default().launch({
         executablePath: src_getChromePath(),
@@ -29013,9 +29060,8 @@ exports.default = _default;
 "use strict";
 
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.createDebuggableDeferredPromise = exports.createDeferredPromise = exports.createDeferredPromiseWithTimer = void 0;
+exports.createDeferredPromise = exports.createDeferredPromiseWithTimer = void 0;
 const Errors_js_1 = __webpack_require__(422);
-const environment_js_1 = __webpack_require__(975);
 /**
  * Creates an returns a promise along with the resolve/reject functions.
  *
@@ -29089,16 +29135,6 @@ function createDeferredPromise() {
     });
 }
 exports.createDeferredPromise = createDeferredPromise;
-/**
- * @internal
- */
-function createDebuggableDeferredPromise(timeoutMessage) {
-    if (environment_js_1.deferredPromiseDebugTimeout > 0) {
-        return createDeferredPromiseWithTimer(timeoutMessage, environment_js_1.deferredPromiseDebugTimeout);
-    }
-    return createDeferredPromise();
-}
-exports.createDebuggableDeferredPromise = createDebuggableDeferredPromise;
 //# sourceMappingURL=DeferredPromise.js.map
 
 /***/ }),
@@ -32978,9 +33014,6 @@ module.exports = {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getQueryHandlerAndSelector = exports.clearCustomQueryHandlers = exports.customQueryHandlerNames = exports.unregisterCustomQueryHandler = exports.registerCustomQueryHandler = void 0;
 const AriaQueryHandler_js_1 = __webpack_require__(28);
-const ElementHandle_js_1 = __webpack_require__(978);
-const Frame_js_1 = __webpack_require__(819);
-const IsolatedWorld_js_1 = __webpack_require__(462);
 function internalizeCustomQueryHandler(handler) {
     const internalHandler = {};
     if (handler.queryOne) {
@@ -32994,28 +33027,8 @@ function internalizeCustomQueryHandler(handler) {
             await jsHandle.dispose();
             return null;
         };
-        internalHandler.waitFor = async (elementOrFrame, selector, options) => {
-            let frame;
-            let element;
-            if (elementOrFrame instanceof Frame_js_1.Frame) {
-                frame = elementOrFrame;
-            }
-            else {
-                frame = elementOrFrame.frame;
-                element = await frame.worlds[IsolatedWorld_js_1.PUPPETEER_WORLD].adoptHandle(elementOrFrame);
-            }
-            const result = await frame.worlds[IsolatedWorld_js_1.PUPPETEER_WORLD]._waitForSelectorInPage(queryOne, element, selector, options);
-            if (element) {
-                await element.dispose();
-            }
-            if (!result) {
-                return null;
-            }
-            if (!(result instanceof ElementHandle_js_1.ElementHandle)) {
-                await result.dispose();
-                return null;
-            }
-            return frame.worlds[IsolatedWorld_js_1.MAIN_WORLD].transferHandle(result);
+        internalHandler.waitFor = (domWorld, selector, options) => {
+            return domWorld._waitForSelectorInPage(queryOne, selector, options);
         };
     }
     if (handler.queryAll) {
@@ -33032,6 +33045,13 @@ function internalizeCustomQueryHandler(handler) {
                 }
             }
             return result;
+        };
+        internalHandler.queryAllArray = async (element, selector) => {
+            const resultHandle = (await element.evaluateHandle(queryAll, selector));
+            const arrayHandle = await resultHandle.evaluateHandle(res => {
+                return Array.from(res);
+            });
+            return arrayHandle;
         };
     }
     return internalHandler;
@@ -33365,10 +33385,7 @@ _LifecycleWatcher_expectedLifecycle = new WeakMap(), _LifecycleWatcher_frameMana
         return;
     }
     __classPrivateFieldSet(this, _LifecycleWatcher_navigationRequest, request, "f");
-    // Resolve previous navigation response in case there are multiple
-    // navigation requests reported by the backend. This generally should not
-    // happen by it looks like it's possible.
-    (_a = __classPrivateFieldGet(this, _LifecycleWatcher_navigationResponseReceived, "f")) === null || _a === void 0 ? void 0 : _a.resolve();
+    (_a = __classPrivateFieldGet(this, _LifecycleWatcher_navigationResponseReceived, "f")) === null || _a === void 0 ? void 0 : _a.reject(new Error('New navigation request was received'));
     __classPrivateFieldSet(this, _LifecycleWatcher_navigationResponseReceived, (0, DeferredPromise_js_1.createDeferredPromise)(), "f");
     if (request.response() !== null) {
         (_b = __classPrivateFieldGet(this, _LifecycleWatcher_navigationResponseReceived, "f")) === null || _b === void 0 ? void 0 : _b.resolve();
@@ -34716,14 +34733,13 @@ var __classPrivateFieldGet = (this && this.__classPrivateFieldGet) || function (
     if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
     return kind === "m" ? f : kind === "a" ? f.call(receiver) : f ? f.value : state.get(receiver);
 };
-var _WebWorker_executionContext, _WebWorker_client, _WebWorker_url;
+var _WebWorker_client, _WebWorker_url, _WebWorker_executionContextPromise, _WebWorker_executionContextCallback;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.WebWorker = void 0;
 const EventEmitter_js_1 = __webpack_require__(18);
 const ExecutionContext_js_1 = __webpack_require__(124);
 const JSHandle_js_1 = __webpack_require__(933);
 const util_js_1 = __webpack_require__(802);
-const DeferredPromise_js_1 = __webpack_require__(501);
 /**
  * This class represents a
  * {@link https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API | WebWorker}.
@@ -34756,38 +34772,45 @@ class WebWorker extends EventEmitter_js_1.EventEmitter {
      */
     constructor(client, url, consoleAPICalled, exceptionThrown) {
         super();
-        _WebWorker_executionContext.set(this, (0, DeferredPromise_js_1.createDeferredPromise)());
         _WebWorker_client.set(this, void 0);
         _WebWorker_url.set(this, void 0);
+        _WebWorker_executionContextPromise.set(this, void 0);
+        _WebWorker_executionContextCallback.set(this, void 0);
         __classPrivateFieldSet(this, _WebWorker_client, client, "f");
         __classPrivateFieldSet(this, _WebWorker_url, url, "f");
+        __classPrivateFieldSet(this, _WebWorker_executionContextPromise, new Promise(x => {
+            return (__classPrivateFieldSet(this, _WebWorker_executionContextCallback, x, "f"));
+        }), "f");
+        let jsHandleFactory;
         __classPrivateFieldGet(this, _WebWorker_client, "f").once('Runtime.executionContextCreated', async (event) => {
-            const context = new ExecutionContext_js_1.ExecutionContext(client, event.context);
-            __classPrivateFieldGet(this, _WebWorker_executionContext, "f").resolve(context);
+            // eslint-disable-next-line @typescript-eslint/explicit-function-return-type
+            jsHandleFactory = remoteObject => {
+                return new JSHandle_js_1.JSHandle(executionContext, client, remoteObject);
+            };
+            const executionContext = new ExecutionContext_js_1.ExecutionContext(client, event.context);
+            __classPrivateFieldGet(this, _WebWorker_executionContextCallback, "f").call(this, executionContext);
         });
-        __classPrivateFieldGet(this, _WebWorker_client, "f").on('Runtime.consoleAPICalled', async (event) => {
-            const context = await __classPrivateFieldGet(this, _WebWorker_executionContext, "f");
-            return consoleAPICalled(event.type, event.args.map((object) => {
-                return new JSHandle_js_1.JSHandle(context, object);
-            }), event.stackTrace);
+        // This might fail if the target is closed before we receive all execution contexts.
+        __classPrivateFieldGet(this, _WebWorker_client, "f").send('Runtime.enable').catch(util_js_1.debugError);
+        __classPrivateFieldGet(this, _WebWorker_client, "f").on('Runtime.consoleAPICalled', event => {
+            return consoleAPICalled(event.type, event.args.map(jsHandleFactory), event.stackTrace);
         });
         __classPrivateFieldGet(this, _WebWorker_client, "f").on('Runtime.exceptionThrown', exception => {
             return exceptionThrown(exception.exceptionDetails);
         });
-        // This might fail if the target is closed before we receive all execution contexts.
-        __classPrivateFieldGet(this, _WebWorker_client, "f").send('Runtime.enable').catch(util_js_1.debugError);
-    }
-    /**
-     * @internal
-     */
-    async executionContext() {
-        return __classPrivateFieldGet(this, _WebWorker_executionContext, "f");
     }
     /**
      * @returns The URL of this web worker.
      */
     url() {
         return __classPrivateFieldGet(this, _WebWorker_url, "f");
+    }
+    /**
+     * Returns the ExecutionContext the WebWorker runs in
+     * @returns The ExecutionContext the web worker runs in.
+     */
+    async executionContext() {
+        return __classPrivateFieldGet(this, _WebWorker_executionContextPromise, "f");
     }
     /**
      * If the function passed to the `worker.evaluate` returns a Promise, then
@@ -34804,8 +34827,7 @@ class WebWorker extends EventEmitter_js_1.EventEmitter {
      * @returns Promise which resolves to the return value of `pageFunction`.
      */
     async evaluate(pageFunction, ...args) {
-        const context = await __classPrivateFieldGet(this, _WebWorker_executionContext, "f");
-        return context.evaluate(pageFunction, ...args);
+        return (await __classPrivateFieldGet(this, _WebWorker_executionContextPromise, "f")).evaluate(pageFunction, ...args);
     }
     /**
      * The only difference between `worker.evaluate` and `worker.evaluateHandle`
@@ -34820,12 +34842,11 @@ class WebWorker extends EventEmitter_js_1.EventEmitter {
      * @returns Promise which resolves to the return value of `pageFunction`.
      */
     async evaluateHandle(pageFunction, ...args) {
-        const context = await __classPrivateFieldGet(this, _WebWorker_executionContext, "f");
-        return context.evaluateHandle(pageFunction, ...args);
+        return (await __classPrivateFieldGet(this, _WebWorker_executionContextPromise, "f")).evaluateHandle(pageFunction, ...args);
     }
 }
 exports.WebWorker = WebWorker;
-_WebWorker_executionContext = new WeakMap(), _WebWorker_client = new WeakMap(), _WebWorker_url = new WeakMap();
+_WebWorker_client = new WeakMap(), _WebWorker_url = new WeakMap(), _WebWorker_executionContextPromise = new WeakMap(), _WebWorker_executionContextCallback = new WeakMap();
 //# sourceMappingURL=WebWorker.js.map
 
 /***/ }),
@@ -37464,9 +37485,9 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.getReadableFromProtocolStream = exports.getReadableAsBuffer = exports.importFS = exports.waitWithTimeout = exports.makePredicateString = exports.pageBindingDeliverErrorValueString = exports.pageBindingDeliverErrorString = exports.pageBindingDeliverResultString = exports.pageBindingInitString = exports.evaluationString = exports.createJSHandle = exports.waitForEvent = exports.isNumber = exports.isString = exports.removeEventListeners = exports.addEventListener = exports.releaseObject = exports.valueFromRemoteObject = exports.getExceptionMessage = exports.debugError = void 0;
 const environment_js_1 = __webpack_require__(975);
 const assert_js_1 = __webpack_require__(725);
-const ErrorLike_js_1 = __webpack_require__(334);
 const Debug_js_1 = __webpack_require__(459);
 const ElementHandle_js_1 = __webpack_require__(978);
+const ErrorLike_js_1 = __webpack_require__(334);
 const Errors_js_1 = __webpack_require__(422);
 const JSHandle_js_1 = __webpack_require__(933);
 /**
@@ -37612,10 +37633,12 @@ exports.waitForEvent = waitForEvent;
  * @internal
  */
 function createJSHandle(context, remoteObject) {
-    if (remoteObject.subtype === 'node' && context._world) {
-        return new ElementHandle_js_1.ElementHandle(context, remoteObject, context._world.frame());
+    const frame = context.frame();
+    if (remoteObject.subtype === 'node' && frame) {
+        const frameManager = frame._frameManager;
+        return new ElementHandle_js_1.ElementHandle(context, context._client, remoteObject, frame, frameManager.page(), frameManager);
     }
-    return new JSHandle_js_1.JSHandle(context, remoteObject);
+    return new JSHandle_js_1.JSHandle(context, context._client, remoteObject);
 }
 exports.createJSHandle = createJSHandle;
 /**
@@ -38086,11 +38109,9 @@ var __classPrivateFieldGet = (this && this.__classPrivateFieldGet) || function (
 var _Frame_parentFrame, _Frame_url, _Frame_detached, _Frame_client;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.Frame = void 0;
-const assert_js_1 = __webpack_require__(725);
 const ErrorLike_js_1 = __webpack_require__(334);
 const IsolatedWorld_js_1 = __webpack_require__(462);
 const LifecycleWatcher_js_1 = __webpack_require__(662);
-const QueryHandler_js_1 = __webpack_require__(647);
 /**
  * Represents a DOM frame.
  *
@@ -38183,8 +38204,8 @@ class Frame {
     updateClient(client) {
         __classPrivateFieldSet(this, _Frame_client, client, "f");
         this.worlds = {
-            [IsolatedWorld_js_1.MAIN_WORLD]: new IsolatedWorld_js_1.IsolatedWorld(this),
-            [IsolatedWorld_js_1.PUPPETEER_WORLD]: new IsolatedWorld_js_1.IsolatedWorld(this),
+            [IsolatedWorld_js_1.MAIN_WORLD]: new IsolatedWorld_js_1.IsolatedWorld(client, this._frameManager, this, this._frameManager.timeoutSettings),
+            [IsolatedWorld_js_1.PUPPETEER_WORLD]: new IsolatedWorld_js_1.IsolatedWorld(client, this._frameManager, this, this._frameManager.timeoutSettings),
         };
     }
     /**
@@ -38330,7 +38351,9 @@ class Frame {
         return __classPrivateFieldGet(this, _Frame_client, "f");
     }
     /**
-     * @internal
+     * @deprecated Do not use the execution context directly.
+     *
+     * @returns a promise that resolves to the frame's default execution context.
      */
     executionContext() {
         return this.worlds[IsolatedWorld_js_1.MAIN_WORLD].executionContext();
@@ -38464,9 +38487,13 @@ class Frame {
      * @throws Throws if an element matching the given selector doesn't appear.
      */
     async waitForSelector(selector, options = {}) {
-        const { updatedSelector, queryHandler } = (0, QueryHandler_js_1.getQueryHandlerAndSelector)(selector);
-        (0, assert_js_1.assert)(queryHandler.waitFor, 'Query handler does not support waiting');
-        return (await queryHandler.waitFor(this, updatedSelector, options));
+        const handle = await this.worlds[IsolatedWorld_js_1.PUPPETEER_WORLD].waitForSelector(selector, options);
+        if (!handle) {
+            return null;
+        }
+        const mainHandle = (await this.worlds[IsolatedWorld_js_1.MAIN_WORLD].adoptHandle(handle));
+        await handle.dispose();
+        return mainHandle;
     }
     /**
      * @deprecated Use {@link Frame.waitForSelector} with the `xpath` prefix.
@@ -41846,7 +41873,12 @@ module.exports = {
 
 
 /***/ }),
-/* 881 */,
+/* 881 */
+/***/ (function(module) {
+
+module.exports = require("dns");
+
+/***/ }),
 /* 882 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -43270,7 +43302,7 @@ var __classPrivateFieldGet = (this && this.__classPrivateFieldGet) || function (
     if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
     return kind === "m" ? f : kind === "a" ? f.call(receiver) : f ? f.value : state.get(receiver);
 };
-var _JSHandle_disposed, _JSHandle_context, _JSHandle_remoteObject;
+var _JSHandle_client, _JSHandle_disposed, _JSHandle_context, _JSHandle_remoteObject;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.JSHandle = void 0;
 const assert_js_1 = __webpack_require__(725);
@@ -43300,18 +43332,20 @@ class JSHandle {
     /**
      * @internal
      */
-    constructor(context, remoteObject) {
+    constructor(context, client, remoteObject) {
+        _JSHandle_client.set(this, void 0);
         _JSHandle_disposed.set(this, false);
         _JSHandle_context.set(this, void 0);
         _JSHandle_remoteObject.set(this, void 0);
         __classPrivateFieldSet(this, _JSHandle_context, context, "f");
+        __classPrivateFieldSet(this, _JSHandle_client, client, "f");
         __classPrivateFieldSet(this, _JSHandle_remoteObject, remoteObject, "f");
     }
     /**
      * @internal
      */
     get client() {
-        return __classPrivateFieldGet(this, _JSHandle_context, "f")._client;
+        return __classPrivateFieldGet(this, _JSHandle_client, "f");
     }
     /**
      * @internal
@@ -43320,7 +43354,7 @@ class JSHandle {
         return __classPrivateFieldGet(this, _JSHandle_disposed, "f");
     }
     /**
-     * @internal
+     * @returns The execution context the handle belongs to.
      */
     executionContext() {
         return __classPrivateFieldGet(this, _JSHandle_context, "f");
@@ -43368,7 +43402,7 @@ class JSHandle {
         (0, assert_js_1.assert)(__classPrivateFieldGet(this, _JSHandle_remoteObject, "f").objectId);
         // We use Runtime.getProperties rather than iterative building because the
         // iterative approach might create a distorted snapshot.
-        const response = await this.client.send('Runtime.getProperties', {
+        const response = await __classPrivateFieldGet(this, _JSHandle_client, "f").send('Runtime.getProperties', {
             objectId: __classPrivateFieldGet(this, _JSHandle_remoteObject, "f").objectId,
             ownProperties: true,
         });
@@ -43416,7 +43450,7 @@ class JSHandle {
             return;
         }
         __classPrivateFieldSet(this, _JSHandle_disposed, true, "f");
-        await (0, util_js_1.releaseObject)(this.client, __classPrivateFieldGet(this, _JSHandle_remoteObject, "f"));
+        await (0, util_js_1.releaseObject)(__classPrivateFieldGet(this, _JSHandle_client, "f"), __classPrivateFieldGet(this, _JSHandle_remoteObject, "f"));
     }
     /**
      * Returns a string representation of the JSHandle.
@@ -43441,7 +43475,7 @@ class JSHandle {
     }
 }
 exports.JSHandle = JSHandle;
-_JSHandle_disposed = new WeakMap(), _JSHandle_context = new WeakMap(), _JSHandle_remoteObject = new WeakMap();
+_JSHandle_client = new WeakMap(), _JSHandle_disposed = new WeakMap(), _JSHandle_context = new WeakMap(), _JSHandle_remoteObject = new WeakMap();
 //# sourceMappingURL=JSHandle.js.map
 
 /***/ }),
@@ -43860,7 +43894,7 @@ class NetworkManager extends EventEmitter_js_1.EventEmitter {
         if (__classPrivateFieldGet(this, _NetworkManager_deferredInitPromise, "f")) {
             return __classPrivateFieldGet(this, _NetworkManager_deferredInitPromise, "f");
         }
-        __classPrivateFieldSet(this, _NetworkManager_deferredInitPromise, (0, DeferredPromise_js_1.createDebuggableDeferredPromise)('NetworkManager initialization timed out'), "f");
+        __classPrivateFieldSet(this, _NetworkManager_deferredInitPromise, (0, DeferredPromise_js_1.createDeferredPromiseWithTimer)('NetworkManager initialization timed out', 30000), "f");
         const init = Promise.all([
             __classPrivateFieldGet(this, _NetworkManager_ignoreHTTPSErrors, "f")
                 ? __classPrivateFieldGet(this, _NetworkManager_client, "f").send('Security.setIgnoreCertificateErrors', {
@@ -44824,18 +44858,11 @@ module.exports = [[[0,44],"disallowed_STD3_valid"],[[45,46],"valid"],[[47,47],"d
  * limitations under the License.
  */
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.deferredPromiseDebugTimeout = exports.isNode = void 0;
+exports.isNode = void 0;
 /**
  * @internal
  */
 exports.isNode = !!(typeof process !== 'undefined' && process.version);
-/**
- * @internal
- */
-exports.deferredPromiseDebugTimeout = typeof process !== 'undefined' &&
-    typeof process.env['PUPPETEER_DEFERRED_PROMISE_DEBUG_TIMEOUT'] !== 'undefined'
-    ? Number(process.env['PUPPETEER_DEFERRED_PROMISE_DEBUG_TIMEOUT'])
-    : -1;
 //# sourceMappingURL=environment.js.map
 
 /***/ }),
@@ -44880,10 +44907,11 @@ var __classPrivateFieldGet = (this && this.__classPrivateFieldGet) || function (
     if (typeof state === "function" ? receiver !== state || !f : !state.has(receiver)) throw new TypeError("Cannot read private member from an object whose class did not declare it");
     return kind === "m" ? f : kind === "a" ? f.call(receiver) : f ? f.value : state.get(receiver);
 };
-var _ElementHandle_instances, _ElementHandle_frame, _ElementHandle_frameManager_get, _ElementHandle_page_get, _ElementHandle_scrollIntoViewIfNeeded, _ElementHandle_getOOPIFOffsets, _ElementHandle_getBoxModel, _ElementHandle_fromProtocolQuad, _ElementHandle_intersectQuadWithViewport;
+var _ElementHandle_instances, _ElementHandle_frame, _ElementHandle_page, _ElementHandle_frameManager, _ElementHandle_scrollIntoViewIfNeeded, _ElementHandle_getOOPIFOffsets, _ElementHandle_getBoxModel, _ElementHandle_fromProtocolQuad, _ElementHandle_intersectQuadWithViewport;
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.ElementHandle = void 0;
 const assert_js_1 = __webpack_require__(725);
+const IsolatedWorld_js_1 = __webpack_require__(462);
 const JSHandle_js_1 = __webpack_require__(933);
 const QueryHandler_js_1 = __webpack_require__(647);
 const util_js_1 = __webpack_require__(802);
@@ -44929,17 +44957,15 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
     /**
      * @internal
      */
-    constructor(context, remoteObject, frame) {
-        super(context, remoteObject);
+    constructor(context, client, remoteObject, frame, page, frameManager) {
+        super(context, client, remoteObject);
         _ElementHandle_instances.add(this);
         _ElementHandle_frame.set(this, void 0);
+        _ElementHandle_page.set(this, void 0);
+        _ElementHandle_frameManager.set(this, void 0);
         __classPrivateFieldSet(this, _ElementHandle_frame, frame, "f");
-    }
-    /**
-     * @internal
-     */
-    get frame() {
-        return __classPrivateFieldGet(this, _ElementHandle_frame, "f");
+        __classPrivateFieldSet(this, _ElementHandle_page, page, "f");
+        __classPrivateFieldSet(this, _ElementHandle_frameManager, frameManager, "f");
     }
     /**
      * Queries the current element for an element matching the given selector.
@@ -45035,18 +45061,10 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
      */
     async $$eval(selector, pageFunction, ...args) {
         const { updatedSelector, queryHandler } = (0, QueryHandler_js_1.getQueryHandlerAndSelector)(selector);
-        (0, assert_js_1.assert)(queryHandler.queryAll, 'Cannot handle queries for a multiple element with the given selector');
-        const handles = (await queryHandler.queryAll(this, updatedSelector));
-        const elements = await this.evaluateHandle((_, ...elements) => {
-            return elements;
-        }, ...handles);
-        const [result] = await Promise.all([
-            elements.evaluate(pageFunction, ...args),
-            ...handles.map(handle => {
-                return handle.dispose();
-            }),
-        ]);
-        await elements.dispose();
+        (0, assert_js_1.assert)(queryHandler.queryAllArray);
+        const arrayHandle = (await queryHandler.queryAllArray(this, updatedSelector));
+        const result = await arrayHandle.evaluate(pageFunction, ...args);
+        await arrayHandle.dispose();
         return result;
     }
     /**
@@ -45100,9 +45118,20 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
      * @throws Throws if an element matching the given selector doesn't appear.
      */
     async waitForSelector(selector, options = {}) {
-        const { updatedSelector, queryHandler } = (0, QueryHandler_js_1.getQueryHandlerAndSelector)(selector);
-        (0, assert_js_1.assert)(queryHandler.waitFor, 'Query handler does not support waiting');
-        return (await queryHandler.waitFor(this, updatedSelector, options));
+        const frame = this.executionContext().frame();
+        (0, assert_js_1.assert)(frame);
+        const adoptedRoot = await frame.worlds[IsolatedWorld_js_1.PUPPETEER_WORLD].adoptHandle(this);
+        const handle = await frame.worlds[IsolatedWorld_js_1.PUPPETEER_WORLD].waitForSelector(selector, {
+            ...options,
+            root: adoptedRoot,
+        });
+        await adoptedRoot.dispose();
+        if (!handle) {
+            return null;
+        }
+        const result = (await frame.worlds[IsolatedWorld_js_1.MAIN_WORLD].adoptHandle(handle));
+        await handle.dispose();
+        return result;
     }
     /**
      * @deprecated Use {@link ElementHandle.waitForSelector} with the `xpath`
@@ -45181,7 +45210,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
         if (typeof nodeInfo.node.frameId !== 'string') {
             return null;
         }
-        return __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_frameManager_get).frame(nodeInfo.node.frameId);
+        return __classPrivateFieldGet(this, _ElementHandle_frameManager, "f").frame(nodeInfo.node.frameId);
     }
     /**
      * Returns the middle point within an element unless a specific offset is provided.
@@ -45193,7 +45222,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
                 objectId: this.remoteObject().objectId,
             })
                 .catch(util_js_1.debugError),
-            __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get)._client().send('Page.getLayoutMetrics'),
+            __classPrivateFieldGet(this, _ElementHandle_page, "f")._client().send('Page.getLayoutMetrics'),
         ]);
         if (!result || !result.quads.length) {
             throw new Error('Node is either not clickable or not an HTMLElement');
@@ -45259,7 +45288,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
     async hover() {
         await __classPrivateFieldGet(this, _ElementHandle_instances, "m", _ElementHandle_scrollIntoViewIfNeeded).call(this);
         const { x, y } = await this.clickablePoint();
-        await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).mouse.move(x, y);
+        await __classPrivateFieldGet(this, _ElementHandle_page, "f").mouse.move(x, y);
     }
     /**
      * This method scrolls element into view if needed, and then
@@ -45269,16 +45298,16 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
     async click(options = {}) {
         await __classPrivateFieldGet(this, _ElementHandle_instances, "m", _ElementHandle_scrollIntoViewIfNeeded).call(this);
         const { x, y } = await this.clickablePoint(options.offset);
-        await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).mouse.click(x, y, options);
+        await __classPrivateFieldGet(this, _ElementHandle_page, "f").mouse.click(x, y, options);
     }
     /**
      * This method creates and captures a dragevent from the element.
      */
     async drag(target) {
-        (0, assert_js_1.assert)(__classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).isDragInterceptionEnabled(), 'Drag Interception is not enabled!');
+        (0, assert_js_1.assert)(__classPrivateFieldGet(this, _ElementHandle_page, "f").isDragInterceptionEnabled(), 'Drag Interception is not enabled!');
         await __classPrivateFieldGet(this, _ElementHandle_instances, "m", _ElementHandle_scrollIntoViewIfNeeded).call(this);
         const start = await this.clickablePoint();
-        return await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).mouse.drag(start, target);
+        return await __classPrivateFieldGet(this, _ElementHandle_page, "f").mouse.drag(start, target);
     }
     /**
      * This method creates a `dragenter` event on the element.
@@ -45286,7 +45315,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
     async dragEnter(data = { items: [], dragOperationsMask: 1 }) {
         await __classPrivateFieldGet(this, _ElementHandle_instances, "m", _ElementHandle_scrollIntoViewIfNeeded).call(this);
         const target = await this.clickablePoint();
-        await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).mouse.dragEnter(target, data);
+        await __classPrivateFieldGet(this, _ElementHandle_page, "f").mouse.dragEnter(target, data);
     }
     /**
      * This method creates a `dragover` event on the element.
@@ -45294,7 +45323,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
     async dragOver(data = { items: [], dragOperationsMask: 1 }) {
         await __classPrivateFieldGet(this, _ElementHandle_instances, "m", _ElementHandle_scrollIntoViewIfNeeded).call(this);
         const target = await this.clickablePoint();
-        await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).mouse.dragOver(target, data);
+        await __classPrivateFieldGet(this, _ElementHandle_page, "f").mouse.dragOver(target, data);
     }
     /**
      * This method triggers a drop on the element.
@@ -45302,7 +45331,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
     async drop(data = { items: [], dragOperationsMask: 1 }) {
         await __classPrivateFieldGet(this, _ElementHandle_instances, "m", _ElementHandle_scrollIntoViewIfNeeded).call(this);
         const destination = await this.clickablePoint();
-        await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).mouse.drop(destination, data);
+        await __classPrivateFieldGet(this, _ElementHandle_page, "f").mouse.drop(destination, data);
     }
     /**
      * This method triggers a dragenter, dragover, and drop on the element.
@@ -45311,7 +45340,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
         await __classPrivateFieldGet(this, _ElementHandle_instances, "m", _ElementHandle_scrollIntoViewIfNeeded).call(this);
         const startPoint = await this.clickablePoint();
         const targetPoint = await target.clickablePoint();
-        await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).mouse.dragAndDrop(startPoint, targetPoint, options);
+        await __classPrivateFieldGet(this, _ElementHandle_page, "f").mouse.dragAndDrop(startPoint, targetPoint, options);
     }
     /**
      * Triggers a `change` and `input` event once all the provided options have been
@@ -45433,7 +45462,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
     async tap() {
         await __classPrivateFieldGet(this, _ElementHandle_instances, "m", _ElementHandle_scrollIntoViewIfNeeded).call(this);
         const { x, y } = await this.clickablePoint();
-        await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).touchscreen.tap(x, y);
+        await __classPrivateFieldGet(this, _ElementHandle_page, "f").touchscreen.tap(x, y);
     }
     /**
      * Calls {@link https://developer.mozilla.org/en-US/docs/Web/API/HTMLElement/focus | focus} on the element.
@@ -45471,7 +45500,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
      */
     async type(text, options) {
         await this.focus();
-        await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).keyboard.type(text, options);
+        await __classPrivateFieldGet(this, _ElementHandle_page, "f").keyboard.type(text, options);
     }
     /**
      * Focuses the element, and then uses {@link Keyboard.down} and {@link Keyboard.up}.
@@ -45489,7 +45518,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
      */
     async press(key, options) {
         await this.focus();
-        await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).keyboard.press(key, options);
+        await __classPrivateFieldGet(this, _ElementHandle_page, "f").keyboard.press(key, options);
     }
     /**
      * This method returns the bounding box of the element (relative to the main frame),
@@ -45541,7 +45570,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
         let needsViewportReset = false;
         let boundingBox = await this.boundingBox();
         (0, assert_js_1.assert)(boundingBox, 'Node is either not visible or not an HTMLElement');
-        const viewport = __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).viewport();
+        const viewport = __classPrivateFieldGet(this, _ElementHandle_page, "f").viewport();
         if (viewport &&
             (boundingBox.width > viewport.width ||
                 boundingBox.height > viewport.height)) {
@@ -45549,7 +45578,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
                 width: Math.max(viewport.width, Math.ceil(boundingBox.width)),
                 height: Math.max(viewport.height, Math.ceil(boundingBox.height)),
             };
-            await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).setViewport(Object.assign({}, viewport, newViewport));
+            await __classPrivateFieldGet(this, _ElementHandle_page, "f").setViewport(Object.assign({}, viewport, newViewport));
             needsViewportReset = true;
         }
         await __classPrivateFieldGet(this, _ElementHandle_instances, "m", _ElementHandle_scrollIntoViewIfNeeded).call(this);
@@ -45563,11 +45592,11 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
         const clip = Object.assign({}, boundingBox);
         clip.x += pageX;
         clip.y += pageY;
-        const imageData = await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).screenshot(Object.assign({}, {
+        const imageData = await __classPrivateFieldGet(this, _ElementHandle_page, "f").screenshot(Object.assign({}, {
             clip,
         }, options));
         if (needsViewportReset && viewport) {
-            await __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).setViewport(viewport);
+            await __classPrivateFieldGet(this, _ElementHandle_page, "f").setViewport(viewport);
         }
         return imageData;
     }
@@ -45589,11 +45618,7 @@ class ElementHandle extends JSHandle_js_1.JSHandle {
     }
 }
 exports.ElementHandle = ElementHandle;
-_ElementHandle_frame = new WeakMap(), _ElementHandle_instances = new WeakSet(), _ElementHandle_frameManager_get = function _ElementHandle_frameManager_get() {
-    return __classPrivateFieldGet(this, _ElementHandle_frame, "f")._frameManager;
-}, _ElementHandle_page_get = function _ElementHandle_page_get() {
-    return __classPrivateFieldGet(this, _ElementHandle_frame, "f").page();
-}, _ElementHandle_scrollIntoViewIfNeeded = async function _ElementHandle_scrollIntoViewIfNeeded() {
+_ElementHandle_frame = new WeakMap(), _ElementHandle_page = new WeakMap(), _ElementHandle_frameManager = new WeakMap(), _ElementHandle_instances = new WeakSet(), _ElementHandle_scrollIntoViewIfNeeded = async function _ElementHandle_scrollIntoViewIfNeeded() {
     const error = await this.evaluate(async (element) => {
         if (!element.isConnected) {
             return 'Node is detached from document';
@@ -45633,7 +45658,7 @@ _ElementHandle_frame = new WeakMap(), _ElementHandle_instances = new WeakSet(), 
                     behavior: 'instant',
                 });
             }
-        }, __classPrivateFieldGet(this, _ElementHandle_instances, "a", _ElementHandle_page_get).isJavaScriptEnabled());
+        }, __classPrivateFieldGet(this, _ElementHandle_page, "f").isJavaScriptEnabled());
     }
 }, _ElementHandle_getOOPIFOffsets = async function _ElementHandle_getOOPIFOffsets(frame) {
     let offsetX = 0;
@@ -46259,6 +46284,17 @@ class ChromeLauncher {
 }
 exports.ChromeLauncher = ChromeLauncher;
 //# sourceMappingURL=ChromeLauncher.js.map
+
+/***/ }),
+/* 989 */,
+/* 990 */,
+/* 991 */,
+/* 992 */,
+/* 993 */
+/***/ (function(module) {
+
+module.exports = eval("require")("node:os");
+
 
 /***/ })
 /******/ ],
