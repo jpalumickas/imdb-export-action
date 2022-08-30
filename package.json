@@ -11,7 +11,7 @@
   "homepage": "https://github.com/jpalumickas/imdb-export-action#readme",
   "repository": "jpalumickas/imdb-export-action",
   "dependencies": {
-    "@actions/core": "^1.6.0",
+    "@actions/core": "^1.9.1",
     "@octokit/action": "^3.18.0",
     "octokit-commit-multiple-files": "^3.2.1",
     "puppeteer-core": "^10.4.0"
@@ -21,17 +21,23 @@
   },
   "devDependencies": {
     "@types/puppeteer-core": "^5.4.0",
-    "@typescript-eslint/eslint-plugin": "^5.2.0",
-    "@typescript-eslint/parser": "^5.2.0",
+    "@typescript-eslint/eslint-plugin": "^5.36.0",
+    "@typescript-eslint/parser": "^5.36.0",
     "@zeit/ncc": "^0.22.3",
-    "eslint": "^8.1.0",
-    "prettier": "^2.4.1",
-    "typescript": "^4.4.4"
+    "eslint": "^8.23.0",
+    "prettier": "^2.7.1",
+    "typescript": "^4.8.2"
   },
   "scripts": {
     "build": "ncc build src/index.ts -o dist",
     "lint": "eslint src",
     "format": "prettier src --write"
   },
-  "keywords": ["imdb", "github", "actions", "github-actions", "javascript"]
+  "keywords": [
+    "imdb",
+    "github",
+    "actions",
+    "github-actions",
+    "javascript"
+  ]
 }
