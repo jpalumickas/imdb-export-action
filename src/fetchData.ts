@@ -1,5 +1,5 @@
 import * as core from '@actions/core';
-import puppeteer from 'puppeteer-core';
+import puppeteer, { ElementHandle } from 'puppeteer-core';
 import getChromePath from './getChromePath';
 
 const email = core.getInput('imdb_email', { trimWhitespace: true });
@@ -36,7 +36,7 @@ const fetchData = async (): Promise<Result> => {
     console.log('Click on Sign in');
 
     // https://github.com/puppeteer/puppeteer/issues/1412#issuecomment-345482273
-    await Promise.all([page.waitForNavigation(), signIn.click()]);
+    await Promise.all([page.waitForNavigation(), (signIn as ElementHandle<HTMLElement>).click()]);
 
     const [signInWithIMDb] = await page.$x(
       "//a[contains(., 'Sign in with IMDb')]",
@@ -47,7 +47,7 @@ const fetchData = async (): Promise<Result> => {
 
     core.debug('Click on Sign in with IMDB');
     console.log('Click on Sign in with IMDB');
-    await Promise.all([page.waitForNavigation(), signInWithIMDb.click()]);
+    await Promise.all([page.waitForNavigation(), (signInWithIMDb as ElementHandle<HTMLElement>).click()]);
 
     core.debug('Enter email and password');
     console.log('Enter email and password');

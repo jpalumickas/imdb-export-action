@@ -14,7 +14,7 @@
     "@actions/core": "^1.9.1",
     "@octokit/action": "^4.0.7",
     "octokit-commit-multiple-files": "^4.1.0",
-    "puppeteer-core": "^10.4.0"
+    "puppeteer-core": "^17.0.0"
   },
   "peerDependencies": {
     "@actions/core": ">=1 <2"
