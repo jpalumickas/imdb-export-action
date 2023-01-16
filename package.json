@@ -14,13 +14,14 @@
     "@actions/core": "^1.10.0",
     "@octokit/action": "4.0.10",
     "octokit-commit-multiple-files": "^4.2.0",
-    "puppeteer-core": "^15.5.0"
+    "puppeteer-core": "^19.5.2"
   },
   "peerDependencies": {
     "@actions/core": ">=1 <2"
   },
   "devDependencies": {
-    "@types/puppeteer-core": "^5.4.0",
+    "@types/node": "^18.11.18",
+    "@types/puppeteer-core": "^7.0.4",
     "@typescript-eslint/eslint-plugin": "^5.48.1",
     "@typescript-eslint/parser": "^5.48.1",
     "@zeit/ncc": "^0.22.3",
