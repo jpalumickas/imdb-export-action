@@ -1,5 +1,7 @@
 # IMDb Export GitHub Action
 
+> This action might not work anymore as IMDb added captcha verification to Login
+
 A GitHub action that allows you to export your IMDb ratings and watchlist as csv to repository
 
 ## Example Usage
