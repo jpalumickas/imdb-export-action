@@ -2,8 +2,6 @@ import * as core from '@actions/core';
 import puppeteer, { ElementHandle } from 'puppeteer-core';
 import getChromePath from './getChromePath';
 
-const email = core.getInput('imdb_email', { trimWhitespace: true });
-const password = core.getInput('imdb_password', { trimWhitespace: true });
 const userAgent =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36'
 
@@ -12,9 +10,13 @@ interface Result {
   ratings?: string;
 }
 
-const fetchData = async (): Promise<Result> => {
+const fetchData = async ({
+  email, password
+}: { email: string, password: string }): Promise<Result> => {
   const browser = await puppeteer.launch({
     executablePath: getChromePath(),
+    // headless: false,
+    // devtools: true
   });
 
   const result: Result = {};

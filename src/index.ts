@@ -3,8 +3,13 @@ import fetchData from './fetchData';
 import commitFile from './commitFile';
 
 (async () => {
+  const email = core.getInput('imdb_email', { trimWhitespace: true });
+  const password = core.getInput('imdb_password', { trimWhitespace: true });
+
   try {
-    const data = await fetchData();
+    const data = await fetchData({
+      email, password
+    });
 
     if (!data.ratings && !data.watchlist) {
       core.setFailed(`Failed to get data from IMDb`);
